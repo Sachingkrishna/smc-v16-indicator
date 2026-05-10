@@ -61,9 +61,13 @@
 //         • Timezones separated for ranges.
 //         • Min penetration ticks instead of pips.
 //         • iFVG creation guard prevents instant deletion.
+// v16.5 — Fixes OB/BB min-penetration touch parity, BB immediate gap-through
+//         guard, MSS offset markers, MSS/CHoCH double alerts, range touch alert
+//         timing, stale OB/BB text, first-bar division guards, independent iFVG
+//         mitigation, and hidden FVG tracking for iFVG-only mode.
 
 //@version=6
-indicator('Smart Money Concepts [v16.0]', 'SMC v16.0', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+indicator('Smart Money Concepts [v16.5]', 'SMC v16.5', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -212,6 +216,8 @@ showIFVGInput       = input(false, 'Show Inverted FVGs',       group=IFVG_GROUP,
 ifvgBullColorInput  = input.color(color.new(#00bcd4, 75), 'Bullish iFVG', group=IFVG_GROUP)
 ifvgBearColorInput  = input.color(color.new(#ff9800, 75), 'Bearish iFVG', group=IFVG_GROUP)
 ifvgMaxCountInput   = input.int(10, 'Max iFVGs Shown',        group=IFVG_GROUP, minval=1, maxval=50)
+ifvgMitigationInput = input.string(BODY_SRC, 'iFVG Mitigation', group=IFVG_GROUP, options=[CLOSE_SRC,BODY_SRC,HIGHLOW],
+    tooltip='Close = close must invalidate the iFVG level.\nBody = candle body must invalidate the level.\nHigh/Low = any wick through the level invalidates it.')
 
 showDailyLevelsInput           = input(false, 'Daily',   group=LEVELS_GROUP, inline='daily')
 dailyLevelsStyleInput          = input.string(SOLID, '', group=LEVELS_GROUP, inline='daily',   options=[SOLID,DASHED,DOTTED])
@@ -243,6 +249,9 @@ mssATRMultInput       = input.float(1.0, 'Displacement ATR Multiplier',   group=
 mssBodyRatioInput     = input.float(0.5, 'Min Body/Range Ratio',          group=MSS_GROUP,
     minval=0.2, maxval=0.9, step=0.05,
     tooltip='Minimum ratio of candle body to total range.\n0.5 = body is at least half the candle.\nHigher = cleaner candles only (less wick).')
+mssDisplacementLookbackInput = input.int(3, 'MSS Displacement Lookback', group=MSS_GROUP,
+    minval=1, maxval=10,
+    tooltip='Number of recent bars that can qualify a CHoCH as MSS.\n3 preserves the original behavior.')
 mssApplyInternalInput = input(true,  'Apply to Internal Structure',       group=MSS_GROUP)
 mssApplySwingInput    = input(true,  'Apply to Swing Structure',          group=MSS_GROUP)
 mssBullColorInput     = input.color(#00e676, 'Bullish MSS Color',         group=MSS_GROUP)
@@ -395,6 +404,8 @@ type alerts
     bool bearishBreakerMitigated     = false
     bool bullishIFVGFormed           = false
     bool bearishIFVGFormed           = false
+    int  bullishMSSOffset            = na
+    int  bearishMSSOffset            = na
 
 type trailingExtremes
     float top
@@ -463,6 +474,7 @@ type sessionTracker
 //──────────────────────────────────────────────────────────────────────────────
 bool needInternalOBTracking = showInternalOrderBlocksInput or showInternalBreakerBlocksInput
 bool needSwingOBTracking    = showSwingOrderBlocksInput    or showSwingBreakerBlocksInput
+bool needFVGTracking        = showFairValueGapsInput or showIFVGInput
 
 //──────────────────────────────────────────────────────────────────────────────
 // State Variables
@@ -494,6 +506,7 @@ var array<float> lows                     = array.new<float>()
 var array<int>   times                    = array.new<int>()
 var array<float> opens                    = array.new<float>()
 var array<float> closes                   = array.new<float>()
+var array<float> minPens                  = array.new<float>()
 
 var trailingExtremes trailing             = trailingExtremes.new()
 
@@ -561,6 +574,8 @@ var bool  nyPrevActive         = false
 var int   nyRangeStartTime     = na
 var bool displacementBullFlag = false
 var bool displacementBearFlag = false
+var int  displacementBullOffset = na
+var int  displacementBearOffset = na
 
 // v15.4 — Initialise to -1 so that on the very first realtime bar
 //         currentBarIndex != lastBarIndex → newBar = true.
@@ -628,7 +643,7 @@ bullishOrderBlockMitigationSource = orderBlockMitigationInput == CLOSE_SRC ? clo
 
 atrMeasure        = nz(ta.atr(200), ta.atr(14))
 float minPen      = math.max(atrMeasure * minPenetrationFactorInput, minPenetrationTicksInput * syminfo.mintick)
-volatilityMeasure = orderBlockFilterInput == ATR ? atrMeasure : ta.cum(ta.tr) / bar_index
+volatilityMeasure = orderBlockFilterInput == ATR ? atrMeasure : ta.cum(ta.tr) / math.max(bar_index, 1)
 highVolatilityBar = (high - low) >= (2 * volatilityMeasure)
 parsedHigh        = highVolatilityBar ? low  : high
 parsedLow         = highVolatilityBar ? high : low
@@ -645,15 +660,21 @@ isDisplacementCandle(int offset, bool bullishBreak) =>
     float body      = math.abs(close[offset] - open[offset])
     float rng       = high[offset] - low[offset]
     float bodyRatio = rng > 0 ? body / rng : 0
-    bool  sizeOk    = body > mssATRMultInput * atrMeasure
+    float atrAtBar  = nz(atrMeasure[offset], atrMeasure)
+    bool  sizeOk    = body > mssATRMultInput * atrAtBar
     bool  ratioOk   = bodyRatio >= mssBodyRatioInput
     bool  dirMatch  = bullishBreak ? (close[offset] > open[offset]) : (close[offset] < open[offset])
     sizeOk and ratioOk and dirMatch
 
+displacementOffset(bool bullishBreak) =>
+    int foundOffset = int(na)
+    for i = 0 to mssDisplacementLookbackInput - 1
+        if na(foundOffset) and isDisplacementCandle(i, bullishBreak)
+            foundOffset := i
+    foundOffset
+
 isDisplacement(bool bullishBreak) =>
-    isDisplacementCandle(0, bullishBreak) or
-     isDisplacementCandle(1, bullishBreak) or
-     isDisplacementCandle(2, bullishBreak)
+    not na(displacementOffset(bullishBreak))
 
 //──────────────────────────────────────────────────────────────────────────────
 // Previous Day / Week data — global scope
@@ -691,6 +712,7 @@ pushBounded(lows,        low)
 pushBoundedInt(times,    time)
 pushBounded(opens,       open)
 pushBounded(closes,      close)
+pushBounded(minPens,     minPen)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Pre-compute crossovers at global scope
@@ -920,14 +942,12 @@ updateOrderBlockTouches(bool internal = false) =>
             // Range overlap with the OB zone on the current bar
             bool overlaps = high >= ob.barLow and low <= ob.barHigh
 
-            // "Still alive" check, mirroring deleteOrderBlocks() exactly:
-            //   bullish OB is alive while bullishOrderBlockMitigationSource >= barLow
-            //   bearish OB is alive while bearishOrderBlockMitigationSource <= barHigh
-            bool stillAlive = ob.bias == BULLISH
-                 ? bullishOrderBlockMitigationSource >= ob.barLow
-                 : bearishOrderBlockMitigationSource <= ob.barHigh
+            // Mirror deleteOrderBlocks(), including minimum penetration.
+            bool mitigated = ob.bias == BULLISH
+                 ? bullishOrderBlockMitigationSource < ob.barLow and (ob.barLow - bullishOrderBlockMitigationSource) >= minPen
+                 : bearishOrderBlockMitigationSource > ob.barHigh and (bearishOrderBlockMitigationSource - ob.barHigh) >= minPen
 
-            bool nowInside = overlaps and stillAlive
+            bool nowInside = overlaps and not mitigated
 
             // Only count a touch on the outside→inside transition.
             // Consecutive bars sitting inside the zone count as ONE touch.
@@ -1008,18 +1028,24 @@ deleteBreakerBlocks(bool internal = false) =>
             orderBlock bb = breakers.get(index)
             if bb.identifiedBarIndex >= bar_index
                 continue
-                
-            // Skip if this is a gap-through on the bar immediately 
-            // after creation — price never traded inside the zone
-            bool isImmediateGapThrough = bb.identifiedBarIndex == bar_index - 1 and bb.wasInside == false
-            if isImmediateGapThrough
+
+            bool crossedAbove = bearishOrderBlockMitigationSource > bb.barHigh and (bearishOrderBlockMitigationSource - bb.barHigh) >= minPen
+            bool crossedBelow = bullishOrderBlockMitigationSource < bb.barLow and (bb.barLow - bullishOrderBlockMitigationSource) >= minPen
+
+            // Skip the immediate next bar if it gaps fully beyond the breaker
+            // zone. Price never traded back through the zone, so do not treat it
+            // as a normal mitigation.
+            bool immediateNoTradeThroughZone = bb.identifiedBarIndex == bar_index - 1 and
+                 (bb.bias == BEARISH ? low > bb.barHigh and crossedAbove : high < bb.barLow and crossedBelow)
+            if immediateNoTradeThroughZone
+                bb.wasInside := false
                 continue
-                
+
             bool mitigated = false
-            if bearishOrderBlockMitigationSource > bb.barHigh and (bearishOrderBlockMitigationSource - bb.barHigh) >= minPen and bb.bias == BEARISH
+            if crossedAbove and bb.bias == BEARISH
                 mitigated := true
                 currentAlerts.bearishBreakerMitigated := true
-            else if bullishOrderBlockMitigationSource < bb.barLow and (bb.barLow - bullishOrderBlockMitigationSource) >= minPen and bb.bias == BULLISH
+            else if crossedBelow and bb.bias == BULLISH
                 mitigated := true
                 currentAlerts.bullishBreakerMitigated := true
             if mitigated
@@ -1039,10 +1065,10 @@ updateBreakerBlockTouches(bool internal = false) =>
             if bb.identifiedBarIndex >= bar_index
                 continue
             bool overlaps = high >= bb.barLow and low <= bb.barHigh
-            bool stillAlive = bb.bias == BULLISH
-                 ? bullishOrderBlockMitigationSource >= bb.barLow
-                 : bearishOrderBlockMitigationSource <= bb.barHigh
-            bool nowInside = overlaps and stillAlive
+            bool mitigated = bb.bias == BULLISH
+                 ? bullishOrderBlockMitigationSource < bb.barLow and (bb.barLow - bullishOrderBlockMitigationSource) >= minPen
+                 : bearishOrderBlockMitigationSource > bb.barHigh and (bearishOrderBlockMitigationSource - bb.barHigh) >= minPen
+            bool nowInside = overlaps and not mitigated
             if nowInside and not bb.wasInside
                 bb.touchCount += 1
             bb.wasInside := nowInside
@@ -1146,9 +1172,11 @@ storeOrderBlock(pivot brokenPivot, pivot originPivot, bool internal = false, int
                             float bullSrc_i = orderBlockMitigationInput == CLOSE_SRC ? c_i
                                  : orderBlockMitigationInput == BODY_SRC ? math.min(o_i, c_i)
                                  : l_i
-                            bool alive_i = bias == BULLISH
-                                 ? bullSrc_i >= obBottom
-                                 : bearSrc_i <= obTop
+                            float minPen_i = i < minPens.size() ? minPens.get(i) : minPen
+                            bool mitigated_i = bias == BULLISH
+                                 ? bullSrc_i < obBottom and (obBottom - bullSrc_i) >= minPen_i
+                                 : bearSrc_i > obTop and (bearSrc_i - obTop) >= minPen_i
+                            bool alive_i = not mitigated_i
                             // If the historical bar would have already
                             // mitigated the OB, drop it entirely.
                             if not alive_i
@@ -1218,6 +1246,7 @@ drawOrderBlocks(bool internal = false) =>
             b_ox.set_bottom_right_point(chart.point.new(time, na, close))
             b_ox.set_bgcolor(color.new(color.white, 100))
             b_ox.set_border_color(color.new(color.white, 100))
+            b_ox.set_text('')
     if showCEMidlinesInput
         int ceUsed = math.min(usedCount, totalCELines)
         if ceUsed < totalCELines
@@ -1278,6 +1307,7 @@ drawBreakerBlocks(bool internal = false) =>
             b_ox.set_bottom_right_point(chart.point.new(time, na, close))
             b_ox.set_bgcolor(color.new(color.white, 100))
             b_ox.set_border_color(color.new(color.white, 100))
+            b_ox.set_text('')
     if showCEMidlinesInput
         int ceUsed = math.min(usedCount, totalCELines)
         if ceUsed < totalCELines
@@ -1330,19 +1360,24 @@ displayStructure(bool internal = false) =>
             bool isChoch = tag == CHOCH
 
             bool applyMSS = internal ? mssApplyInternalInput : mssApplySwingInput
-            if isChoch and showMSSInput and applyMSS and isDisplacement(true)
-                tag := MSS
+            int bullDispOffset = int(na)
+            if isChoch and showMSSInput and applyMSS
+                bullDispOffset := displacementOffset(true)
+                if not na(bullDispOffset)
+                    tag := MSS
 
             if internal
-                currentAlerts.internalBullishCHoCH := isChoch
+                currentAlerts.internalBullishCHoCH := tag == CHOCH
                 currentAlerts.internalBullishBOS   := tag == BOS
                 if tag == MSS
                     currentAlerts.internalBullishMSS := true
+                    currentAlerts.bullishMSSOffset := bullDispOffset
             else
-                currentAlerts.swingBullishCHoCH    := isChoch
+                currentAlerts.swingBullishCHoCH    := tag == CHOCH
                 currentAlerts.swingBullishBOS      := tag == BOS
                 if tag == MSS
                     currentAlerts.swingBullishMSS := true
+                    currentAlerts.bullishMSSOffset := bullDispOffset
 
             // v15.3 — Use mintick tolerance instead of float ==.
             if not na(snapHigh.currentLevel) and not na(realHigh.currentLevel) and math.abs(snapHigh.currentLevel - realHigh.currentLevel) <= syminfo.mintick / 2
@@ -1376,19 +1411,24 @@ displayStructure(bool internal = false) =>
             bool isChoch = tag == CHOCH
 
             bool applyMSS = internal ? mssApplyInternalInput : mssApplySwingInput
-            if isChoch and showMSSInput and applyMSS and isDisplacement(false)
-                tag := MSS
+            int bearDispOffset = int(na)
+            if isChoch and showMSSInput and applyMSS
+                bearDispOffset := displacementOffset(false)
+                if not na(bearDispOffset)
+                    tag := MSS
 
             if internal
-                currentAlerts.internalBearishCHoCH := isChoch
+                currentAlerts.internalBearishCHoCH := tag == CHOCH
                 currentAlerts.internalBearishBOS   := tag == BOS
                 if tag == MSS
                     currentAlerts.internalBearishMSS := true
+                    currentAlerts.bearishMSSOffset := bearDispOffset
             else
-                currentAlerts.swingBearishCHoCH    := isChoch
+                currentAlerts.swingBearishCHoCH    := tag == CHOCH
                 currentAlerts.swingBearishBOS      := tag == BOS
                 if tag == MSS
                     currentAlerts.swingBearishMSS := true
+                    currentAlerts.bearishMSSOffset := bearDispOffset
 
             // v15.3 — Use mintick tolerance instead of float ==.
             if not na(snapLow.currentLevel) and not na(realLow.currentLevel) and math.abs(snapLow.currentLevel - realLow.currentLevel) <= syminfo.mintick / 2
@@ -1533,11 +1573,11 @@ deleteInvertedFVGs() =>
             //         v16.1 had the field references right but used a bare `close`
             //         comparison that didn't filter wick sweeps; bringing in the
             //         shared mitigation source matches v16.0 ICT-correctness.
-            float ifvgBullSrc = orderBlockMitigationInput == CLOSE_SRC ? close
-                 : orderBlockMitigationInput == BODY_SRC ? math.min(open, close)
+            float ifvgBullSrc = ifvgMitigationInput == CLOSE_SRC ? close
+                 : ifvgMitigationInput == BODY_SRC ? math.min(open, close)
                  : low
-            float ifvgBearSrc = orderBlockMitigationInput == CLOSE_SRC ? close
-                 : orderBlockMitigationInput == BODY_SRC ? math.max(open, close)
+            float ifvgBearSrc = ifvgMitigationInput == CLOSE_SRC ? close
+                 : ifvgMitigationInput == BODY_SRC ? math.max(open, close)
                  : high
 
             if eachIFVG.bias == BULLISH and ifvgBullSrc < eachIFVG.top
@@ -1565,27 +1605,29 @@ drawFairValueGaps() =>
     // v15.3 — Was (midClose - midOpen) / (midOpen * 100), which is 1/100th of
     //         the real percentage. Threshold compares like-for-like so detection
     //         still functioned, but the variable now represents an actual %.
-    barDeltaPercent = (midClose - midOpen) / midOpen * 100
+    barDeltaPercent = midOpen != 0 ? (midClose - midOpen) / midOpen * 100 : 0
     newTimeframe    = timeframe.change(fairValueGapsTimeframeInput)
     threshold       = fairValueGapsThresholdInput
-         ? ta.cum(math.abs(newTimeframe ? barDeltaPercent : 0)) / bar_index * 2
+         ? ta.cum(math.abs(newTimeframe ? barDeltaPercent : 0)) / math.max(bar_index, 1) * 2
          : 0
     float ceLevel = na
     bullishFVG = recentLow > oldHigh and midClose > oldHigh and barDeltaPercent > threshold and newTimeframe and barstate.isconfirmed
     bearishFVG = recentHigh < oldLow and midClose < oldLow and -barDeltaPercent > threshold and newTimeframe and barstate.isconfirmed
+    color activeBullFVGColor = showFairValueGapsInput ? fairValueGapBullishColor : color.new(fairValueGapBullishColor, 100)
+    color activeBearFVGColor = showFairValueGapsInput ? fairValueGapBearishColor : color.new(fairValueGapBearishColor, 100)
     if bullishFVG
         currentAlerts.bullishFairValueGap := true
         ceLevel  := math.avg(recentLow, oldHigh)
         fairValueGaps.unshift(fairValueGap.new(recentLow, oldHigh, BULLISH,
-             fairValueGapBox(midTime, recentTime, recentLow, ceLevel, fairValueGapBullishColor),
-             fairValueGapBox(midTime, recentTime, ceLevel, oldHigh, fairValueGapBullishColor),
+             fairValueGapBox(midTime, recentTime, recentLow, ceLevel, activeBullFVGColor),
+             fairValueGapBox(midTime, recentTime, ceLevel, oldHigh, activeBullFVGColor),
              bar_index))
     if bearishFVG
         currentAlerts.bearishFairValueGap := true
         ceLevel  := math.avg(recentHigh, oldLow)
         fairValueGaps.unshift(fairValueGap.new(recentHigh, oldLow, BEARISH,
-             fairValueGapBox(midTime, recentTime, recentHigh, ceLevel, fairValueGapBearishColor),
-             fairValueGapBox(midTime, recentTime, ceLevel, oldLow, fairValueGapBearishColor),
+             fairValueGapBox(midTime, recentTime, recentHigh, ceLevel, activeBearFVGColor),
+             fairValueGapBox(midTime, recentTime, ceLevel, oldLow, activeBearFVGColor),
              bar_index))
     trimFairValueGaps()
 
@@ -1794,7 +1836,7 @@ if showHighLowSwingsInput or showPremiumDiscountZonesInput or showOTEInput
     if showOTEInput and swingTrend.bias != 0
         drawOTEZone()
 
-if showFairValueGapsInput and barstate.isconfirmed
+if needFVGTracking and barstate.isconfirmed
     deleteFairValueGaps()
 if showIFVGInput and barstate.isconfirmed
     deleteInvertedFVGs()
@@ -1818,6 +1860,8 @@ if showStructureInput or needSwingOBTracking or showHighLowSwingsInput
 
 displacementBullFlag := currentAlerts.internalBullishMSS or currentAlerts.swingBullishMSS
 displacementBearFlag := currentAlerts.internalBearishMSS or currentAlerts.swingBearishMSS
+displacementBullOffset := displacementBullFlag ? currentAlerts.bullishMSSOffset : na
+displacementBearOffset := displacementBearFlag ? currentAlerts.bearishMSSOffset : na
 
 // Liquidity Sweep Detection
 if showLiquiditySweepsInput and barstate.isconfirmed
@@ -1886,7 +1930,7 @@ if showInternalBreakerBlocksInput and barstate.isconfirmed
 if showSwingBreakerBlocksInput and barstate.isconfirmed
     updateBreakerBlockTouches()
 
-if showFairValueGapsInput and barstate.isconfirmed
+if needFVGTracking and barstate.isconfirmed
     drawFairValueGaps()
 
 if barstate.islastconfirmedhistory or barstate.islast
@@ -2251,27 +2295,55 @@ if showNYRangeInput and not na(nyRangeHigh) and not na(nyRangeLow)
     nyLowLabel.set_color(color(na))
     nyLowLabel.set_style(label.style_label_left)
 
-bool showBullDisp = displacementBullFlag and showDisplacementInput and isDisplacementCandle(0, true)
-bool showBearDisp = displacementBearFlag and showDisplacementInput and isDisplacementCandle(0, false)
+bool showBullDisp0 = displacementBullFlag and showDisplacementInput and displacementBullOffset == 0
+bool showBullDisp1 = displacementBullFlag and showDisplacementInput and displacementBullOffset == 1
+bool showBullDisp2 = displacementBullFlag and showDisplacementInput and displacementBullOffset == 2
+bool showBullDisp3 = displacementBullFlag and showDisplacementInput and displacementBullOffset == 3
+bool showBullDisp4 = displacementBullFlag and showDisplacementInput and displacementBullOffset == 4
+bool showBullDisp5 = displacementBullFlag and showDisplacementInput and displacementBullOffset == 5
+bool showBullDisp6 = displacementBullFlag and showDisplacementInput and displacementBullOffset == 6
+bool showBullDisp7 = displacementBullFlag and showDisplacementInput and displacementBullOffset == 7
+bool showBullDisp8 = displacementBullFlag and showDisplacementInput and displacementBullOffset == 8
+bool showBullDisp9 = displacementBullFlag and showDisplacementInput and displacementBullOffset == 9
+bool showBearDisp0 = displacementBearFlag and showDisplacementInput and displacementBearOffset == 0
+bool showBearDisp1 = displacementBearFlag and showDisplacementInput and displacementBearOffset == 1
+bool showBearDisp2 = displacementBearFlag and showDisplacementInput and displacementBearOffset == 2
+bool showBearDisp3 = displacementBearFlag and showDisplacementInput and displacementBearOffset == 3
+bool showBearDisp4 = displacementBearFlag and showDisplacementInput and displacementBearOffset == 4
+bool showBearDisp5 = displacementBearFlag and showDisplacementInput and displacementBearOffset == 5
+bool showBearDisp6 = displacementBearFlag and showDisplacementInput and displacementBearOffset == 6
+bool showBearDisp7 = displacementBearFlag and showDisplacementInput and displacementBearOffset == 7
+bool showBearDisp8 = displacementBearFlag and showDisplacementInput and displacementBearOffset == 8
+bool showBearDisp9 = displacementBearFlag and showDisplacementInput and displacementBearOffset == 9
+
+plotshape(showBullDisp0, title='Bullish Displacement',    location=location.belowbar, style=shape.diamond, size=size.tiny, color=mssBullColorInput, offset=0)
+plotshape(showBullDisp1, title='Bullish Displacement -1', location=location.belowbar, style=shape.diamond, size=size.tiny, color=mssBullColorInput, offset=-1)
+plotshape(showBullDisp2, title='Bullish Displacement -2', location=location.belowbar, style=shape.diamond, size=size.tiny, color=mssBullColorInput, offset=-2)
+plotshape(showBullDisp3, title='Bullish Displacement -3', location=location.belowbar, style=shape.diamond, size=size.tiny, color=mssBullColorInput, offset=-3)
+plotshape(showBullDisp4, title='Bullish Displacement -4', location=location.belowbar, style=shape.diamond, size=size.tiny, color=mssBullColorInput, offset=-4)
+plotshape(showBullDisp5, title='Bullish Displacement -5', location=location.belowbar, style=shape.diamond, size=size.tiny, color=mssBullColorInput, offset=-5)
+plotshape(showBullDisp6, title='Bullish Displacement -6', location=location.belowbar, style=shape.diamond, size=size.tiny, color=mssBullColorInput, offset=-6)
+plotshape(showBullDisp7, title='Bullish Displacement -7', location=location.belowbar, style=shape.diamond, size=size.tiny, color=mssBullColorInput, offset=-7)
+plotshape(showBullDisp8, title='Bullish Displacement -8', location=location.belowbar, style=shape.diamond, size=size.tiny, color=mssBullColorInput, offset=-8)
+plotshape(showBullDisp9, title='Bullish Displacement -9', location=location.belowbar, style=shape.diamond, size=size.tiny, color=mssBullColorInput, offset=-9)
+
+plotshape(showBearDisp0, title='Bearish Displacement',    location=location.abovebar, style=shape.diamond, size=size.tiny, color=mssBearColorInput, offset=0)
+plotshape(showBearDisp1, title='Bearish Displacement -1', location=location.abovebar, style=shape.diamond, size=size.tiny, color=mssBearColorInput, offset=-1)
+plotshape(showBearDisp2, title='Bearish Displacement -2', location=location.abovebar, style=shape.diamond, size=size.tiny, color=mssBearColorInput, offset=-2)
+plotshape(showBearDisp3, title='Bearish Displacement -3', location=location.abovebar, style=shape.diamond, size=size.tiny, color=mssBearColorInput, offset=-3)
+plotshape(showBearDisp4, title='Bearish Displacement -4', location=location.abovebar, style=shape.diamond, size=size.tiny, color=mssBearColorInput, offset=-4)
+plotshape(showBearDisp5, title='Bearish Displacement -5', location=location.abovebar, style=shape.diamond, size=size.tiny, color=mssBearColorInput, offset=-5)
+plotshape(showBearDisp6, title='Bearish Displacement -6', location=location.abovebar, style=shape.diamond, size=size.tiny, color=mssBearColorInput, offset=-6)
+plotshape(showBearDisp7, title='Bearish Displacement -7', location=location.abovebar, style=shape.diamond, size=size.tiny, color=mssBearColorInput, offset=-7)
+plotshape(showBearDisp8, title='Bearish Displacement -8', location=location.abovebar, style=shape.diamond, size=size.tiny, color=mssBearColorInput, offset=-8)
+plotshape(showBearDisp9, title='Bearish Displacement -9', location=location.abovebar, style=shape.diamond, size=size.tiny, color=mssBearColorInput, offset=-9)
 
 if displacementBullFlag
     displacementBullFlag := false
+    displacementBullOffset := na
 if displacementBearFlag
     displacementBearFlag := false
-
-plotshape(showBullDisp,
-    title='Bullish Displacement',
-    location=location.belowbar,
-    style=shape.diamond,
-    size=size.tiny,
-    color=mssBullColorInput)
-
-plotshape(showBearDisp,
-    title='Bearish Displacement',
-    location=location.abovebar,
-    style=shape.diamond,
-    size=size.tiny,
-    color=mssBearColorInput)
+    displacementBearOffset := na
 
 //──────────────────────────────────────────────────────────────────────────────
 // Alerts
@@ -2327,8 +2399,9 @@ alertcondition(currentAlerts.internalBearishMSS, 'Internal Bearish MSS', 'Intern
 alertcondition(currentAlerts.swingBullishMSS,    'Bullish MSS',          'Bullish Market Structure Shift detected')
 alertcondition(currentAlerts.swingBearishMSS,    'Bearish MSS',          'Bearish Market Structure Shift detected')
 
-bool asianHighTouched = showAsianRangeInput and not na(asianRangeHigh) and high >= asianRangeHigh and high[1] < asianRangeHigh
-bool asianLowTouched  = showAsianRangeInput and not na(asianRangeLow)  and low  <= asianRangeLow  and low[1]  > asianRangeLow
+bool asianActiveForAlert = showAsianRangeInput and not na(time(timeframe.period, asianRangeSessionInput, rangeTimezoneInput))
+bool asianHighTouched = showAsianRangeInput and not asianActiveForAlert and not na(asianRangeHigh) and high >= asianRangeHigh and (na(high[1]) or high[1] < asianRangeHigh)
+bool asianLowTouched  = showAsianRangeInput and not asianActiveForAlert and not na(asianRangeLow)  and low  <= asianRangeLow  and (na(low[1])  or low[1]  > asianRangeLow)
 bool priceInOTE = false
 // v15.3 — Mirror the bearish OTE math fix from drawOTEZone(); also gate on
 //         swingTrend.bias != 0 so we don't fire the alert in the warm-up
@@ -2353,10 +2426,13 @@ bool midnightOpenTouched = showMidnightOpenInput and not na(midnightOpenPrice) a
     not (high[1] >= midnightOpenPrice and low[1] <= midnightOpenPrice))
 alertcondition(midnightOpenTouched, 'Midnight Open Touched', 'Price touched Midnight Open level')
 
-bool londonHighTouched = showLondonRangeInput and not na(londonRangeHigh) and high >= londonRangeHigh and high[1] < londonRangeHigh
-bool londonLowTouched  = showLondonRangeInput and not na(londonRangeLow)  and low  <= londonRangeLow  and low[1]  > londonRangeLow
-bool nyHighTouched     = showNYRangeInput     and not na(nyRangeHigh)     and high >= nyRangeHigh     and high[1] < nyRangeHigh
-bool nyLowTouched      = showNYRangeInput     and not na(nyRangeLow)      and low  <= nyRangeLow      and low[1]  > nyRangeLow
+bool londonActiveForAlert = showLondonRangeInput and not na(time(timeframe.period, londonRangeSessionInput, rangeTimezoneInput))
+bool nyActiveForAlert     = showNYRangeInput     and not na(time(timeframe.period, nyRangeSessionInput, rangeTimezoneInput))
+
+bool londonHighTouched = showLondonRangeInput and not londonActiveForAlert and not na(londonRangeHigh) and high >= londonRangeHigh and (na(high[1]) or high[1] < londonRangeHigh)
+bool londonLowTouched  = showLondonRangeInput and not londonActiveForAlert and not na(londonRangeLow)  and low  <= londonRangeLow  and (na(low[1])  or low[1]  > londonRangeLow)
+bool nyHighTouched     = showNYRangeInput     and not nyActiveForAlert     and not na(nyRangeHigh)     and high >= nyRangeHigh     and (na(high[1]) or high[1] < nyRangeHigh)
+bool nyLowTouched      = showNYRangeInput     and not nyActiveForAlert     and not na(nyRangeLow)      and low  <= nyRangeLow      and (na(low[1])  or low[1]  > nyRangeLow)
 
 alertcondition(londonHighTouched, 'London High Touched', 'Price reached London Range High')
 alertcondition(londonLowTouched,  'London Low Touched',  'Price reached London Range Low')
