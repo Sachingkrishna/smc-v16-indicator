@@ -67,6 +67,31 @@
 //         mitigation, and hidden FVG tracking for iFVG-only mode.
 // v16.6 — Replaces MSS displacement plotshape offset markers with label markers
 //         so the script stays below TradingView's 64-plot hard limit.
+// v17.0 — Bug-fix + feature release:
+//         • EQH/EQL sweep detection. Sweeps now fire `Bearish EQH Sweep` /
+//           `Bullish EQL Sweep` alerts when price wicks through an Equal
+//           High/Low cluster and reverses. Previously only swing pivots
+//           generated sweep alerts despite EQH/EQL being explicit ICT
+//           liquidity pools.
+//         • useTrailResetInput now honours pivotSourceInput on swing-flip
+//           reset. Was hardcoded to math.max/min(open, close); in Wick mode
+//           this caused a one-cycle desync where Strong/Weak H/L drifted
+//           toward the body until updateTrailingExtremes overwrote it.
+//         • MSS displacement-offset field split: internalBullish/Bearish
+//           and swingBullish/Bearish offsets stored separately. Previously
+//           shared a single int → on the rare bar where both internal and
+//           swing MSS fired with different offsets, last write won and only
+//           one diamond marker rendered. drawDisplacementMarker() helper
+//           now dedupes when offsets match.
+//         • CVD (Cumulative Volume Delta) — new institutional-footprint
+//           module. Per-bar delta = volume * (2·close − high − low) / range
+//           (close-position weighted); cumulated chart-wide. Detects CVD
+//           divergence at confirmed swing pivots: HH in price + LH in CVD
+//           = bearish (distribution); LL in price + HL in CVD = bullish
+//           (accumulation). Markers placed at the pivot bar; alertconditions
+//           emitted; optional top-right status table shows live CVD value.
+//           Works on any instrument with `volume` (most equities/futures/
+//           crypto); silently zero on volume-less symbols (some indices).
 // v16.9 — Code-quality cleanup release:
 //         • Replaced the 10-branch hardcoded `low[N]` / `high[N]` ladder for
 //           MSS displacement label placement with native Pine v6 dynamic
@@ -108,7 +133,7 @@
 //           ICT timing is designed for FX/futures/crypto, not stocks.
 
 //@version=6
-indicator('Smart Money Concepts [v16.9]', 'SMC v16.9', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+indicator('Smart Money Concepts [v17.0]', 'SMC v17.0', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -163,6 +188,7 @@ KILLZONE_GROUP = 'Kill Zones'
 SESSION_GROUP  = 'Sessions'
 PDHL_GROUP     = 'Previous Day / Week Levels'
 NDOG_GROUP     = 'Opening Gaps (NDOG/NWOG)'
+CVD_GROUP      = 'Cumulative Volume Delta (CVD)'
 
 MAX_SESSION_BOXES  = 50
 MAX_SESSION_LABELS = 50
@@ -413,6 +439,18 @@ ndogMaxAgeHoursInput = input.int(24, 'Auto-Expire After (hours)',     group=NDOG
     minval=0, maxval=168,
     tooltip='Remove unfilled NDOG after this many hours.\n0 = never expire (removed only when filled or max count reached).\n24 = persist for 1 trading day.\nWorks consistently across all timeframes.')
 
+// ── CVD (Cumulative Volume Delta) ────────────────────────────────────────────
+showCVDDivergenceInput = input(false, 'Detect CVD Divergence at Swings', group=CVD_GROUP,
+     tooltip='Marks confirmed swing pivots where CVD diverges from price.\n' +
+             'Bearish: HH in price + LH in CVD = distribution / absorption.\n' +
+             'Bullish: LL in price + HL in CVD = accumulation.\n' +
+             'Per-bar delta is volume × close-position weight: +1 at high, -1 at low.\n' +
+             'Silently zero on volume-less symbols (some indices/forex).')
+showCVDTableInput      = input(false, 'Show CVD Status Table',           group=CVD_GROUP,
+     tooltip='Top-right table showing live cumulative CVD value, sign, and bar delta.')
+cvdBullDivColorInput   = input.color(#00e676, 'Bullish Divergence Marker', group=CVD_GROUP)
+cvdBearDivColorInput   = input.color(#ff1744, 'Bearish Divergence Marker', group=CVD_GROUP)
+
 //──────────────────────────────────────────────────────────────────────────────
 // Types
 //──────────────────────────────────────────────────────────────────────────────
@@ -451,8 +489,19 @@ type alerts
     bool bearishBreakerMitigated     = false
     bool bullishIFVGFormed           = false
     bool bearishIFVGFormed           = false
-    int  bullishMSSOffset            = na
-    int  bearishMSSOffset            = na
+    // v17.0 — Split per source so internal and swing MSS can fire on the
+    //         same bar with different displacement offsets without
+    //         clobbering each other.
+    int  internalBullishMSSOffset    = na
+    int  internalBearishMSSOffset    = na
+    int  swingBullishMSSOffset       = na
+    int  swingBearishMSSOffset       = na
+    // v17.0 — EQH/EQL sweep alerts (extending swing-only sweep coverage).
+    bool bearishEQHSweep             = false
+    bool bullishEQLSweep             = false
+    // v17.0 — CVD divergence at confirmed swing pivots.
+    bool bullishCVDDivergence        = false
+    bool bearishCVDDivergence        = false
 
 type trailingExtremes
     float top
@@ -488,6 +537,11 @@ type pivot
     //         sweeps register against the true swing extreme even when the
     //         structural level (currentLevel) is anchored at the body.
     float actualLevel = na
+    // v17.0 — CVD value snapshot at the pivot bar. Used by divergence
+    //         detection to compare price-level vs CVD-level evolution
+    //         across consecutive swings.
+    float currentCVD  = na
+    float lastCVD     = na
 
 // ── v15.2: wasInside defaults to TRUE — the OB candle itself is by definition
 //          inside the zone, so a touch can only count after price has demonstrably
@@ -602,8 +656,20 @@ var bool  anyCloseAboveSwingHigh = false
 var bool  anyCloseBelowSwingLow  = false
 var int   lastSwingHighBarIdx    = -1
 var int   lastSwingLowBarIdx     = -1
+// v17.0 — EQH/EQL sweep latching state (mirrors swing-high/low pattern).
+var bool  eqHighSwept            = false
+var bool  eqLowSwept             = false
+var bool  anyCloseAboveEqHigh    = false
+var bool  anyCloseBelowEqLow     = false
+var int   lastEqHighBarIdx       = -1
+var int   lastEqLowBarIdx        = -1
+// v17.0 — CVD divergence latching: only re-evaluate on a freshly-formed
+//         swing pivot (barIndex change), not on every bar.
+var int   lastCVDDivHighIdx      = -1
+var int   lastCVDDivLowIdx       = -1
 var array<label> sweepLabels     = array.new<label>()
 var array<label> displacementLabels = array.new<label>()
+var array<label> cvdDivLabels    = array.new<label>()
 
 var sessionTracker sydneySession  = sessionTracker.new(false, false, na, na, na, na, na, na)
 var sessionTracker tokyoSession   = sessionTracker.new(false, false, na, na, na, na, na, na)
@@ -636,10 +702,10 @@ var float nyRangeHigh          = na
 var float nyRangeLow           = na
 var bool  nyPrevActive         = false
 var int   nyRangeStartTime     = na
-var bool displacementBullFlag = false
-var bool displacementBearFlag = false
-var int  displacementBullOffset = na
-var int  displacementBearOffset = na
+// v17.0 — displacementBull/BearFlag/Offset pattern removed; the marker
+//         emitter now consumes currentAlerts.{internal,swing}{Bullish,
+//         Bearish}MSSOffset directly, which fixes the offset-collision bug
+//         where shared bullish/bearishMSSOffset fields got overwritten.
 
 // v15.4 — Initialise to -1 so that on the very first realtime bar
 //         currentBarIndex != lastBarIndex → newBar = true.
@@ -691,6 +757,8 @@ copyPivot(pivot dst, pivot src) =>
     dst.barTime      := src.barTime
     dst.barIndex     := src.barIndex
     dst.actualLevel  := src.actualLevel
+    dst.currentCVD   := src.currentCVD
+    dst.lastCVD      := src.lastCVD
 
 //──────────────────────────────────────────────────────────────────────────────
 // Volatility & Parsing
@@ -712,6 +780,19 @@ volatilityMeasure = orderBlockFilterInput == ATR ? atrMeasure : ta.cum(ta.tr) / 
 highVolatilityBar = (high - low) >= (2 * volatilityMeasure)
 parsedHigh        = highVolatilityBar ? low  : high
 parsedLow         = highVolatilityBar ? high : low
+
+// v17.0 — CVD (Cumulative Volume Delta).
+//         Per-bar delta = volume × close-position weight, where weight is +1
+//         at the high, −1 at the low, 0 at the midpoint. This approximates
+//         buy/sell pressure without true tick data. Fallback for zero-range
+//         bars uses sign(close − open).
+//         Gated behind needCVD so volume-less symbols and disabled state
+//         contribute zero rather than NaNs to ta.cum().
+bool  needCVD       = showCVDDivergenceInput or showCVDTableInput
+float cvdRange      = high - low
+float cvdWeight     = cvdRange > 0 ? (2 * close - high - low) / cvdRange : math.sign(close - open)
+float cvdBarDelta   = needCVD ? cvdWeight * nz(volume) : 0.0
+float cumCVD        = ta.cum(cvdBarDelta)
 // v15.3 — lookahead_off avoids future-bar leakage; the value is constant
 //         per bar (bar duration) so lookahead_on is unnecessary anyway.
 htfBarDuration    = nz(
@@ -938,6 +1019,12 @@ getCurrentStructure(int size, bool equalHighLow = false, bool internal = false) 
             p_ivot.barTime      := time[size]
             p_ivot.barIndex     := bar_index[size]
             p_ivot.actualLevel  := low[size]
+            // v17.0 — Snapshot CVD at the pivot bar for divergence detection.
+            //         Only on swing-level pivots (not internal / not EQ) since
+            //         divergence at internal-structure level is too noisy.
+            if not equalHighLow and not internal
+                p_ivot.lastCVD    := p_ivot.currentCVD
+                p_ivot.currentCVD := cumCVD[size]
             if not equalHighLow and not internal
                 trailing.bottom         := p_ivot.currentLevel
                 trailing.barTime        := p_ivot.barTime
@@ -957,6 +1044,10 @@ getCurrentStructure(int size, bool equalHighLow = false, bool internal = false) 
             p_ivot.barTime      := time[size]
             p_ivot.barIndex     := bar_index[size]
             p_ivot.actualLevel  := high[size]
+            // v17.0 — Snapshot CVD at the pivot bar (swing-level only).
+            if not equalHighLow and not internal
+                p_ivot.lastCVD    := p_ivot.currentCVD
+                p_ivot.currentCVD := cumCVD[size]
             if not equalHighLow and not internal
                 trailing.top         := p_ivot.currentLevel
                 trailing.barTime     := p_ivot.barTime
@@ -1451,25 +1542,28 @@ displayStructure(bool internal = false) =>
                 currentAlerts.internalBullishCHoCH := tag == CHOCH
                 currentAlerts.internalBullishBOS   := tag == BOS
                 if tag == MSS
-                    currentAlerts.internalBullishMSS := true
-                    currentAlerts.bullishMSSOffset := bullDispOffset
+                    currentAlerts.internalBullishMSS       := true
+                    currentAlerts.internalBullishMSSOffset := bullDispOffset
             else
                 currentAlerts.swingBullishCHoCH    := tag == CHOCH
                 currentAlerts.swingBullishBOS      := tag == BOS
                 if tag == MSS
-                    currentAlerts.swingBullishMSS := true
-                    currentAlerts.bullishMSSOffset := bullDispOffset
+                    currentAlerts.swingBullishMSS       := true
+                    currentAlerts.swingBullishMSSOffset := bullDispOffset
 
             // v15.3 — Use mintick tolerance instead of float ==.
             if not na(snapHigh.currentLevel) and not na(realHigh.currentLevel) and math.abs(snapHigh.currentLevel - realHigh.currentLevel) <= syminfo.mintick / 2
                 realHigh.crossed := true
             t_rend.bias := BULLISH
 
+            // v17.0 — Trail-reset top now respects pivotSourceInput so a
+            //         Wick-mode chart resets to the actual high, not the body.
             if not internal and useTrailResetInput
+                float resetTop = pivotSourceInput == 'Wick' ? high : math.max(open, close)
                 trailing.bottom         := nz(snapSwingLow.currentLevel, math.min(open, close))
                 trailing.lastBottomTime := nz(snapSwingLow.barTime, time)
                 trailing.barIndex       := nz(snapSwingLow.barIndex, bar_index)
-                trailing.top            := math.max(open, close)
+                trailing.top            := resetTop
                 trailing.lastTopTime    := time
 
             bool isChochOrMSS = tag == CHOCH or tag == MSS
@@ -1502,25 +1596,27 @@ displayStructure(bool internal = false) =>
                 currentAlerts.internalBearishCHoCH := tag == CHOCH
                 currentAlerts.internalBearishBOS   := tag == BOS
                 if tag == MSS
-                    currentAlerts.internalBearishMSS := true
-                    currentAlerts.bearishMSSOffset := bearDispOffset
+                    currentAlerts.internalBearishMSS       := true
+                    currentAlerts.internalBearishMSSOffset := bearDispOffset
             else
                 currentAlerts.swingBearishCHoCH    := tag == CHOCH
                 currentAlerts.swingBearishBOS      := tag == BOS
                 if tag == MSS
-                    currentAlerts.swingBearishMSS := true
-                    currentAlerts.bearishMSSOffset := bearDispOffset
+                    currentAlerts.swingBearishMSS       := true
+                    currentAlerts.swingBearishMSSOffset := bearDispOffset
 
             // v15.3 — Use mintick tolerance instead of float ==.
             if not na(snapLow.currentLevel) and not na(realLow.currentLevel) and math.abs(snapLow.currentLevel - realLow.currentLevel) <= syminfo.mintick / 2
                 realLow.crossed := true
             t_rend.bias := BEARISH
 
+            // v17.0 — Trail-reset bottom now respects pivotSourceInput.
             if not internal and useTrailResetInput
+                float resetBot = pivotSourceInput == 'Wick' ? low : math.min(open, close)
                 trailing.top            := nz(snapSwingHigh.currentLevel, math.max(open, close))
                 trailing.lastTopTime    := nz(snapSwingHigh.barTime, time)
                 trailing.barIndex       := nz(snapSwingHigh.barIndex, bar_index)
-                trailing.bottom         := math.min(open, close)
+                trailing.bottom         := resetBot
                 trailing.lastBottomTime := time
 
             bool isChochOrMSS = tag == CHOCH or tag == MSS
@@ -1947,11 +2043,6 @@ if showInternalsInput or needInternalOBTracking or showTrendInput
 if showStructureInput or needSwingOBTracking or showHighLowSwingsInput
     displayStructure()
 
-displacementBullFlag := currentAlerts.internalBullishMSS or currentAlerts.swingBullishMSS
-displacementBearFlag := currentAlerts.internalBearishMSS or currentAlerts.swingBearishMSS
-displacementBullOffset := displacementBullFlag ? currentAlerts.bullishMSSOffset : na
-displacementBearOffset := displacementBearFlag ? currentAlerts.bearishMSSOffset : na
-
 // Liquidity Sweep Detection
 // v16.7 — Compare against the swing pivot's wick high/low (actualLevel) so a
 //         sweep registers against the true swing extreme even when Pivot
@@ -1994,6 +2085,83 @@ if showLiquiditySweepsInput and barstate.isconfirmed
                 label.delete(sweepLabels.shift())
         else if close < sweepLowLevel
             anyCloseBelowSwingLow := true
+
+    // v17.0 — Equal Highs/Lows are textbook ICT liquidity pools.
+    //         Mirror the swing sweep latching logic against the most recent
+    //         confirmed EQH/EQL level so wick-and-reverse through a pool
+    //         emits its own dedicated alert.
+    if equalHigh.barIndex != lastEqHighBarIdx
+        eqHighSwept            := false
+        anyCloseAboveEqHigh    := false
+        lastEqHighBarIdx       := equalHigh.barIndex
+    if equalLow.barIndex != lastEqLowBarIdx
+        eqLowSwept             := false
+        anyCloseBelowEqLow     := false
+        lastEqLowBarIdx        := equalLow.barIndex
+    if not na(equalHigh.currentLevel) and not eqHighSwept and not anyCloseAboveEqHigh
+        float eqHighSweepLevel = nz(equalHigh.actualLevel, equalHigh.currentLevel)
+        if high > eqHighSweepLevel and close <= eqHighSweepLevel
+            eqHighSwept                  := true
+            currentAlerts.bearishEQHSweep := true
+            color sweepCol = styleInput == MONOCHROME ? MONO_BEARISH : sweepBearColorInput
+            label sl = label.new(bar_index, high, 'EQH×',
+                 color=color(na), textcolor=sweepCol,
+                 style=label.style_label_down, size=sweepLabelSizeInput)
+            sweepLabels.push(sl)
+            if sweepLabels.size() > MAX_SWEEP_LABELS
+                label.delete(sweepLabels.shift())
+        else if close > eqHighSweepLevel
+            anyCloseAboveEqHigh := true
+    if not na(equalLow.currentLevel) and not eqLowSwept and not anyCloseBelowEqLow
+        float eqLowSweepLevel = nz(equalLow.actualLevel, equalLow.currentLevel)
+        if low < eqLowSweepLevel and close >= eqLowSweepLevel
+            eqLowSwept                   := true
+            currentAlerts.bullishEQLSweep := true
+            color sweepCol = styleInput == MONOCHROME ? MONO_BULLISH : sweepBullColorInput
+            label sl = label.new(bar_index, low, 'EQL×',
+                 color=color(na), textcolor=sweepCol,
+                 style=label.style_label_up, size=sweepLabelSizeInput)
+            sweepLabels.push(sl)
+            if sweepLabels.size() > MAX_SWEEP_LABELS
+                label.delete(sweepLabels.shift())
+        else if close < eqLowSweepLevel
+            anyCloseBelowEqLow := true
+
+// v17.0 — CVD divergence detection at confirmed swing pivots.
+//         Bearish: HH in price + LH in CVD (price made higher swing high
+//                  but cumulative delta did NOT confirm = absorption /
+//                  distribution).
+//         Bullish: LL in price + HL in CVD (price made lower swing low
+//                  but cumulative delta did NOT confirm = accumulation).
+//         Triggered once per pivot, gated on barIndex change so it doesn't
+//         re-fire while the swing is still the most-recent pivot.
+if showCVDDivergenceInput and barstate.isconfirmed
+    if swingHigh.barIndex != lastCVDDivHighIdx
+        if not na(swingHigh.lastLevel) and not na(swingHigh.lastCVD) and not na(swingHigh.currentCVD) and swingHigh.currentLevel > swingHigh.lastLevel and swingHigh.currentCVD < swingHigh.lastCVD
+            currentAlerts.bearishCVDDivergence := true
+            label divLabel = label.new(swingHigh.barTime, swingHigh.actualLevel, 'CVD÷',
+                 xloc=xloc.bar_time,
+                 color=color(na),
+                 textcolor=cvdBearDivColorInput,
+                 style=label.style_label_down,
+                 size=size.tiny)
+            cvdDivLabels.push(divLabel)
+            if cvdDivLabels.size() > MAX_SWEEP_LABELS
+                label.delete(cvdDivLabels.shift())
+        lastCVDDivHighIdx := swingHigh.barIndex
+    if swingLow.barIndex != lastCVDDivLowIdx
+        if not na(swingLow.lastLevel) and not na(swingLow.lastCVD) and not na(swingLow.currentCVD) and swingLow.currentLevel < swingLow.lastLevel and swingLow.currentCVD > swingLow.lastCVD
+            currentAlerts.bullishCVDDivergence := true
+            label divLabel = label.new(swingLow.barTime, swingLow.actualLevel, 'CVD÷',
+                 xloc=xloc.bar_time,
+                 color=color(na),
+                 textcolor=cvdBullDivColorInput,
+                 style=label.style_label_up,
+                 size=size.tiny)
+            cvdDivLabels.push(divLabel)
+            if cvdDivLabels.size() > MAX_SWEEP_LABELS
+                label.delete(cvdDivLabels.shift())
+        lastCVDDivLowIdx := swingLow.barIndex
 
 // v15.4 — Correct execution order: delete OBs FIRST (mitigation → BB conversion),
 //         THEN count touches on surviving OBs. Previously updateOrderBlockTouches()
@@ -2406,40 +2574,55 @@ if showNYRangeInput and not na(nyRangeHigh) and not na(nyRangeLow)
     nyLowLabel.set_color(color(na))
     nyLowLabel.set_style(label.style_label_left)
 
-if displacementBullFlag and showDisplacementInput and not na(displacementBullOffset)
-    int dispX = bar_index - displacementBullOffset
-    // v16.9 — Dynamic series indexing (Pine v6) replaces a 10-branch ladder.
-    float dispY = low[displacementBullOffset]
-    label dispLabel = label.new(dispX, dispY, '◆',
-         xloc=xloc.bar_index,
-         color=color(na),
-         textcolor=mssBullColorInput,
-         style=label.style_none,
-         size=size.tiny)
-    displacementLabels.push(dispLabel)
-    if displacementLabels.size() > MAX_SWEEP_LABELS
-        label.delete(displacementLabels.shift())
+// v17.0 — Single shared marker emitter. Internal and swing MSS may both
+//         qualify on the same bar with potentially different displacement
+//         offsets; we render one marker per offset, deduplicating when both
+//         agree.
+drawDisplacementMarker(int offset, bool bullish, color textCol) =>
+    if not na(offset)
+        int dispX = bar_index - offset
+        float dispY = bullish ? low[offset] : high[offset]
+        label dispLabel = label.new(dispX, dispY, '◆',
+             xloc=xloc.bar_index,
+             color=color(na),
+             textcolor=textCol,
+             style=label.style_none,
+             size=size.tiny)
+        displacementLabels.push(dispLabel)
+        if displacementLabels.size() > MAX_SWEEP_LABELS
+            label.delete(displacementLabels.shift())
 
-if displacementBearFlag and showDisplacementInput and not na(displacementBearOffset)
-    int dispX = bar_index - displacementBearOffset
-    // v16.9 — Dynamic series indexing (Pine v6) replaces a 10-branch ladder.
-    float dispY = high[displacementBearOffset]
-    label dispLabel = label.new(dispX, dispY, '◆',
-         xloc=xloc.bar_index,
-         color=color(na),
-         textcolor=mssBearColorInput,
-         style=label.style_none,
-         size=size.tiny)
-    displacementLabels.push(dispLabel)
-    if displacementLabels.size() > MAX_SWEEP_LABELS
-        label.delete(displacementLabels.shift())
+if showDisplacementInput
+    int iBullOff = currentAlerts.internalBullishMSSOffset
+    int sBullOff = currentAlerts.swingBullishMSSOffset
+    int iBearOff = currentAlerts.internalBearishMSSOffset
+    int sBearOff = currentAlerts.swingBearishMSSOffset
+    if currentAlerts.internalBullishMSS
+        drawDisplacementMarker(iBullOff, true, mssBullColorInput)
+    if currentAlerts.swingBullishMSS and (na(iBullOff) or sBullOff != iBullOff)
+        drawDisplacementMarker(sBullOff, true, mssBullColorInput)
+    if currentAlerts.internalBearishMSS
+        drawDisplacementMarker(iBearOff, false, mssBearColorInput)
+    if currentAlerts.swingBearishMSS and (na(iBearOff) or sBearOff != iBearOff)
+        drawDisplacementMarker(sBearOff, false, mssBearColorInput)
 
-if displacementBullFlag
-    displacementBullFlag := false
-    displacementBullOffset := na
-if displacementBearFlag
-    displacementBearFlag := false
-    displacementBearOffset := na
+//──────────────────────────────────────────────────────────────────────────────
+// v17.0 — CVD Status Table
+//──────────────────────────────────────────────────────────────────────────────
+if showCVDTableInput and barstate.islast
+    var table cvdTable = table.new(position.top_right, 2, 3,
+         frame_color=color.new(color.gray, 50),
+         frame_width=1,
+         border_color=color.new(color.gray, 80),
+         border_width=1)
+    color cvdSignCol = cumCVD >= 0 ? GREEN : RED
+    table.cell(cvdTable, 0, 0, 'CVD',         text_color=color.white,    bgcolor=color.new(color.black, 60), text_size=size.small)
+    table.cell(cvdTable, 1, 0, str.tostring(cumCVD, format.volume), text_color=cvdSignCol, bgcolor=color.new(color.black, 80), text_size=size.small)
+    table.cell(cvdTable, 0, 1, 'Bias',        text_color=color.white,    bgcolor=color.new(color.black, 60), text_size=size.small)
+    table.cell(cvdTable, 1, 1, cumCVD >= 0 ? 'Bullish' : 'Bearish', text_color=cvdSignCol, bgcolor=color.new(color.black, 80), text_size=size.small)
+    table.cell(cvdTable, 0, 2, 'Δ Bar',       text_color=color.white,    bgcolor=color.new(color.black, 60), text_size=size.small)
+    color barSignCol = cvdBarDelta >= 0 ? GREEN : RED
+    table.cell(cvdTable, 1, 2, str.tostring(cvdBarDelta, format.volume), text_color=barSignCol, bgcolor=color.new(color.black, 80), text_size=size.small)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Alerts
@@ -2470,6 +2653,12 @@ alertcondition(currentAlerts.bullishFairValueGap,       'Bullish FVG',          
 alertcondition(currentAlerts.bearishFairValueGap,       'Bearish FVG',                  'Bearish FVG formed')
 alertcondition(currentAlerts.bullishLiquiditySweep,     'Bullish Liquidity Sweep',      'Bullish liquidity sweep detected')
 alertcondition(currentAlerts.bearishLiquiditySweep,     'Bearish Liquidity Sweep',      'Bearish liquidity sweep detected')
+// v17.0 — EQH/EQL pool sweep alerts.
+alertcondition(currentAlerts.bearishEQHSweep,           'EQH Sweep',                    'Equal Highs liquidity pool swept (bearish)')
+alertcondition(currentAlerts.bullishEQLSweep,           'EQL Sweep',                    'Equal Lows liquidity pool swept (bullish)')
+// v17.0 — CVD divergence at confirmed swing pivots.
+alertcondition(currentAlerts.bullishCVDDivergence,      'Bullish CVD Divergence',       'Bullish CVD divergence at swing low (potential accumulation)')
+alertcondition(currentAlerts.bearishCVDDivergence,      'Bearish CVD Divergence',       'Bearish CVD divergence at swing high (potential distribution)')
 alertcondition(currentAlerts.bullishBreakerFormed,      'Bullish Breaker Formed',       'Bullish breaker block formed')
 alertcondition(currentAlerts.bearishBreakerFormed,      'Bearish Breaker Formed',       'Bearish breaker block formed')
 alertcondition(currentAlerts.bullishBreakerMitigated,   'Bullish Breaker Mitigated',    'Bullish breaker block mitigated')
