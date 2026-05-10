@@ -67,6 +67,16 @@
 //         mitigation, and hidden FVG tracking for iFVG-only mode.
 // v16.6 — Replaces MSS displacement plotshape offset markers with label markers
 //         so the script stays below TradingView's 64-plot hard limit.
+// v16.9 — Code-quality cleanup release:
+//         • Replaced the 10-branch hardcoded `low[N]` / `high[N]` ladder for
+//           MSS displacement label placement with native Pine v6 dynamic
+//           series indexing (`low[displacementBullOffset]`). The ladder
+//           silently capped any offset > 8 to N=9; harmless under the
+//           current maxval=10 input cap, but a future-bump foot-gun.
+//         • pushBounded() history-array writes now gated behind a single
+//           `needHistoryArrays` flag (OB tracking OR MTF level drawing).
+//           When all consumers are off, the eight 5000-entry float/int
+//           ring buffers no longer accumulate per bar.
 // v16.8 — Follow-up bug-fix release:
 //         • New "OB Formed" alerts (Internal/Swing × Bullish/Bearish). The
 //           legacy *OrderBlock alerts only fired on mitigation despite their
@@ -98,7 +108,7 @@
 //           ICT timing is designed for FX/futures/crypto, not stocks.
 
 //@version=6
-indicator('Smart Money Concepts [v16.8]', 'SMC v16.8', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+indicator('Smart Money Concepts [v16.9]', 'SMC v16.9', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -524,6 +534,11 @@ bool needFVGTracking        = showFairValueGapsInput or showIFVGInput
 //         them automatically on equity instruments.
 bool isEquityInstrument = syminfo.type == "stock" or syminfo.type == "fund" or syminfo.type == "dr" or syminfo.type == "ietf"
 
+// v16.9 — Gate the eight history ring buffers behind their actual consumers
+//         (storeOrderBlock + drawLevels). When OB tracking and MTF level
+//         drawing are all off, the 5000-entry buffers no longer accumulate.
+bool needHistoryArrays = needInternalOBTracking or needSwingOBTracking or showDailyLevelsInput or showWeeklyLevelsInput or showMonthlyLevelsInput
+
 //──────────────────────────────────────────────────────────────────────────────
 // State Variables
 //──────────────────────────────────────────────────────────────────────────────
@@ -755,14 +770,15 @@ pushBoundedInt(array<int> arr, int val) =>
     if arr.size() > MAX_ARRAY_SIZE
         arr.shift()
 
-pushBounded(parsedHighs, parsedHigh)
-pushBounded(parsedLows,  parsedLow)
-pushBounded(highs,       high)
-pushBounded(lows,        low)
-pushBoundedInt(times,    time)
-pushBounded(opens,       open)
-pushBounded(closes,      close)
-pushBounded(minPens,     minPen)
+if needHistoryArrays
+    pushBounded(parsedHighs, parsedHigh)
+    pushBounded(parsedLows,  parsedLow)
+    pushBounded(highs,       high)
+    pushBounded(lows,        low)
+    pushBoundedInt(times,    time)
+    pushBounded(opens,       open)
+    pushBounded(closes,      close)
+    pushBounded(minPens,     minPen)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Pre-compute crossovers at global scope
@@ -2392,15 +2408,8 @@ if showNYRangeInput and not na(nyRangeHigh) and not na(nyRangeLow)
 
 if displacementBullFlag and showDisplacementInput and not na(displacementBullOffset)
     int dispX = bar_index - displacementBullOffset
-    float dispY = displacementBullOffset == 0 ? low :
-         displacementBullOffset == 1 ? low[1] :
-         displacementBullOffset == 2 ? low[2] :
-         displacementBullOffset == 3 ? low[3] :
-         displacementBullOffset == 4 ? low[4] :
-         displacementBullOffset == 5 ? low[5] :
-         displacementBullOffset == 6 ? low[6] :
-         displacementBullOffset == 7 ? low[7] :
-         displacementBullOffset == 8 ? low[8] : low[9]
+    // v16.9 — Dynamic series indexing (Pine v6) replaces a 10-branch ladder.
+    float dispY = low[displacementBullOffset]
     label dispLabel = label.new(dispX, dispY, '◆',
          xloc=xloc.bar_index,
          color=color(na),
@@ -2413,15 +2422,8 @@ if displacementBullFlag and showDisplacementInput and not na(displacementBullOff
 
 if displacementBearFlag and showDisplacementInput and not na(displacementBearOffset)
     int dispX = bar_index - displacementBearOffset
-    float dispY = displacementBearOffset == 0 ? high :
-         displacementBearOffset == 1 ? high[1] :
-         displacementBearOffset == 2 ? high[2] :
-         displacementBearOffset == 3 ? high[3] :
-         displacementBearOffset == 4 ? high[4] :
-         displacementBearOffset == 5 ? high[5] :
-         displacementBearOffset == 6 ? high[6] :
-         displacementBearOffset == 7 ? high[7] :
-         displacementBearOffset == 8 ? high[8] : high[9]
+    // v16.9 — Dynamic series indexing (Pine v6) replaces a 10-branch ladder.
+    float dispY = high[displacementBearOffset]
     label dispLabel = label.new(dispX, dispY, '◆',
          xloc=xloc.bar_index,
          color=color(na),
