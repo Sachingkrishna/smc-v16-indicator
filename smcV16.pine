@@ -67,6 +67,20 @@
 //         mitigation, and hidden FVG tracking for iFVG-only mode.
 // v16.6 — Replaces MSS displacement plotshape offset markers with label markers
 //         so the script stays below TradingView's 64-plot hard limit.
+// v17.2 — Alert-budget cleanup ahead of v18 feature additions:
+//         • Removed 4 legacy *OB Breakout (mitigation) alerts. The same
+//           event is captured by the corresponding *Breaker Formed alert
+//           when Breaker tracking is enabled, and the *OB Formed alerts
+//           cover the formation side. Net: −4 outputs.
+//         • Combined PDH + PDL touch alerts into a single
+//           "PD Level Touched". Net: −1 output.
+//         • Combined NDOG Formed + NWOG Formed into "Opening Gap Formed".
+//           Net: −1 output.
+//         • Combined Asian/London/NY High+Low range-touch alerts into
+//           three single "<Session> Range Touched" alerts. Net: −3 outputs.
+//         Total budget freed: 9 outputs. Sets up v18 institutional-
+//         footprint additions (RVOL/VI/AVWAP/LP/PO3) without re-hitting
+//         RE10140.
 // v17.1 — Plot-budget fix:
 //         • TradingView caps regular indicators at 64 outputs (plots +
 //           alertconditions + bgcolor calls). v17.0 added 4 new alerts
@@ -146,7 +160,7 @@
 //           ICT timing is designed for FX/futures/crypto, not stocks.
 
 //@version=6
-indicator('Smart Money Concepts [v17.1]', 'SMC v17.1', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+indicator('Smart Money Concepts [v17.2]', 'SMC v17.2', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -2648,14 +2662,10 @@ alertcondition(currentAlerts.swingBullishBOS,           'Bullish BOS',          
 alertcondition(currentAlerts.swingBullishCHoCH,         'Bullish CHoCH',                'Bullish CHoCH formed')
 alertcondition(currentAlerts.swingBearishBOS,           'Bearish BOS',                  'Bearish BOS formed')
 alertcondition(currentAlerts.swingBearishCHoCH,         'Bearish CHoCH',                'Bearish CHoCH formed')
-// Legacy *OB Breakout alerts — fire on MITIGATION (titles preserved for
-// backward-compat with existing TradingView alert subscriptions; messages
-// updated in v16.8 for clarity).
-alertcondition(currentAlerts.internalBullishOrderBlock, 'Bullish Internal OB Breakout', 'Bullish internal OB mitigated')
-alertcondition(currentAlerts.internalBearishOrderBlock, 'Bearish Internal OB Breakout', 'Bearish internal OB mitigated')
-alertcondition(currentAlerts.swingBullishOrderBlock,    'Bullish Swing OB Breakout',    'Bullish swing OB mitigated')
-alertcondition(currentAlerts.swingBearishOrderBlock,    'Bearish Swing OB Breakout',    'Bearish swing OB mitigated')
-// v16.8 — New OB *formation* alerts.
+// v17.2 — Legacy *OB Breakout (mitigation) alerts removed to free output
+// slots. The same events are captured by *Breaker Formed when Breaker
+// tracking is enabled.
+// v16.8 — OB *formation* alerts.
 alertcondition(currentAlerts.internalBullishOBFormed, 'Bullish Internal OB Formed', 'Bullish internal OB formed')
 alertcondition(currentAlerts.internalBearishOBFormed, 'Bearish Internal OB Formed', 'Bearish internal OB formed')
 alertcondition(currentAlerts.swingBullishOBFormed,    'Bullish Swing OB Formed',    'Bullish swing OB formed')
@@ -2701,12 +2711,11 @@ alertcondition(anySilverBulletStart, 'Silver Bullet Start', 'A Silver Bullet win
 //         the level. Locking the comparison to a stable level kills that.
 bool pdHighSweep = showPDLevelsInput and showPDHighInput and not na(pdHigh) and not na(pdHigh[1]) and pdHigh == pdHigh[1] and high >= pdHigh and not na(high[1]) and high[1] < pdHigh
 bool pdLowSweep  = showPDLevelsInput and showPDLowInput  and not na(pdLow)  and not na(pdLow[1])  and pdLow  == pdLow[1]  and low  <= pdLow  and not na(low[1])  and low[1]  > pdLow
-alertcondition(pdHighSweep, 'PDH Touched', 'Price reached Previous Day High')
-alertcondition(pdLowSweep,  'PDL Touched', 'Price reached Previous Day Low')
-alertcondition(showNDOGInput and isNewDay  and not na(pdClose) and not na(cdOpen) and math.abs(cdOpen - pdClose) > syminfo.mintick,
-    'NDOG Formed', 'New Day Opening Gap formed')
-alertcondition(showNWOGInput and isNewWeek and not na(nwogPrevClose) and not na(nwogCurrOpen) and math.abs(nwogCurrOpen - nwogPrevClose) > syminfo.mintick,
-    'NWOG Formed', 'New Week Opening Gap formed')
+// v17.2 — PDH+PDL collapsed to single "PD Level Touched", and NDOG+NWOG
+// to "Opening Gap Formed", to free output slots.
+alertcondition(pdHighSweep or pdLowSweep, 'PD Level Touched', 'Price reached a Previous Day level (high or low)')
+alertcondition((showNDOGInput and isNewDay  and not na(pdClose)      and not na(cdOpen)      and math.abs(cdOpen      - pdClose)      > syminfo.mintick) or (showNWOGInput and isNewWeek and not na(nwogPrevClose) and not na(nwogCurrOpen) and math.abs(nwogCurrOpen - nwogPrevClose) > syminfo.mintick),
+    'Opening Gap Formed', 'New Day or New Week Opening Gap formed')
 
 alertcondition(currentAlerts.internalBullishMSS, 'Internal Bullish MSS', 'Internal Bullish Market Structure Shift detected')
 alertcondition(currentAlerts.internalBearishMSS, 'Internal Bearish MSS', 'Internal Bearish Market Structure Shift detected')
@@ -2732,8 +2741,8 @@ if showOTEInput and swingTrend.bias != 0 and not na(trailing.top) and not na(tra
              : trailing.bottom + oteFib1Input * _oteRange
         priceInOTE := close <= _oteUpper and close >= _oteLower
 
-alertcondition(asianHighTouched, 'Asian High Touched', 'Price reached Asian Range High')
-alertcondition(asianLowTouched,  'Asian Low Touched',  'Price reached Asian Range Low')
+// v17.2 — H+L touch alerts collapsed per session to free output slots.
+alertcondition(asianHighTouched or asianLowTouched, 'Asian Range Touched', 'Price reached the Asian Range high or low')
 alertcondition(priceInOTE and not priceInOTE[1], 'Price Enters OTE', 'Price entered Optimal Trade Entry zone')
 // v16.7 — Same day-rollover guard as PDH/PDL: require midnightOpenPrice to
 //         be stable from the previous bar so the level "jumping" at the
@@ -2751,7 +2760,5 @@ bool londonLowTouched  = showLondonRangeInput and not londonActiveForAlert and n
 bool nyHighTouched     = showNYRangeInput     and not nyActiveForAlert     and not na(nyRangeHigh)     and high >= nyRangeHigh     and (na(high[1]) or high[1] < nyRangeHigh)
 bool nyLowTouched      = showNYRangeInput     and not nyActiveForAlert     and not na(nyRangeLow)      and low  <= nyRangeLow      and (na(low[1])  or low[1]  > nyRangeLow)
 
-alertcondition(londonHighTouched, 'London High Touched', 'Price reached London Range High')
-alertcondition(londonLowTouched,  'London Low Touched',  'Price reached London Range Low')
-alertcondition(nyHighTouched,     'NY High Touched',     'Price reached New York Range High')
-alertcondition(nyLowTouched,      'NY Low Touched',      'Price reached New York Range Low')
+alertcondition(londonHighTouched or londonLowTouched, 'London Range Touched', 'Price reached the London Range high or low')
+alertcondition(nyHighTouched or nyLowTouched,         'NY Range Touched',     'Price reached the New York Range high or low')
