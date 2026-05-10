@@ -67,6 +67,19 @@
 //         mitigation, and hidden FVG tracking for iFVG-only mode.
 // v16.6 — Replaces MSS displacement plotshape offset markers with label markers
 //         so the script stays below TradingView's 64-plot hard limit.
+// v17.1 — Plot-budget fix:
+//         • TradingView caps regular indicators at 64 outputs (plots +
+//           alertconditions + bgcolor calls). v17.0 added 4 new alerts
+//           (EQH/EQL sweep + 2× CVD divergence) and tipped the script
+//           to 68, triggering RE10140 at runtime.
+//         • Collapsed the 4 per-zone Kill Zone Start alerts into a single
+//           "Kill Zone Start" alert and the 3 per-window Silver Bullet
+//           alerts into a single "Silver Bullet Start" alert (saves 5
+//           outputs). Per-zone differentiation was already conveyed by
+//           the bgcolor visualisation; the alert title is the only thing
+//           that loses granularity. Existing user alerts on the old
+//           per-zone titles will need to be re-pointed at the combined
+//           alert.
 // v17.0 — Bug-fix + feature release:
 //         • EQH/EQL sweep detection. Sweeps now fire `Bearish EQH Sweep` /
 //           `Bullish EQL Sweep` alerts when price wicks through an Equal
@@ -133,7 +146,7 @@
 //           ICT timing is designed for FX/futures/crypto, not stocks.
 
 //@version=6
-indicator('Smart Money Concepts [v17.0]', 'SMC v17.0', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+indicator('Smart Money Concepts [v17.1]', 'SMC v17.1', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -2666,13 +2679,14 @@ alertcondition(currentAlerts.bearishBreakerMitigated,   'Bearish Breaker Mitigat
 alertcondition(currentAlerts.bullishIFVGFormed,         'Bullish iFVG Formed',          'Bullish inverted FVG formed (support)')
 alertcondition(currentAlerts.bearishIFVGFormed,         'Bearish iFVG Formed',          'Bearish inverted FVG formed (resistance)')
 
-alertcondition(inAsianKZ and not inAsianKZ[1],             'Asian KZ Start',       'Asian Kill Zone started')
-alertcondition(inLondonOpenKZ and not inLondonOpenKZ[1],   'London Open KZ Start', 'London Open Kill Zone started')
-alertcondition(inNYOpenKZ and not inNYOpenKZ[1],           'NY Open KZ Start',     'NY Open Kill Zone started')
-alertcondition(inLondonCloseKZ and not inLondonCloseKZ[1], 'London Close KZ Start','London Close Kill Zone started')
-alertcondition(inSilverBulletAM  and not inSilverBulletAM[1],  'Silver Bullet AM Start',     'Silver Bullet AM window started (10:00-11:00)')
-alertcondition(inSilverBulletPM  and not inSilverBulletPM[1],  'Silver Bullet PM Start',     'Silver Bullet PM window started (14:00-15:00)')
-alertcondition(inSilverBulletLDN and not inSilverBulletLDN[1], 'Silver Bullet London Start', 'Silver Bullet London window started (03:00-04:00)')
+// v17.1 — Collapsed 4 per-zone KZ alerts and 3 per-window Silver Bullet
+//         alerts into 2 combined alerts (saves 5 output slots toward the
+//         64-plot cap). Use the message string + a chart annotation to
+//         identify which window fired.
+bool anyKZStart = (inAsianKZ and not inAsianKZ[1]) or (inLondonOpenKZ and not inLondonOpenKZ[1]) or (inNYOpenKZ and not inNYOpenKZ[1]) or (inLondonCloseKZ and not inLondonCloseKZ[1])
+bool anySilverBulletStart = (inSilverBulletAM and not inSilverBulletAM[1]) or (inSilverBulletPM and not inSilverBulletPM[1]) or (inSilverBulletLDN and not inSilverBulletLDN[1])
+alertcondition(anyKZStart,           'Kill Zone Start',     'A Kill Zone window has started (Asian / London Open / NY Open / London Close)')
+alertcondition(anySilverBulletStart, 'Silver Bullet Start', 'A Silver Bullet window has started (AM / PM / London)')
 
 // v15.3 — Edge-detect the PDH / PDL touches with a [1] guard so the alert
 //         fires once on the bar that crosses the level instead of every bar
