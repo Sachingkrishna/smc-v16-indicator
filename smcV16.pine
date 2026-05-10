@@ -67,6 +67,20 @@
 //         mitigation, and hidden FVG tracking for iFVG-only mode.
 // v16.6 — Replaces MSS displacement plotshape offset markers with label markers
 //         so the script stays below TradingView's 64-plot hard limit.
+// v16.8 — Follow-up bug-fix release:
+//         • New "OB Formed" alerts (Internal/Swing × Bullish/Bearish). The
+//           legacy *OrderBlock alerts only fired on mitigation despite their
+//           "Breakout" naming, leaving no way to alert on OB creation. The
+//           legacy alerts are unchanged for backward compat; their messages
+//           now say "mitigated" instead of "broke" for clarity.
+//         • NDOG / NWOG no longer evaluated for fill on the same bar they
+//           are created. The legacy close[1]-vs-gap.bottom traversal check
+//           referenced close[1] from BEFORE the gap existed, occasionally
+//           killing newly-formed gaps instantly on the rollover bar.
+//         • Internal Order Block border colour now matches Breaker Block
+//           behaviour (visible border) instead of being na, fixing a
+//           cosmetic asymmetry where internal OBs looked "borderless" while
+//           internal BBs always rendered with a border.
 // v16.7 — Bug-fix release:
 //         • Liquidity sweep now uses actual wick high/low of the swing pivot
 //           bar instead of the body-source level. Fixes phantom sweeps when
@@ -84,7 +98,7 @@
 //           ICT timing is designed for FX/futures/crypto, not stocks.
 
 //@version=6
-indicator('Smart Money Concepts [v16.7]', 'SMC v16.7', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+indicator('Smart Money Concepts [v16.8]', 'SMC v16.8', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -409,6 +423,12 @@ type alerts
     bool internalBearishOrderBlock   = false
     bool swingBullishOrderBlock      = false
     bool swingBearishOrderBlock      = false
+    // v16.8 — OB *formation* alerts (legacy *OrderBlock fields above fire on
+    //         mitigation only, despite their misleading naming).
+    bool internalBullishOBFormed     = false
+    bool internalBearishOBFormed     = false
+    bool swingBullishOBFormed        = false
+    bool swingBearishOBFormed        = false
     bool equalHighs                  = false
     bool equalLows                   = false
     bool bullishFairValueGap         = false
@@ -1227,6 +1247,17 @@ storeOrderBlock(pivot brokenPivot, pivot originPivot, bool internal = false, int
                     if _orderBlocksSize >= MAX_ORDER_BLOCK_COUNT
                         orderBlocks.pop()
                     orderBlocks.unshift(o_rderBlock)
+                    // v16.8 — Fire OB-formation alert flag.
+                    if bias == BULLISH
+                        if internal
+                            currentAlerts.internalBullishOBFormed := true
+                        else
+                            currentAlerts.swingBullishOBFormed := true
+                    else
+                        if internal
+                            currentAlerts.internalBearishOBFormed := true
+                        else
+                            currentAlerts.swingBearishOBFormed := true
 
 //──────────────────────────────────────────────────────────────────────────────
 // Order Block Drawing
@@ -1252,7 +1283,9 @@ drawOrderBlocks(bool internal = false) =>
                 box b_ox = b_oxes.get(index)
                 b_ox.set_top_left_point(    chart.point.new(eachOB.barTime, na, eachOB.barHigh))
                 b_ox.set_bottom_right_point(chart.point.new(last_bar_time,  na, eachOB.barLow))
-                b_ox.set_border_color(internal ? na : obColor)
+                // v16.8 — Both internal & swing OBs now render with a border,
+                //         matching Breaker Block behaviour.
+                b_ox.set_border_color(obColor)
                 b_ox.set_bgcolor(obColor)
                 if showOBTouchCountInput and eachOB.touchCount > 0
                     string touchText = str.tostring(eachOB.touchCount) + 'x'
@@ -2135,6 +2168,18 @@ updateAndMitigateGaps(array<openingGap> gaps, int maxAgeHours) =>
         for index = sz - 1 to 0
             openingGap gap = gaps.get(index)
 
+            // v16.8 — Skip the bar on which the gap was created. Both
+            //         createOpeningGap() and updateAndMitigateGaps() run
+            //         inside the same `if showNDOGInput` block on the
+            //         rollover bar, which previously caused two issues:
+            //         (1) high/low overlap on a small gap could mark it
+            //         instantly filled; (2) the close[1] traversal check
+            //         compared close[1] from BEFORE the gap existed against
+            //         the freshly-minted gap.top/.bottom, occasionally
+            //         killing the gap on its very first bar.
+            if time == gap.startTime
+                continue
+
             bool expired = maxAgeMs > 0 and (time - gap.startTime) > maxAgeMs
 
             bool filled = (high >= gap.top and low <= gap.bottom)
@@ -2405,10 +2450,18 @@ alertcondition(currentAlerts.swingBullishBOS,           'Bullish BOS',          
 alertcondition(currentAlerts.swingBullishCHoCH,         'Bullish CHoCH',                'Bullish CHoCH formed')
 alertcondition(currentAlerts.swingBearishBOS,           'Bearish BOS',                  'Bearish BOS formed')
 alertcondition(currentAlerts.swingBearishCHoCH,         'Bearish CHoCH',                'Bearish CHoCH formed')
-alertcondition(currentAlerts.internalBullishOrderBlock, 'Bullish Internal OB Breakout', 'Price broke bullish internal OB')
-alertcondition(currentAlerts.internalBearishOrderBlock, 'Bearish Internal OB Breakout', 'Price broke bearish internal OB')
-alertcondition(currentAlerts.swingBullishOrderBlock,    'Bullish Swing OB Breakout',    'Price broke bullish swing OB')
-alertcondition(currentAlerts.swingBearishOrderBlock,    'Bearish Swing OB Breakout',    'Price broke bearish swing OB')
+// Legacy *OB Breakout alerts — fire on MITIGATION (titles preserved for
+// backward-compat with existing TradingView alert subscriptions; messages
+// updated in v16.8 for clarity).
+alertcondition(currentAlerts.internalBullishOrderBlock, 'Bullish Internal OB Breakout', 'Bullish internal OB mitigated')
+alertcondition(currentAlerts.internalBearishOrderBlock, 'Bearish Internal OB Breakout', 'Bearish internal OB mitigated')
+alertcondition(currentAlerts.swingBullishOrderBlock,    'Bullish Swing OB Breakout',    'Bullish swing OB mitigated')
+alertcondition(currentAlerts.swingBearishOrderBlock,    'Bearish Swing OB Breakout',    'Bearish swing OB mitigated')
+// v16.8 — New OB *formation* alerts.
+alertcondition(currentAlerts.internalBullishOBFormed, 'Bullish Internal OB Formed', 'Bullish internal OB formed')
+alertcondition(currentAlerts.internalBearishOBFormed, 'Bearish Internal OB Formed', 'Bearish internal OB formed')
+alertcondition(currentAlerts.swingBullishOBFormed,    'Bullish Swing OB Formed',    'Bullish swing OB formed')
+alertcondition(currentAlerts.swingBearishOBFormed,    'Bearish Swing OB Formed',    'Bearish swing OB formed')
 alertcondition(currentAlerts.equalHighs,                'Equal Highs',                  'Equal highs detected')
 alertcondition(currentAlerts.equalLows,                 'Equal Lows',                   'Equal lows detected')
 alertcondition(currentAlerts.bullishFairValueGap,       'Bullish FVG',                  'Bullish FVG formed')
