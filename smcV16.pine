@@ -65,9 +65,11 @@
 //         guard, MSS offset markers, MSS/CHoCH double alerts, range touch alert
 //         timing, stale OB/BB text, first-bar division guards, independent iFVG
 //         mitigation, and hidden FVG tracking for iFVG-only mode.
+// v16.6 — Replaces MSS displacement plotshape offset markers with label markers
+//         so the script stays below TradingView's 64-plot hard limit.
 
 //@version=6
-indicator('Smart Money Concepts [v16.5]', 'SMC v16.5', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+indicator('Smart Money Concepts [v16.6]', 'SMC v16.6', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -540,6 +542,7 @@ var bool  anyCloseBelowSwingLow  = false
 var int   lastSwingHighBarIdx    = -1
 var int   lastSwingLowBarIdx     = -1
 var array<label> sweepLabels     = array.new<label>()
+var array<label> displacementLabels = array.new<label>()
 
 var sessionTracker sydneySession  = sessionTracker.new(false, false, na, na, na, na, na, na)
 var sessionTracker tokyoSession   = sessionTracker.new(false, false, na, na, na, na, na, na)
@@ -2295,48 +2298,47 @@ if showNYRangeInput and not na(nyRangeHigh) and not na(nyRangeLow)
     nyLowLabel.set_color(color(na))
     nyLowLabel.set_style(label.style_label_left)
 
-bool showBullDisp0 = displacementBullFlag and showDisplacementInput and displacementBullOffset == 0
-bool showBullDisp1 = displacementBullFlag and showDisplacementInput and displacementBullOffset == 1
-bool showBullDisp2 = displacementBullFlag and showDisplacementInput and displacementBullOffset == 2
-bool showBullDisp3 = displacementBullFlag and showDisplacementInput and displacementBullOffset == 3
-bool showBullDisp4 = displacementBullFlag and showDisplacementInput and displacementBullOffset == 4
-bool showBullDisp5 = displacementBullFlag and showDisplacementInput and displacementBullOffset == 5
-bool showBullDisp6 = displacementBullFlag and showDisplacementInput and displacementBullOffset == 6
-bool showBullDisp7 = displacementBullFlag and showDisplacementInput and displacementBullOffset == 7
-bool showBullDisp8 = displacementBullFlag and showDisplacementInput and displacementBullOffset == 8
-bool showBullDisp9 = displacementBullFlag and showDisplacementInput and displacementBullOffset == 9
-bool showBearDisp0 = displacementBearFlag and showDisplacementInput and displacementBearOffset == 0
-bool showBearDisp1 = displacementBearFlag and showDisplacementInput and displacementBearOffset == 1
-bool showBearDisp2 = displacementBearFlag and showDisplacementInput and displacementBearOffset == 2
-bool showBearDisp3 = displacementBearFlag and showDisplacementInput and displacementBearOffset == 3
-bool showBearDisp4 = displacementBearFlag and showDisplacementInput and displacementBearOffset == 4
-bool showBearDisp5 = displacementBearFlag and showDisplacementInput and displacementBearOffset == 5
-bool showBearDisp6 = displacementBearFlag and showDisplacementInput and displacementBearOffset == 6
-bool showBearDisp7 = displacementBearFlag and showDisplacementInput and displacementBearOffset == 7
-bool showBearDisp8 = displacementBearFlag and showDisplacementInput and displacementBearOffset == 8
-bool showBearDisp9 = displacementBearFlag and showDisplacementInput and displacementBearOffset == 9
+if displacementBullFlag and showDisplacementInput and not na(displacementBullOffset)
+    int dispX = bar_index - displacementBullOffset
+    float dispY = displacementBullOffset == 0 ? low :
+         displacementBullOffset == 1 ? low[1] :
+         displacementBullOffset == 2 ? low[2] :
+         displacementBullOffset == 3 ? low[3] :
+         displacementBullOffset == 4 ? low[4] :
+         displacementBullOffset == 5 ? low[5] :
+         displacementBullOffset == 6 ? low[6] :
+         displacementBullOffset == 7 ? low[7] :
+         displacementBullOffset == 8 ? low[8] : low[9]
+    label dispLabel = label.new(dispX, dispY, '◆',
+         xloc=xloc.bar_index,
+         color=color(na),
+         textcolor=mssBullColorInput,
+         style=label.style_none,
+         size=size.tiny)
+    displacementLabels.push(dispLabel)
+    if displacementLabels.size() > MAX_SWEEP_LABELS
+        label.delete(displacementLabels.shift())
 
-plotshape(showBullDisp0, title='Bullish Displacement',    location=location.belowbar, style=shape.diamond, size=size.tiny, color=mssBullColorInput, offset=0)
-plotshape(showBullDisp1, title='Bullish Displacement -1', location=location.belowbar, style=shape.diamond, size=size.tiny, color=mssBullColorInput, offset=-1)
-plotshape(showBullDisp2, title='Bullish Displacement -2', location=location.belowbar, style=shape.diamond, size=size.tiny, color=mssBullColorInput, offset=-2)
-plotshape(showBullDisp3, title='Bullish Displacement -3', location=location.belowbar, style=shape.diamond, size=size.tiny, color=mssBullColorInput, offset=-3)
-plotshape(showBullDisp4, title='Bullish Displacement -4', location=location.belowbar, style=shape.diamond, size=size.tiny, color=mssBullColorInput, offset=-4)
-plotshape(showBullDisp5, title='Bullish Displacement -5', location=location.belowbar, style=shape.diamond, size=size.tiny, color=mssBullColorInput, offset=-5)
-plotshape(showBullDisp6, title='Bullish Displacement -6', location=location.belowbar, style=shape.diamond, size=size.tiny, color=mssBullColorInput, offset=-6)
-plotshape(showBullDisp7, title='Bullish Displacement -7', location=location.belowbar, style=shape.diamond, size=size.tiny, color=mssBullColorInput, offset=-7)
-plotshape(showBullDisp8, title='Bullish Displacement -8', location=location.belowbar, style=shape.diamond, size=size.tiny, color=mssBullColorInput, offset=-8)
-plotshape(showBullDisp9, title='Bullish Displacement -9', location=location.belowbar, style=shape.diamond, size=size.tiny, color=mssBullColorInput, offset=-9)
-
-plotshape(showBearDisp0, title='Bearish Displacement',    location=location.abovebar, style=shape.diamond, size=size.tiny, color=mssBearColorInput, offset=0)
-plotshape(showBearDisp1, title='Bearish Displacement -1', location=location.abovebar, style=shape.diamond, size=size.tiny, color=mssBearColorInput, offset=-1)
-plotshape(showBearDisp2, title='Bearish Displacement -2', location=location.abovebar, style=shape.diamond, size=size.tiny, color=mssBearColorInput, offset=-2)
-plotshape(showBearDisp3, title='Bearish Displacement -3', location=location.abovebar, style=shape.diamond, size=size.tiny, color=mssBearColorInput, offset=-3)
-plotshape(showBearDisp4, title='Bearish Displacement -4', location=location.abovebar, style=shape.diamond, size=size.tiny, color=mssBearColorInput, offset=-4)
-plotshape(showBearDisp5, title='Bearish Displacement -5', location=location.abovebar, style=shape.diamond, size=size.tiny, color=mssBearColorInput, offset=-5)
-plotshape(showBearDisp6, title='Bearish Displacement -6', location=location.abovebar, style=shape.diamond, size=size.tiny, color=mssBearColorInput, offset=-6)
-plotshape(showBearDisp7, title='Bearish Displacement -7', location=location.abovebar, style=shape.diamond, size=size.tiny, color=mssBearColorInput, offset=-7)
-plotshape(showBearDisp8, title='Bearish Displacement -8', location=location.abovebar, style=shape.diamond, size=size.tiny, color=mssBearColorInput, offset=-8)
-plotshape(showBearDisp9, title='Bearish Displacement -9', location=location.abovebar, style=shape.diamond, size=size.tiny, color=mssBearColorInput, offset=-9)
+if displacementBearFlag and showDisplacementInput and not na(displacementBearOffset)
+    int dispX = bar_index - displacementBearOffset
+    float dispY = displacementBearOffset == 0 ? high :
+         displacementBearOffset == 1 ? high[1] :
+         displacementBearOffset == 2 ? high[2] :
+         displacementBearOffset == 3 ? high[3] :
+         displacementBearOffset == 4 ? high[4] :
+         displacementBearOffset == 5 ? high[5] :
+         displacementBearOffset == 6 ? high[6] :
+         displacementBearOffset == 7 ? high[7] :
+         displacementBearOffset == 8 ? high[8] : high[9]
+    label dispLabel = label.new(dispX, dispY, '◆',
+         xloc=xloc.bar_index,
+         color=color(na),
+         textcolor=mssBearColorInput,
+         style=label.style_none,
+         size=size.tiny)
+    displacementLabels.push(dispLabel)
+    if displacementLabels.size() > MAX_SWEEP_LABELS
+        label.delete(displacementLabels.shift())
 
 if displacementBullFlag
     displacementBullFlag := false
