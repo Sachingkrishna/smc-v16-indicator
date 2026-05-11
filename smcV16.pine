@@ -67,6 +67,30 @@
 //         mitigation, and hidden FVG tracking for iFVG-only mode.
 // v16.6 — Replaces MSS displacement plotshape offset markers with label markers
 //         so the script stays below TradingView's 64-plot hard limit.
+// v18.4 — Plot-budget rebalance + AVWAP anchor types + RVOL bug fixes:
+//         • Re-combined NDOG+NWOG → "Opening Gap Formed" and NY High+Low
+//           → "NY Range Touched" (each saves one output). RE10140 was
+//           firing again at 66/64; these revert two of v18.2's restores
+//           to bring us back to budget.
+//         • AVWAP now has an anchor-type dropdown:
+//             - MSS (current behaviour: reset on internal/swing MSS event)
+//             - Swing (reset on every new swing high or low pivot)
+//             - Daily (reset on new trading day)
+//             - Weekly (reset on new trading week)
+//           Single plot, user-selected source. No additional plot cost.
+//         • FVG RVOL stamping bug fix. v18.0 read volume[2] from the
+//           chart timeframe even when fairValueGapsTimeframeInput pointed
+//           at a higher timeframe. Now requested via request.security
+//           alongside the FVG OHLC tuple so volume aligns to the HTF.
+//         • iFVG visual RVOL filter bug fix. iFVGs inherited the parent
+//           FVG's RVOL stamp but never applied dimming on render. Now
+//           ifvgColor is dimmed (or hidden) the same way FVGs are.
+//         • needHistoryArrays cleanup. v18.0 added rvolEnableInput to the
+//           gate predicate, causing the 8 ring buffers to accumulate even
+//           when only FVG RVOL was needed (which uses request.security,
+//           not the arrays). The volumes array is only read by OB RVOL,
+//           which is already gated by OB-tracking inputs, so dropping
+//           rvolEnableInput from the gate has no functional impact.
 // v18.3 — Restore per-zone Kill Zone alerts:
 //         • v17.1 collapsed 4 Kill Zone Start alerts (Asian / London Open /
 //           NY Open / London Close) into one combined alert to stay under
@@ -211,7 +235,7 @@
 //           ICT timing is designed for FX/futures/crypto, not stocks.
 
 //@version=6
-indicator('Smart Money Concepts [v18.3]', 'SMC v18.3', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+indicator('Smart Money Concepts [v18.4]', 'SMC v18.4', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -552,10 +576,17 @@ viBearColorInput   = input.color(color.new(#ef9a9a, 70), 'Bearish VI', group=VI_
 viMaxCountInput    = input.int(20, 'Max Unmitigated VIs', group=VI_GROUP, minval=1, maxval=100)
 viMitigationInput  = input.string(BODY_SRC, 'VI Mitigation', group=VI_GROUP, options=[CLOSE_SRC, BODY_SRC, HIGHLOW])
 
-// ── Anchored VWAP from MSS ───────────────────────────────────────────────────
-showMSSAVWAPInput   = input(false, 'Show MSS Anchored VWAP',  group=AVWAP_GROUP,
-     tooltip='Resets cumulative PV/volume on every confirmed MSS event.\n' +
-             'Acts as a defended institutional reference until next MSS.')
+// ── Anchored VWAP ────────────────────────────────────────────────────────────
+showMSSAVWAPInput   = input(false, 'Show Anchored VWAP',     group=AVWAP_GROUP,
+     tooltip='Cumulative VWAP that resets at the chosen anchor event.\n' +
+             'Acts as a defended institutional reference between anchors.')
+// v18.4 — Anchor-type dropdown. Single AVWAP plot, multi-source.
+avwapAnchorTypeInput = input.string('MSS', 'Anchor Type',     group=AVWAP_GROUP,
+     options=['MSS', 'Swing', 'Daily', 'Weekly'],
+     tooltip='MSS    = reset on every confirmed Market Structure Shift.\n' +
+             'Swing  = reset on every new swing high or swing low pivot.\n' +
+             'Daily  = reset at the start of each new trading day.\n' +
+             'Weekly = reset at the start of each new trading week.')
 mssAVWAPColorInput  = input.color(#ffeb3b, 'AVWAP Color',     group=AVWAP_GROUP)
 mssAVWAPWidthInput  = input.int(2, 'AVWAP Line Width',         group=AVWAP_GROUP, minval=1, maxval=4)
 
@@ -724,9 +755,13 @@ bool isEquityInstrument = syminfo.type == "stock" or syminfo.type == "fund" or s
 // v16.9 — Gate the eight history ring buffers behind their actual consumers
 //         (storeOrderBlock + drawLevels). When OB tracking and MTF level
 //         drawing are all off, the 5000-entry buffers no longer accumulate.
-// v18.0 — RVOL stamping for OBs reads back to the OB's origin bar via
-//         volumes.slice(), so OB tracking + RVOL also requires the buffer.
-bool needHistoryArrays = needInternalOBTracking or needSwingOBTracking or showDailyLevelsInput or showWeeklyLevelsInput or showMonthlyLevelsInput or rvolEnableInput
+// v18.4 — Removed rvolEnableInput from the predicate. OB RVOL is the only
+//         consumer of the volumes array; FVG RVOL uses request.security
+//         directly. OB RVOL is implicitly gated by OB-tracking inputs
+//         (no OBs = no need for the array), so the original cleanup is
+//         sufficient — adding rvolEnableInput caused all 8 buffers to
+//         accumulate even on RVOL-on-with-no-OB configurations.
+bool needHistoryArrays = needInternalOBTracking or needSwingOBTracking or showDailyLevelsInput or showWeeklyLevelsInput or showMonthlyLevelsInput
 
 //──────────────────────────────────────────────────────────────────────────────
 // State Variables
@@ -815,12 +850,16 @@ var array<label> cvdDivLabels    = array.new<label>()
 var streakCounter eqHighStreak = streakCounter.new()
 var streakCounter eqLowStreak  = streakCounter.new()
 // v18.0 — AVWAP from latest MSS.
+// v18.4 — Now anchor-type aware; lastAvwapSwingHighIdx / lastAvwapSwingLowIdx
+//         track swing-pivot transitions for the 'Swing' anchor mode.
 var int   mssAvwapAnchorTime     = na
 var int   mssAvwapAnchorBar      = na
 var float mssAvwapCumPV          = 0.0
 var float mssAvwapCumVol         = 0.0
 var float mssAvwapValue          = na
 var bool  mssAvwapResetThisBar   = false
+var int   lastAvwapSwingHighIdx  = -1
+var int   lastAvwapSwingLowIdx   = -1
 // v18.1 — PO3 phase tracking state removed.
 
 var sessionTracker sydneySession  = sessionTracker.new(false, false, na, na, na, na, na, na)
@@ -1888,6 +1927,12 @@ deleteFairValueGaps() =>
                     color ifvgColor = newBias == BULLISH
                          ? (styleInput == MONOCHROME ? color.new(MONO_BULLISH, 75) : ifvgBullColorInput)
                          : (styleInput == MONOCHROME ? color.new(MONO_BEARISH, 75) : ifvgBearColorInput)
+                    // v18.4 — Apply RVOL dimming on iFVG using the inherited
+                    //         parent stamp. Without this, a low-volume FVG
+                    //         became a fully-opaque iFVG on conversion,
+                    //         defeating the "Hide Low-Vol FVGs" filter.
+                    if rvolEnableInput and not savedIsInst
+                        ifvgColor := rvolHideRetailFVGInput ? color.new(ifvgColor, 100) : color.new(ifvgColor, 95)
 
                     // v16.7 — For bearish-FVG-derived iFVGs, savedTop is the
                     //         LOWER edge and savedBottom is the HIGHER edge
@@ -2060,10 +2105,14 @@ extendVolumeImbalances() =>
             vi.viBox.set_right(rightEdge)
 
 drawFairValueGaps() =>
-    [midClose, midOpen, midTime, recentHigh, recentLow, recentTime, oldHigh, oldLow] = request.security(
+    // v18.4 — Volume series for RVOL stamping is now fetched at the same
+    //         timeframe as the FVG OHLC tuple. Before, RVOL read chart-time
+    //         volume[2] even when fairValueGapsTimeframeInput pointed at a
+    //         higher timeframe — completely unrelated number.
+    [midClose, midOpen, midTime, recentHigh, recentLow, recentTime, oldHigh, oldLow, htfOriginVol, htfAvgVol] = request.security(
          syminfo.tickerid,
          fairValueGapsTimeframeInput,
-         [close[2], open[2], time[2], high[1], low[1], time[1], high[3], low[3]],
+         [close[2], open[2], time[2], high[1], low[1], time[1], high[3], low[3], nz(volume[2]), ta.sma(nz(volume), rvolPeriodInput)[2]],
          lookahead = barmerge.lookahead_off)
     // v15.3 — Was (midClose - midOpen) / (midOpen * 100), which is 1/100th of
     //         the real percentage. Threshold compares like-for-like so detection
@@ -2076,14 +2125,11 @@ drawFairValueGaps() =>
     float ceLevel = na
     bullishFVG = recentLow > oldHigh and midClose > oldHigh and barDeltaPercent > threshold and newTimeframe and barstate.isconfirmed
     bearishFVG = recentHigh < oldLow and midClose < oldLow and -barDeltaPercent > threshold and newTimeframe and barstate.isconfirmed
-    // v18.0 — RVOL stamp for FVGs. The "originating" bar of an FVG is the
-    //         middle bar (offset 2 in this script's HTF FVG model — see
-    //         midClose / midOpen requested at offset [2]). Hoist ta.sma()
-    //         out of the conditional and read offset [2] post-hoc so the
-    //         function is called every bar for history consistency.
-    float fvgVolSMA    = ta.sma(nz(volume), rvolPeriodInput)
-    float fvgOriginVol = rvolEnableInput ? nz(volume[2]) : na
-    float fvgAvgVol    = rvolEnableInput ? fvgVolSMA[2] : na
+    // v18.4 — RVOL stamp now reads from the request.security tuple so the
+    //         volume sample matches the FVG's timeframe instead of using
+    //         chart-time volume[2] (which only matched when FVG TF == chart).
+    float fvgOriginVol = rvolEnableInput ? nz(htfOriginVol) : na
+    float fvgAvgVol    = rvolEnableInput ? htfAvgVol        : na
     float fvgRVOL      = (rvolEnableInput and not na(fvgAvgVol) and fvgAvgVol > 0) ? fvgOriginVol / fvgAvgVol : na
     bool  fvgIsInst    = rvolEnableInput and not na(fvgRVOL) and fvgRVOL >= rvolFVGThresholdInput
     // v18.0 — RVOL color modulation. Uses fvgIsInst computed above so it
@@ -2346,20 +2392,39 @@ if showInternalsInput or needInternalOBTracking or showTrendInput
 if showStructureInput or needSwingOBTracking or showHighLowSwingsInput
     displayStructure()
 
-// ── v18.0 — Anchored VWAP from latest MSS ─────────────────────────────────────
-//   Reset cumulative on every confirmed MSS event (internal or swing, bull or
-//   bear); accumulate hlc3 * volume thereafter. plot.style_linebr breaks the
-//   line on the reset bar so the new AVWAP doesn't visually connect to the
-//   previous one. Tag-alert fires when price wicks the level after at least
-//   one prior bar where price was outside it.
-bool mssAnyFired = currentAlerts.internalBullishMSS or currentAlerts.swingBullishMSS or currentAlerts.internalBearishMSS or currentAlerts.swingBearishMSS
+// ── v18.4 — Anchored VWAP with selectable anchor type ─────────────────────────
+//   Reset cumulative on the chosen anchor event; accumulate hlc3 * volume
+//   thereafter. plot.style_linebr breaks the line on the reset bar so the new
+//   AVWAP doesn't visually connect to the previous one. Tag-alert fires when
+//   price wicks the level after at least one prior bar where price was outside.
+//
+//   Anchor types:
+//     MSS    — reset on any confirmed Market Structure Shift (internal or swing)
+//     Swing  — reset on every new swing high or swing low pivot (barIndex change)
+//     Daily  — reset on isNewDay
+//     Weekly — reset on isNewWeek
+bool mssAnyFired    = currentAlerts.internalBullishMSS or currentAlerts.swingBullishMSS or currentAlerts.internalBearishMSS or currentAlerts.swingBearishMSS
+bool swingHighNew   = not na(swingHigh.barIndex) and swingHigh.barIndex != lastAvwapSwingHighIdx
+bool swingLowNew    = not na(swingLow.barIndex)  and swingLow.barIndex  != lastAvwapSwingLowIdx
+bool avwapShouldReset = avwapAnchorTypeInput == 'MSS'    ? mssAnyFired
+                      : avwapAnchorTypeInput == 'Swing'  ? (swingHighNew or swingLowNew)
+                      : avwapAnchorTypeInput == 'Daily'  ? isNewDay
+                      : avwapAnchorTypeInput == 'Weekly' ? isNewWeek
+                      : false
 mssAvwapResetThisBar := false
-if showMSSAVWAPInput and mssAnyFired
+if showMSSAVWAPInput and avwapShouldReset
     mssAvwapAnchorTime   := time
     mssAvwapAnchorBar    := bar_index
     mssAvwapCumPV        := 0.0
     mssAvwapCumVol       := 0.0
     mssAvwapResetThisBar := true
+// Update tracking indices for the Swing anchor type. Update unconditionally so
+// the comparison on subsequent bars detects only true pivot changes.
+if not na(swingHigh.barIndex)
+    lastAvwapSwingHighIdx := swingHigh.barIndex
+if not na(swingLow.barIndex)
+    lastAvwapSwingLowIdx  := swingLow.barIndex
+
 if showMSSAVWAPInput and not na(mssAvwapAnchorBar)
     mssAvwapCumPV  += hlc3 * nz(volume)
     mssAvwapCumVol += nz(volume)
@@ -3031,10 +3096,9 @@ bool pdLowSweep  = showPDLevelsInput and showPDLowInput  and not na(pdLow)  and 
 // v18.2 — Restored per-side alerts (were combined in v17.2 for budget).
 alertcondition(pdHighSweep, 'PDH Touched', 'Price reached Previous Day High')
 alertcondition(pdLowSweep,  'PDL Touched', 'Price reached Previous Day Low')
-alertcondition(showNDOGInput and isNewDay  and not na(pdClose)      and not na(cdOpen)      and math.abs(cdOpen      - pdClose)      > syminfo.mintick,
-    'NDOG Formed', 'New Day Opening Gap formed')
-alertcondition(showNWOGInput and isNewWeek and not na(nwogPrevClose) and not na(nwogCurrOpen) and math.abs(nwogCurrOpen - nwogPrevClose) > syminfo.mintick,
-    'NWOG Formed', 'New Week Opening Gap formed')
+// v18.4 — NDOG and NWOG re-combined to free one output slot for AVWAP types.
+alertcondition((showNDOGInput and isNewDay  and not na(pdClose)      and not na(cdOpen)      and math.abs(cdOpen      - pdClose)      > syminfo.mintick) or (showNWOGInput and isNewWeek and not na(nwogPrevClose) and not na(nwogCurrOpen) and math.abs(nwogCurrOpen - nwogPrevClose) > syminfo.mintick),
+    'Opening Gap Formed', 'New Day or New Week Opening Gap formed')
 
 alertcondition(currentAlerts.internalBullishMSS, 'Internal Bullish MSS', 'Internal Bullish Market Structure Shift detected')
 alertcondition(currentAlerts.internalBearishMSS, 'Internal Bearish MSS', 'Internal Bearish Market Structure Shift detected')
@@ -3080,8 +3144,8 @@ bool londonLowTouched  = showLondonRangeInput and not londonActiveForAlert and n
 bool nyHighTouched     = showNYRangeInput     and not nyActiveForAlert     and not na(nyRangeHigh)     and high >= nyRangeHigh     and (na(high[1]) or high[1] < nyRangeHigh)
 bool nyLowTouched      = showNYRangeInput     and not nyActiveForAlert     and not na(nyRangeLow)      and low  <= nyRangeLow      and (na(low[1])  or low[1]  > nyRangeLow)
 
-// v18.2 — Restored per-side London / NY range alerts.
+// v18.2 — Restored per-side London range alerts.
+// v18.4 — NY high/low re-combined to free one output slot.
 alertcondition(londonHighTouched, 'London High Touched', 'Price reached London Range High')
 alertcondition(londonLowTouched,  'London Low Touched',  'Price reached London Range Low')
-alertcondition(nyHighTouched,     'NY High Touched',     'Price reached New York Range High')
-alertcondition(nyLowTouched,      'NY Low Touched',      'Price reached New York Range Low')
+alertcondition(nyHighTouched or nyLowTouched, 'NY Range Touched', 'Price reached the New York Range high or low')
