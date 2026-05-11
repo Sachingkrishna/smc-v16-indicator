@@ -67,6 +67,17 @@
 //         mitigation, and hidden FVG tracking for iFVG-only mode.
 // v16.6 — Replaces MSS displacement plotshape offset markers with label markers
 //         so the script stays below TradingView's 64-plot hard limit.
+// v18.9 — Independent EQH/EQL pivot source override:
+//         • New input "EQH/EQL Pivot Source" in EQ group. Options:
+//             Follow Main — inherit global pivotSourceInput (default)
+//             Body        — match body extremes (filters wick noise)
+//             Wick        — match actual high/low (authentic ICT
+//                           liquidity pool detection — where stops sit)
+//         • Affects only the EQ-comparison level, not pivot detection
+//           itself. Pivot detection still uses the global Pivot Source
+//           via the existing bodyHigh/bodyLow series. This is intentional:
+//           leg() detection at one source + level comparison at another
+//           gives a sensible hybrid without a full pivot-stream refactor.
 // v18.8 — CVD custom pivot length + EQH/EQL freshness timeout:
 //         • CVD divergence detection now supports three pivot sources:
 //             Swing    — existing swing pivots (Swing Length, default 20)
@@ -278,7 +289,7 @@
 //           ICT timing is designed for FX/futures/crypto, not stocks.
 
 //@version=6
-indicator('Smart Money Concepts [v18.8]', 'SMC v18.8', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+indicator('Smart Money Concepts [v18.9]', 'SMC v18.9', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -430,6 +441,17 @@ eqMaxBarsBetweenMatchesInput   = input.int(0, 'Max Bars Between Matches', group=
              'streak count to 1 (preventing inflated x N badges from\n' +
              'unrelated price visits to the same level long ago).\n' +
              'Default 0 = disabled.')
+// v18.9 — Independent pivot source for EQH/EQL level comparison.
+//         Affects only the EQ-comparison level, not pivot detection itself.
+eqPivotComparisonInput         = input.string('Follow Main', 'EQH/EQL Pivot Source', group=EQUAL_GROUP,
+     options=['Follow Main', 'Body', 'Wick'],
+     tooltip='Override the global Pivot Source setting for EQH/EQL only.\n' +
+             '"Follow Main" inherits the global setting.\n' +
+             '"Wick" compares actual highs/lows — authentic ICT\n' +
+             '       liquidity-pool detection (where stops sit).\n' +
+             '"Body" compares body extremes — filters wick noise.\n' +
+             'Note: pivot DETECTION still uses the main Pivot Source;\n' +
+             'this only affects the level used for the EQ comparison.')
 
 showFairValueGapsInput         = input(false, 'Fair Value Gaps',            group=GAPS_GROUP)
 fairValueGapsThresholdInput    = input(true,  'Auto Threshold',             group=GAPS_GROUP)
@@ -1283,7 +1305,9 @@ getCurrentStructure(int size, bool equalHighLow = false, bool internal = false) 
     if newPivot
         if pivotLow
             pivot p_ivot = equalHighLow ? equalLow : internal ? internalLow : swingLow
-            float candidateBodyLow = pivotSourceInput == 'Wick' ? low[size] : math.min(open[size], close[size])
+            // v18.9 — EQ-specific pivot source override.
+            string eqEffectiveSourceLow = equalHighLow and eqPivotComparisonInput != 'Follow Main' ? eqPivotComparisonInput : pivotSourceInput
+            float candidateBodyLow = eqEffectiveSourceLow == 'Wick' ? low[size] : math.min(open[size], close[size])
             // v18.0 — Liquidity Pool streak counter. Increment on consecutive
             //         in-tolerance equal pivots; reset to 1 on a non-EQ pivot.
             // v18.8 — Optional freshness timeout: matches more than
@@ -1324,7 +1348,9 @@ getCurrentStructure(int size, bool equalHighLow = false, bool internal = false) 
                 drawLabel(time[size], p_ivot.currentLevel, p_ivot.currentLevel < p_ivot.lastLevel ? 'LL' : 'HL', swingBullishColor, label.style_label_up)
         else
             pivot p_ivot = equalHighLow ? equalHigh : internal ? internalHigh : swingHigh
-            float candidateBodyHigh = pivotSourceInput == 'Wick' ? high[size] : math.max(open[size], close[size])
+            // v18.9 — EQ-specific pivot source override.
+            string eqEffectiveSourceHigh = equalHighLow and eqPivotComparisonInput != 'Follow Main' ? eqPivotComparisonInput : pivotSourceInput
+            float candidateBodyHigh = eqEffectiveSourceHigh == 'Wick' ? high[size] : math.max(open[size], close[size])
             // v18.0 — Liquidity Pool streak counter (high side).
             // v18.8 — Optional freshness timeout (see low-side branch above).
             if equalHighLow and not na(p_ivot.currentLevel)
