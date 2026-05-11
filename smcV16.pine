@@ -67,6 +67,15 @@
 //         mitigation, and hidden FVG tracking for iFVG-only mode.
 // v16.6 — Replaces MSS displacement plotshape offset markers with label markers
 //         so the script stays below TradingView's 64-plot hard limit.
+// v18.7 — Fix AVWAP plot 1-bar lag:
+//         • The plot() statement for the MSS AVWAP was positioned above
+//           the assignment block that computes mssAvwapValue / sets
+//           mssAvwapResetThisBar. Because mssAvwapValue is a `var`,
+//           plot() at that position captured the PREVIOUS BAR'S final
+//           value, producing a visible 1-bar lag (and the linebr "gap"
+//           appearing on the bar AFTER the actual MSS reset). Moved the
+//           plot() to after the AVWAP computation block so the current
+//           bar's freshly-computed value reaches the chart on its own bar.
 // v18.6 — Decouple CVD divergence lookback from swing-structure lookback:
 //         • New input "CVD Use Internal Pivots". When ON, CVD divergence
 //           triggers off the internal pivot stream (Internal Swing Length,
@@ -251,7 +260,7 @@
 //           ICT timing is designed for FX/futures/crypto, not stocks.
 
 //@version=6
-indicator('Smart Money Concepts [v18.6]', 'SMC v18.6', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+indicator('Smart Money Concepts [v18.7]', 'SMC v18.7', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -2375,14 +2384,8 @@ drawOTEZone() =>
 parsedOpen  = showTrendInput ? open : na
 candleColor = internalTrend.bias == BULLISH ? swingBullishColor : swingBearishColor
 plotcandle(parsedOpen, high, low, close, color=candleColor, wickcolor=candleColor, bordercolor=candleColor)
-
-// v18.0 — MSS AVWAP plot. style_linebr leaves a 1-bar gap on the reset bar
-//         so the new VWAP doesn't visually connect to the previous segment.
-plot(showMSSAVWAPInput and not mssAvwapResetThisBar ? mssAvwapValue : na,
-     title = 'MSS Anchored VWAP',
-     color = mssAVWAPColorInput,
-     linewidth = mssAVWAPWidthInput,
-     style = plot.style_linebr)
+// v18.7 — MSS AVWAP plot() moved to AFTER the AVWAP computation block
+//         (see end of main execution section) to fix a 1-bar lag.
 
 //──────────────────────────────────────────────────────────────────────────────
 // Main Execution
@@ -2467,6 +2470,16 @@ if showMSSAVWAPInput and barstate.isconfirmed and not na(mssAvwapValue) and not 
     bool taggedPrev = high[1] >= mssAvwapValue[1] and low[1] <= mssAvwapValue[1]
     if taggedNow and not taggedPrev
         currentAlerts.mssAVWAPTagged := true
+
+// v18.7 — AVWAP plot moved here from above plotcandle. mssAvwapValue is a
+//         `var` so a plot() positioned above its assignment captured the
+//         previous bar's final value, producing a 1-bar visible lag and
+//         shifting the linebr gap one bar later than the actual MSS event.
+plot(showMSSAVWAPInput and not mssAvwapResetThisBar ? mssAvwapValue : na,
+     title = 'MSS Anchored VWAP',
+     color = mssAVWAPColorInput,
+     linewidth = mssAVWAPWidthInput,
+     style = plot.style_linebr)
 
 // Liquidity Sweep Detection
 // v16.7 — Compare against the swing pivot's wick high/low (actualLevel) so a
