@@ -67,6 +67,17 @@
 //         mitigation, and hidden FVG tracking for iFVG-only mode.
 // v16.6 — Replaces MSS displacement plotshape offset markers with label markers
 //         so the script stays below TradingView's 64-plot hard limit.
+// v19.0 — Rename EQH/EQL pivot-length input for discoverability:
+//         • Renamed input label "Bars Confirmation" → "EQH/EQL Pivot Length"
+//           and expanded tooltip. No behavior change; the input
+//           equalHighsLowsLengthInput has always controlled the pivot
+//           lookback for EQH/EQL detection, independently from swing
+//           (Swing Length) and internal (Internal Swing Length) lookbacks.
+//           The legacy name was inherited from the original LuxAlgo code.
+//         • Also added a maxval cap (50) for the slider UI; previously
+//           unbounded.
+//         • No new outputs. Volume Profile and SMT divergence will live in
+//           companion indicators rather than bloat this one further.
 // v18.9 — Independent EQH/EQL pivot source override:
 //         • New input "EQH/EQL Pivot Source" in EQ group. Options:
 //             Follow Main — inherit global pivotSourceInput (default)
@@ -289,7 +300,7 @@
 //           ICT timing is designed for FX/futures/crypto, not stocks.
 
 //@version=6
-indicator('Smart Money Concepts [v18.9]', 'SMC v18.9', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+indicator('Smart Money Concepts [v19.0]', 'SMC v19.0', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -426,7 +437,12 @@ showBBTouchCountInput            = input(true,  'Show Touch Count on BBs',  grou
     tooltip='Display retest count on Breaker Blocks, independent of OB touch count toggle.')
 
 showEqualHighsLowsInput        = input(true,   'Equal High/Low',           group=EQUAL_GROUP)
-equalHighsLowsLengthInput      = input.int(3,  'Bars Confirmation',        group=EQUAL_GROUP, minval=1)
+equalHighsLowsLengthInput      = input.int(3,  'EQH/EQL Pivot Length', group=EQUAL_GROUP, minval=1, maxval=50,
+     tooltip='Pivot lookback for EQH/EQL detection only.\n' +
+             'Independent from Swing Length (Real Time Swing Structure)\n' +
+             'and Internal Swing Length (Real Time Internal Structure).\n' +
+             'Default 3 = highly sensitive (many EQH/EQL labels).\n' +
+             'Try 5–10 for fewer, higher-quality liquidity pools.')
 equalHighsLowsThresholdInput   = input.float(0.1, 'Threshold',             group=EQUAL_GROUP, minval=0, maxval=0.5, step=0.1)
 equalHighsLowsSizeInput        = input.string(TINY, 'Label Size',          group=EQUAL_GROUP, options=[TINY,SMALL,NORMAL])
 // v18.8 — Optional freshness timeout. If > 0, an EQ match where the
