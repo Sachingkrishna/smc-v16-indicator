@@ -67,6 +67,32 @@
 //         mitigation, and hidden FVG tracking for iFVG-only mode.
 // v16.6 — Replaces MSS displacement plotshape offset markers with label markers
 //         so the script stays below TradingView's 64-plot hard limit.
+// v18.0 — Institutional-footprint feature pack:
+//         • Volume-validated OB / FVG ("RVOL stamping"). At creation,
+//           computes RVOL = volume / SMA(volume, N) of the originating
+//           bar. OBs/FVGs above the threshold are flagged isInstitutional
+//           and rendered at full opacity; non-institutional structures
+//           are rendered dimmed (or hidden entirely via a per-feature
+//           "show only high-volume" toggle). No new alerts — opt-in
+//           visual filter.
+//         • Volume Imbalance (VI). ICT-distinct from FVG: a body-to-body
+//           gap between consecutive bars (max(open,close)[1] strictly
+//           below min(open,close) for bullish; symmetric for bearish).
+//           Drawn as small boxes; mitigated when body crosses far edge.
+//           One combined alert "Volume Imbalance Formed".
+//         • Anchored VWAP from latest MSS (Market Structure Shift).
+//           Resets cumulative PV / volume on every confirmed MSS event;
+//           plotted as a continuous line on the price chart. One alert
+//           "Price Tagged MSS AVWAP" when price wicks the level.
+//         • Liquidity Pool clustering. Equal-Highs / Equal-Lows now
+//           track a streak counter (`EQH×N` / `EQL×N` badges) so a 3rd
+//           or 4th consecutive equal touch is visible at a glance —
+//           higher-conviction sweep target.
+//         • Power of 3 (PO3) day cycle. Auto-classifies the current
+//           intraday phase into Accumulation (Asian), Manipulation
+//           (London open), or Distribution (NY) based on user-tunable
+//           sessions. Surfaces as a single status label and a phase-
+//           change alert.
 // v17.2 — Alert-budget cleanup ahead of v18 feature additions:
 //         • Removed 4 legacy *OB Breakout (mitigation) alerts. The same
 //           event is captured by the corresponding *Breaker Formed alert
@@ -160,7 +186,7 @@
 //           ICT timing is designed for FX/futures/crypto, not stocks.
 
 //@version=6
-indicator('Smart Money Concepts [v17.2]', 'SMC v17.2', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+indicator('Smart Money Concepts [v18.0]', 'SMC v18.0', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -216,6 +242,10 @@ SESSION_GROUP  = 'Sessions'
 PDHL_GROUP     = 'Previous Day / Week Levels'
 NDOG_GROUP     = 'Opening Gaps (NDOG/NWOG)'
 CVD_GROUP      = 'Cumulative Volume Delta (CVD)'
+RVOL_GROUP     = 'Volume Validation (RVOL)'
+VI_GROUP       = 'Volume Imbalance (VI)'
+AVWAP_GROUP    = 'Anchored VWAP'
+PO3_GROUP      = 'Power of 3 (PO3)'
 
 MAX_SESSION_BOXES  = 50
 MAX_SESSION_LABELS = 50
@@ -478,6 +508,45 @@ showCVDTableInput      = input(false, 'Show CVD Status Table',           group=C
 cvdBullDivColorInput   = input.color(#00e676, 'Bullish Divergence Marker', group=CVD_GROUP)
 cvdBearDivColorInput   = input.color(#ff1744, 'Bearish Divergence Marker', group=CVD_GROUP)
 
+// ── RVOL stamping ────────────────────────────────────────────────────────────
+rvolEnableInput      = input(false, 'Enable RVOL Stamping (OB/FVG)', group=RVOL_GROUP,
+     tooltip='At creation, compute origin RVOL = volume / SMA(volume, N).\n' +
+             'Above-threshold OBs/FVGs render at full opacity (institutional);\n' +
+             'below-threshold render dimmed or hidden depending on filter mode.')
+rvolPeriodInput      = input.int(20,  'RVOL Lookback (bars)', group=RVOL_GROUP, minval=5, maxval=200)
+rvolOBThresholdInput = input.float(1.5, 'OB Volume Multiple',  group=RVOL_GROUP, minval=1.0, maxval=5.0, step=0.1)
+rvolFVGThresholdInput= input.float(1.5, 'FVG Volume Multiple', group=RVOL_GROUP, minval=1.0, maxval=5.0, step=0.1)
+rvolHideRetailOBInput  = input(false, 'Hide Low-Vol OBs',     group=RVOL_GROUP)
+rvolHideRetailFVGInput = input(false, 'Hide Low-Vol FVGs',    group=RVOL_GROUP)
+
+// ── Volume Imbalance ─────────────────────────────────────────────────────────
+showVIInput        = input(false, 'Show Volume Imbalance (VI)',  group=VI_GROUP,
+     tooltip='Body-to-body gap between consecutive bars (no body overlap).\n' +
+             'ICT-distinct from FVG. Mitigated when body crosses the far edge.')
+viBullColorInput   = input.color(color.new(#80cbc4, 70), 'Bullish VI', group=VI_GROUP)
+viBearColorInput   = input.color(color.new(#ef9a9a, 70), 'Bearish VI', group=VI_GROUP)
+viMaxCountInput    = input.int(20, 'Max Unmitigated VIs', group=VI_GROUP, minval=1, maxval=100)
+viMitigationInput  = input.string(BODY_SRC, 'VI Mitigation', group=VI_GROUP, options=[CLOSE_SRC, BODY_SRC, HIGHLOW])
+
+// ── Anchored VWAP from MSS ───────────────────────────────────────────────────
+showMSSAVWAPInput   = input(false, 'Show MSS Anchored VWAP',  group=AVWAP_GROUP,
+     tooltip='Resets cumulative PV/volume on every confirmed MSS event.\n' +
+             'Acts as a defended institutional reference until next MSS.')
+mssAVWAPColorInput  = input.color(#ffeb3b, 'AVWAP Color',     group=AVWAP_GROUP)
+mssAVWAPWidthInput  = input.int(2, 'AVWAP Line Width',         group=AVWAP_GROUP, minval=1, maxval=4)
+
+// ── Power of 3 ───────────────────────────────────────────────────────────────
+showPO3Input         = input(false, 'Show PO3 Phase Label',   group=PO3_GROUP,
+     tooltip='Auto-classifies current intraday phase as Accumulation (Asian),\n' +
+             'Manipulation (London open), or Distribution (NY).\n' +
+             'Sessions are user-tunable; times use Kill Zone Timezone.')
+po3AccumSessionInput = input.string('1800-0200', 'Accumulation Session', group=PO3_GROUP)
+po3ManipSessionInput = input.string('0200-0930', 'Manipulation Session', group=PO3_GROUP)
+po3DistSessionInput  = input.string('0930-1600', 'Distribution Session', group=PO3_GROUP)
+po3AccumColorInput   = input.color(#9c27b0, 'Accumulation Color',  group=PO3_GROUP)
+po3ManipColorInput   = input.color(#ff9800, 'Manipulation Color',  group=PO3_GROUP)
+po3DistColorInput    = input.color(#2196f3, 'Distribution Color',  group=PO3_GROUP)
+
 //──────────────────────────────────────────────────────────────────────────────
 // Types
 //──────────────────────────────────────────────────────────────────────────────
@@ -529,6 +598,10 @@ type alerts
     // v17.0 — CVD divergence at confirmed swing pivots.
     bool bullishCVDDivergence        = false
     bool bearishCVDDivergence        = false
+    // v18.0 — Volume Imbalance, AVWAP tag, PO3 phase change.
+    bool volumeImbalanceFormed       = false
+    bool mssAVWAPTagged              = false
+    bool po3PhaseChange              = false
 
 type trailingExtremes
     float top
@@ -545,6 +618,9 @@ type fairValueGap
     box   topBox
     box   bottomBox
     int   createdBarIndex = 0
+    // v18.0 — RVOL stamping at FVG creation.
+    float originRVOL      = na
+    bool  isInstitutional = false
 
 type trend
     int bias
@@ -582,6 +658,16 @@ type orderBlock
     int   touchCount         = 0
     int   identifiedBarIndex = 0
     bool  wasInside          = true
+    // v18.0 — RVOL stamping at OB creation.
+    float originRVOL         = na
+    bool  isInstitutional    = false
+
+type volumeImbalance
+    float top
+    float bottom
+    int   bias
+    box   viBox
+    int   createdBarIndex = 0
 
 type openingGap
     float  top
@@ -618,7 +704,9 @@ bool isEquityInstrument = syminfo.type == "stock" or syminfo.type == "fund" or s
 // v16.9 — Gate the eight history ring buffers behind their actual consumers
 //         (storeOrderBlock + drawLevels). When OB tracking and MTF level
 //         drawing are all off, the 5000-entry buffers no longer accumulate.
-bool needHistoryArrays = needInternalOBTracking or needSwingOBTracking or showDailyLevelsInput or showWeeklyLevelsInput or showMonthlyLevelsInput
+// v18.0 — RVOL stamping for OBs reads back to the OB's origin bar via
+//         volumes.slice(), so OB tracking + RVOL also requires the buffer.
+bool needHistoryArrays = needInternalOBTracking or needSwingOBTracking or showDailyLevelsInput or showWeeklyLevelsInput or showMonthlyLevelsInput or rvolEnableInput
 
 //──────────────────────────────────────────────────────────────────────────────
 // State Variables
@@ -651,6 +739,10 @@ var array<int>   times                    = array.new<int>()
 var array<float> opens                    = array.new<float>()
 var array<float> closes                   = array.new<float>()
 var array<float> minPens                  = array.new<float>()
+// v18.0 — Volume history (gated). Used by RVOL stamping for OBs/FVGs.
+var array<float> volumes                  = array.new<float>()
+// v18.0 — Volume Imbalance state.
+var array<volumeImbalance> volumeImbalances = array.new<volumeImbalance>()
 
 var trailingExtremes trailing             = trailingExtremes.new()
 
@@ -697,6 +789,19 @@ var int   lastCVDDivLowIdx       = -1
 var array<label> sweepLabels     = array.new<label>()
 var array<label> displacementLabels = array.new<label>()
 var array<label> cvdDivLabels    = array.new<label>()
+// v18.0 — Liquidity Pool clustering: consecutive equal-touch streak counts.
+var int eqHighStreak             = 1
+var int eqLowStreak              = 1
+// v18.0 — AVWAP from latest MSS.
+var int   mssAvwapAnchorTime     = na
+var int   mssAvwapAnchorBar      = na
+var float mssAvwapCumPV          = 0.0
+var float mssAvwapCumVol         = 0.0
+var float mssAvwapValue          = na
+var bool  mssAvwapResetThisBar   = false
+// v18.0 — PO3 phase tracking (state-machine over intraday session windows).
+var string po3CurrentPhase       = ''
+var label  po3PhaseLabel         = na
 
 var sessionTracker sydneySession  = sessionTracker.new(false, false, na, na, na, na, na, na)
 var sessionTracker tokyoSession   = sessionTracker.new(false, false, na, na, na, na, na, na)
@@ -887,6 +992,7 @@ if needHistoryArrays
     pushBounded(opens,       open)
     pushBounded(closes,      close)
     pushBounded(minPens,     minPen)
+    pushBounded(volumes,     nz(volume))
 
 //──────────────────────────────────────────────────────────────────────────────
 // Pre-compute crossovers at global scope
@@ -1006,11 +1112,17 @@ drawLabel(int labelTime, float labelPrice, string tag, color labelColor, string 
 
 drawEqualHighLow(pivot p_ivot, float level, int size, bool isEqualHigh) =>
     equalDisplay e_qualDisplay = isEqualHigh ? equalHighDisplay : equalLowDisplay
-    string tag        = 'EQL'
+    // v18.0 — Liquidity Pool clustering. Streak counter promotes 'EQH' →
+    //         'EQH×N' once the same level has been kissed twice or more,
+    //         making 3+ equal touches visible at a glance as a high-
+    //         conviction sweep target.
+    int streakRef = isEqualHigh ? eqHighStreak : eqLowStreak
+    string countSuffix = streakRef >= 2 ? '×' + str.tostring(streakRef) : ''
+    string tag        = 'EQL' + countSuffix
     color  equalColor = swingBullishColor
     string labelStyle = label.style_label_up
     if isEqualHigh
-        tag        := 'EQH'
+        tag        := 'EQH' + countSuffix
         equalColor := swingBearishColor
         labelStyle := label.style_label_down
     if modeInput == PRESENT
@@ -1037,9 +1149,15 @@ getCurrentStructure(int size, bool equalHighLow = false, bool internal = false) 
         if pivotLow
             pivot p_ivot = equalHighLow ? equalLow : internal ? internalLow : swingLow
             float candidateBodyLow = pivotSourceInput == 'Wick' ? low[size] : math.min(open[size], close[size])
-            if equalHighLow and not na(p_ivot.currentLevel) and math.abs(p_ivot.currentLevel - candidateBodyLow) < equalHighsLowsThresholdInput * atrMeasure
-                drawEqualHighLow(p_ivot, candidateBodyLow, size, false)
-                currentAlerts.equalLows := true
+            // v18.0 — Liquidity Pool streak counter. Increment on consecutive
+            //         in-tolerance equal pivots; reset to 1 on a non-EQ pivot.
+            if equalHighLow and not na(p_ivot.currentLevel)
+                if math.abs(p_ivot.currentLevel - candidateBodyLow) < equalHighsLowsThresholdInput * atrMeasure
+                    eqLowStreak += 1
+                    drawEqualHighLow(p_ivot, candidateBodyLow, size, false)
+                    currentAlerts.equalLows := true
+                else
+                    eqLowStreak := 1
             p_ivot.lastLevel    := p_ivot.currentLevel
             p_ivot.currentLevel := candidateBodyLow
             p_ivot.crossed      := false
@@ -1062,9 +1180,14 @@ getCurrentStructure(int size, bool equalHighLow = false, bool internal = false) 
         else
             pivot p_ivot = equalHighLow ? equalHigh : internal ? internalHigh : swingHigh
             float candidateBodyHigh = pivotSourceInput == 'Wick' ? high[size] : math.max(open[size], close[size])
-            if equalHighLow and not na(p_ivot.currentLevel) and math.abs(p_ivot.currentLevel - candidateBodyHigh) < equalHighsLowsThresholdInput * atrMeasure
-                drawEqualHighLow(p_ivot, candidateBodyHigh, size, true)
-                currentAlerts.equalHighs := true
+            // v18.0 — Liquidity Pool streak counter (high side).
+            if equalHighLow and not na(p_ivot.currentLevel)
+                if math.abs(p_ivot.currentLevel - candidateBodyHigh) < equalHighsLowsThresholdInput * atrMeasure
+                    eqHighStreak += 1
+                    drawEqualHighLow(p_ivot, candidateBodyHigh, size, true)
+                    currentAlerts.equalHighs := true
+                else
+                    eqHighStreak := 1
             p_ivot.lastLevel    := p_ivot.currentLevel
             p_ivot.currentLevel := candidateBodyHigh
             p_ivot.crossed      := false
@@ -1174,6 +1297,7 @@ deleteOrderBlocks(bool internal = false) =>
                     // is, by construction, interacting with the zone that becomes the
                     // breaker. Without this, the very next bar's overlap would falsely
                     // register as the breaker's first retest.
+                    // v18.0 — Inherit parent OB's RVOL stamp on BB conversion.
                     orderBlock breaker = orderBlock.new(
                          eachOrderBlock.barHigh,
                          eachOrderBlock.barLow,
@@ -1181,7 +1305,9 @@ deleteOrderBlocks(bool internal = false) =>
                         newBias,
                         0,
                         bar_index,
-                        true)
+                        true,
+                        eachOrderBlock.originRVOL,
+                        eachOrderBlock.isInstitutional)
                     array<orderBlock> breakers = internal ? internalBreakerBlocks : swingBreakerBlocks
                     if breakers.size() >= MAX_BREAKER_COUNT
                         breakers.pop()
@@ -1375,7 +1501,22 @@ storeOrderBlock(pivot brokenPivot, pivot originPivot, bool internal = false, int
 
                 // Skip storing if the OB was already exhausted historically.
                 if stillValid and hTouches < maxOBTouchesInput
-                    orderBlock o_rderBlock = orderBlock.new(obTop, obBottom, times.get(parsedIndex), bias, hTouches, bar_index, prevInside)
+                    // v18.0 — RVOL stamping. Look up the origin bar's volume
+                    //         and the trailing SMA(volume, rvolPeriodInput)
+                    //         centred on parsedIndex. Volumes array gated on
+                    //         rvolEnableInput (see needHistoryArrays).
+                    float obOriginVol = na
+                    float obAvgVol    = na
+                    if rvolEnableInput and parsedIndex >= 0 and parsedIndex < volumes.size()
+                        obOriginVol := volumes.get(parsedIndex)
+                        int volStart = math.max(0, parsedIndex - rvolPeriodInput + 1)
+                        int volEnd   = math.min(parsedIndex + 1, volumes.size())
+                        if volEnd > volStart
+                            array<float> volSlice = volumes.slice(volStart, volEnd)
+                            obAvgVol := volSlice.avg()
+                    float obRVOL = (rvolEnableInput and not na(obAvgVol) and obAvgVol > 0) ? obOriginVol / obAvgVol : na
+                    bool  obIsInst = rvolEnableInput and not na(obRVOL) and obRVOL >= rvolOBThresholdInput
+                    orderBlock o_rderBlock = orderBlock.new(obTop, obBottom, times.get(parsedIndex), bias, hTouches, bar_index, prevInside, obRVOL, obIsInst)
                     array<orderBlock> orderBlocks = internal ? internalOrderBlocks : swingOrderBlocks
                     int _orderBlocksSize = orderBlocks.size()
                     if _orderBlocksSize >= MAX_ORDER_BLOCK_COUNT
@@ -1415,12 +1556,16 @@ drawOrderBlocks(bool internal = false) =>
                          ? (eachOB.bias == BEARISH ? internalBearishOrderBlockColor : internalBullishOrderBlockColor)
                          : (eachOB.bias == BEARISH ? swingBearishOrderBlockColor    : swingBullishOrderBlockColor)
                 box b_ox = b_oxes.get(index)
+                // v18.0 — RVOL render: dim non-institutional, optionally hide.
+                color rvolBg = obColor
+                color rvolBd = obColor
+                if rvolEnableInput and not eachOB.isInstitutional
+                    rvolBg := rvolHideRetailOBInput ? color.new(obColor, 100) : color.new(obColor, 95)
+                    rvolBd := rvolHideRetailOBInput ? color.new(obColor, 100) : color.new(obColor, 95)
                 b_ox.set_top_left_point(    chart.point.new(eachOB.barTime, na, eachOB.barHigh))
                 b_ox.set_bottom_right_point(chart.point.new(last_bar_time,  na, eachOB.barLow))
-                // v16.8 — Both internal & swing OBs now render with a border,
-                //         matching Breaker Block behaviour.
-                b_ox.set_border_color(obColor)
-                b_ox.set_bgcolor(obColor)
+                b_ox.set_border_color(rvolBd)
+                b_ox.set_bgcolor(rvolBg)
                 if showOBTouchCountInput and eachOB.touchCount > 0
                     string touchText = str.tostring(eachOB.touchCount) + 'x'
                     b_ox.set_text(touchText)
@@ -1477,10 +1622,16 @@ drawBreakerBlocks(bool internal = false) =>
                          ? (eachBB.bias == BEARISH ? internalBearishBreakerColor : internalBullishBreakerColor)
                          : (eachBB.bias == BEARISH ? swingBearishBreakerColor    : swingBullishBreakerColor)
                 box b_ox = b_oxes.get(index)
+                // v18.0 — RVOL render: dim non-institutional, optionally hide.
+                color rvolBbBg = bbColor
+                color rvolBbBd = bbColor
+                if rvolEnableInput and not eachBB.isInstitutional
+                    rvolBbBg := rvolHideRetailOBInput ? color.new(bbColor, 100) : color.new(bbColor, 95)
+                    rvolBbBd := rvolHideRetailOBInput ? color.new(bbColor, 100) : color.new(bbColor, 95)
                 b_ox.set_top_left_point(    chart.point.new(eachBB.barTime, na, eachBB.barHigh))
                 b_ox.set_bottom_right_point(chart.point.new(last_bar_time,  na, eachBB.barLow))
-                b_ox.set_border_color(bbColor)
-                b_ox.set_bgcolor(bbColor)
+                b_ox.set_border_color(rvolBbBd)
+                b_ox.set_bgcolor(rvolBbBg)
                 // v15.4 — BB touch count now has its own toggle.
                 if showBBTouchCountInput and eachBB.touchCount > 0
                     string bbTouchText = str.tostring(eachBB.touchCount) + 'x'
@@ -1704,6 +1855,9 @@ deleteFairValueGaps() =>
                 float savedTop       = eachFVG.top
                 float savedBottom    = eachFVG.bottom
                 int   savedBias      = eachFVG.bias
+                // v18.0 — Inherit parent's RVOL on iFVG conversion.
+                float savedRVOL      = eachFVG.originRVOL
+                bool  savedIsInst    = eachFVG.isInstitutional
 
                 eachFVG.topBox.delete()
                 eachFVG.bottomBox.delete()
@@ -1747,7 +1901,9 @@ deleteFairValueGaps() =>
                          newBias,
                          newTopBox,
                          newBottomBox,
-                         bar_index)
+                         bar_index,
+                         savedRVOL,
+                         savedIsInst)
 
                     invertedFVGs.unshift(iFVG)
                     if newBias == BULLISH
@@ -1808,6 +1964,81 @@ trimFairValueGaps() =>
         old.topBox.delete()
         old.bottomBox.delete()
 
+//──────────────────────────────────────────────────────────────────────────────
+// v18.0 — Volume Imbalance (VI)
+//   ICT body-to-body gap between two adjacent candles (distinct from FVG):
+//     Bullish: max(open,close)[1] < min(open,close)  → gap above prev body
+//     Bearish: min(open,close)[1] > max(open,close)  → gap below prev body
+//   Stored with top > bottom invariant. Mitigated when body crosses the FAR
+//   edge (bullish → below .bottom; bearish → above .top), consistent with
+//   the OB/FVG mitigation-source model.
+//──────────────────────────────────────────────────────────────────────────────
+detectVolumeImbalances() =>
+    if showVIInput and barstate.isconfirmed and bar_index >= 1
+        float prevTopBody = math.max(open[1], close[1])
+        float prevBotBody = math.min(open[1], close[1])
+        float currTopBody = math.max(open, close)
+        float currBotBody = math.min(open, close)
+        bool bullVI = prevTopBody < currBotBody
+        bool bearVI = prevBotBody > currTopBody
+        int  barDur = nz(time - time[1], 60000)
+        if bullVI
+            box viBox = box.new(
+                 chart.point.new(time[1], na, currBotBody),
+                 chart.point.new(time + 5 * barDur, na, prevTopBody),
+                 xloc=xloc.bar_time,
+                 bgcolor=viBullColorInput,
+                 border_color=color.new(viBullColorInput, 30),
+                 border_style=line.style_dotted)
+            volumeImbalance newVI = volumeImbalance.new(currBotBody, prevTopBody, BULLISH, viBox, bar_index)
+            volumeImbalances.unshift(newVI)
+            currentAlerts.volumeImbalanceFormed := true
+        if bearVI
+            box viBox = box.new(
+                 chart.point.new(time[1], na, prevBotBody),
+                 chart.point.new(time + 5 * barDur, na, currTopBody),
+                 xloc=xloc.bar_time,
+                 bgcolor=viBearColorInput,
+                 border_color=color.new(viBearColorInput, 30),
+                 border_style=line.style_dotted)
+            volumeImbalance newVI = volumeImbalance.new(prevBotBody, currTopBody, BEARISH, viBox, bar_index)
+            volumeImbalances.unshift(newVI)
+            currentAlerts.volumeImbalanceFormed := true
+        while volumeImbalances.size() > viMaxCountInput
+            volumeImbalance oldVI = volumeImbalances.pop()
+            oldVI.viBox.delete()
+
+deleteVolumeImbalances() =>
+    int sz = volumeImbalances.size()
+    if sz > 0
+        for index = sz - 1 to 0
+            volumeImbalance vi = volumeImbalances.get(index)
+            if vi.createdBarIndex >= bar_index
+                continue
+            float viBullSrc = viMitigationInput == CLOSE_SRC ? close
+                 : viMitigationInput == BODY_SRC ? math.min(open, close)
+                 : low
+            float viBearSrc = viMitigationInput == CLOSE_SRC ? close
+                 : viMitigationInput == BODY_SRC ? math.max(open, close)
+                 : high
+            bool mitigated = false
+            if vi.bias == BULLISH and viBullSrc < vi.bottom
+                mitigated := true
+            else if vi.bias == BEARISH and viBearSrc > vi.top
+                mitigated := true
+            if mitigated
+                vi.viBox.delete()
+                volumeImbalances.remove(index)
+
+extendVolumeImbalances() =>
+    int sz = volumeImbalances.size()
+    if sz > 0
+        int barDur = nz(time - time[1], 60000)
+        int rightEdge = time + 5 * barDur
+        for index = 0 to sz - 1
+            volumeImbalance vi = volumeImbalances.get(index)
+            vi.viBox.set_right(rightEdge)
+
 drawFairValueGaps() =>
     [midClose, midOpen, midTime, recentHigh, recentLow, recentTime, oldHigh, oldLow] = request.security(
          syminfo.tickerid,
@@ -1825,22 +2056,37 @@ drawFairValueGaps() =>
     float ceLevel = na
     bullishFVG = recentLow > oldHigh and midClose > oldHigh and barDeltaPercent > threshold and newTimeframe and barstate.isconfirmed
     bearishFVG = recentHigh < oldLow and midClose < oldLow and -barDeltaPercent > threshold and newTimeframe and barstate.isconfirmed
-    color activeBullFVGColor = showFairValueGapsInput ? fairValueGapBullishColor : color.new(fairValueGapBullishColor, 100)
-    color activeBearFVGColor = showFairValueGapsInput ? fairValueGapBearishColor : color.new(fairValueGapBearishColor, 100)
+    // v18.0 — RVOL color modulation. Compute fvgIsInst now so it applies
+    //         to whichever direction (bullish/bearish) actually fires below.
+    color rvolBullCol = fairValueGapBullishColor
+    color rvolBearCol = fairValueGapBearishColor
+    if rvolEnableInput and not fvgIsInst
+        rvolBullCol := rvolHideRetailFVGInput ? color.new(fairValueGapBullishColor, 100) : color.new(fairValueGapBullishColor, 95)
+        rvolBearCol := rvolHideRetailFVGInput ? color.new(fairValueGapBearishColor, 100) : color.new(fairValueGapBearishColor, 95)
+    color activeBullFVGColor = showFairValueGapsInput ? rvolBullCol : color.new(fairValueGapBullishColor, 100)
+    color activeBearFVGColor = showFairValueGapsInput ? rvolBearCol : color.new(fairValueGapBearishColor, 100)
+    // v18.0 — RVOL stamp for FVGs. The "originating" bar of an FVG is the
+    //         middle bar (offset 2 in this script's HTF FVG model — see
+    //         midClose / midOpen requested at offset [2]). Use ta.sma over
+    //         volume on that same offset window.
+    float fvgOriginVol = rvolEnableInput ? nz(volume[2]) : na
+    float fvgAvgVol    = rvolEnableInput ? ta.sma(volume, rvolPeriodInput)[2] : na
+    float fvgRVOL      = (rvolEnableInput and not na(fvgAvgVol) and fvgAvgVol > 0) ? fvgOriginVol / fvgAvgVol : na
+    bool  fvgIsInst    = rvolEnableInput and not na(fvgRVOL) and fvgRVOL >= rvolFVGThresholdInput
     if bullishFVG
         currentAlerts.bullishFairValueGap := true
         ceLevel  := math.avg(recentLow, oldHigh)
         fairValueGaps.unshift(fairValueGap.new(recentLow, oldHigh, BULLISH,
              fairValueGapBox(midTime, recentTime, recentLow, ceLevel, activeBullFVGColor),
              fairValueGapBox(midTime, recentTime, ceLevel, oldHigh, activeBullFVGColor),
-             bar_index))
+             bar_index, fvgRVOL, fvgIsInst))
     if bearishFVG
         currentAlerts.bearishFairValueGap := true
         ceLevel  := math.avg(recentHigh, oldLow)
         fairValueGaps.unshift(fairValueGap.new(recentHigh, oldLow, BEARISH,
              fairValueGapBox(midTime, recentTime, recentHigh, ceLevel, activeBearFVGColor),
              fairValueGapBox(midTime, recentTime, ceLevel, oldLow, activeBearFVGColor),
-             bar_index))
+             bar_index, fvgRVOL, fvgIsInst))
     trimFairValueGaps()
 
 //──────────────────────────────────────────────────────────────────────────────
@@ -2034,6 +2280,14 @@ parsedOpen  = showTrendInput ? open : na
 candleColor = internalTrend.bias == BULLISH ? swingBullishColor : swingBearishColor
 plotcandle(parsedOpen, high, low, close, color=candleColor, wickcolor=candleColor, bordercolor=candleColor)
 
+// v18.0 — MSS AVWAP plot. style_linebr leaves a 1-bar gap on the reset bar
+//         so the new VWAP doesn't visually connect to the previous segment.
+plot(showMSSAVWAPInput and not mssAvwapResetThisBar ? mssAvwapValue : na,
+     title = 'MSS Anchored VWAP',
+     color = mssAVWAPColorInput,
+     linewidth = mssAVWAPWidthInput,
+     style = plot.style_linebr)
+
 //──────────────────────────────────────────────────────────────────────────────
 // Main Execution
 //──────────────────────────────────────────────────────────────────────────────
@@ -2069,6 +2323,33 @@ if showInternalsInput or needInternalOBTracking or showTrendInput
 
 if showStructureInput or needSwingOBTracking or showHighLowSwingsInput
     displayStructure()
+
+// ── v18.0 — Anchored VWAP from latest MSS ─────────────────────────────────────
+//   Reset cumulative on every confirmed MSS event (internal or swing, bull or
+//   bear); accumulate hlc3 * volume thereafter. plot.style_linebr breaks the
+//   line on the reset bar so the new AVWAP doesn't visually connect to the
+//   previous one. Tag-alert fires when price wicks the level after at least
+//   one prior bar where price was outside it.
+bool mssAnyFired = currentAlerts.internalBullishMSS or currentAlerts.swingBullishMSS or currentAlerts.internalBearishMSS or currentAlerts.swingBearishMSS
+mssAvwapResetThisBar := false
+if showMSSAVWAPInput and mssAnyFired
+    mssAvwapAnchorTime   := time
+    mssAvwapAnchorBar    := bar_index
+    mssAvwapCumPV        := 0.0
+    mssAvwapCumVol       := 0.0
+    mssAvwapResetThisBar := true
+if showMSSAVWAPInput and not na(mssAvwapAnchorBar)
+    mssAvwapCumPV  += hlc3 * nz(volume)
+    mssAvwapCumVol += nz(volume)
+    mssAvwapValue  := mssAvwapCumVol > 0 ? mssAvwapCumPV / mssAvwapCumVol : na
+else
+    mssAvwapValue := na
+
+if showMSSAVWAPInput and barstate.isconfirmed and not na(mssAvwapValue) and not na(mssAvwapValue[1])
+    bool taggedNow  = high >= mssAvwapValue and low <= mssAvwapValue
+    bool taggedPrev = high[1] >= mssAvwapValue[1] and low[1] <= mssAvwapValue[1]
+    if taggedNow and not taggedPrev
+        currentAlerts.mssAVWAPTagged := true
 
 // Liquidity Sweep Detection
 // v16.7 — Compare against the swing pivot's wick high/low (actualLevel) so a
@@ -2223,6 +2504,15 @@ if showSwingBreakerBlocksInput and barstate.isconfirmed
 if needFVGTracking and barstate.isconfirmed
     drawFairValueGaps()
 
+// v18.0 — Volume Imbalance lifecycle. Detect on confirmed bars, mitigate on
+//         confirmed bars (using the configured mitigation source), extend
+//         box right edges every bar so unmitigated VIs stay visible.
+if showVIInput and barstate.isconfirmed
+    deleteVolumeImbalances()
+if showVIInput
+    detectVolumeImbalances()
+    extendVolumeImbalances()
+
 if barstate.islastconfirmedhistory or barstate.islast
     if showInternalOrderBlocksInput
         drawOrderBlocks(true)
@@ -2269,6 +2559,39 @@ bool inSilverBulletLDN = kzEnabled and kzSilverBulletLDNInput and inKillZone('03
 
 bgcolor(inSilverBulletAM ? kzSilverBulletAMColorInput : inSilverBulletPM ? kzSilverBulletPMColorInput : na, title='Silver Bullet AM/PM')
 bgcolor(inSilverBulletLDN ? kzSilverBulletLDNColorInput : na, title='Silver Bullet London')
+
+//──────────────────────────────────────────────────────────────────────────────
+// v18.0 — Power of 3 (PO3) day cycle
+//   Classifies the current intraday bar into one of three ICT phases:
+//     Accumulation (Asian-style range building),
+//     Manipulation (London-open sweep of the accumulation range),
+//     Distribution (NY trend in the direction opposite the manipulation).
+//   Session windows are user-tunable; times resolved via kzTimezoneInput.
+//──────────────────────────────────────────────────────────────────────────────
+bool po3InAccum = showPO3Input and not na(time(timeframe.period, po3AccumSessionInput, kzTimezoneInput))
+bool po3InManip = showPO3Input and not na(time(timeframe.period, po3ManipSessionInput, kzTimezoneInput))
+bool po3InDist  = showPO3Input and not na(time(timeframe.period, po3DistSessionInput,  kzTimezoneInput))
+string po3NewPhase = po3InAccum ? 'Accumulation' : po3InManip ? 'Manipulation' : po3InDist ? 'Distribution' : ''
+if showPO3Input and barstate.isconfirmed and po3NewPhase != '' and po3NewPhase != po3CurrentPhase
+    po3CurrentPhase := po3NewPhase
+    currentAlerts.po3PhaseChange := true
+
+if showPO3Input and barstate.islast
+    if not na(po3PhaseLabel)
+        po3PhaseLabel.delete()
+    color phaseColor = po3CurrentPhase == 'Accumulation' ? po3AccumColorInput
+         : po3CurrentPhase == 'Manipulation' ? po3ManipColorInput
+         : po3CurrentPhase == 'Distribution' ? po3DistColorInput
+         : color.gray
+    po3PhaseLabel := label.new(
+         last_bar_time + 30 * nz(time - time[1], 60000),
+         high,
+         'PO3: ' + (po3CurrentPhase == '' ? 'Idle' : po3CurrentPhase),
+         xloc=xloc.bar_time,
+         style=label.style_label_left,
+         color=color(na),
+         textcolor=phaseColor,
+         size=size.normal)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Session Boxes
@@ -2682,6 +3005,10 @@ alertcondition(currentAlerts.bullishEQLSweep,           'EQL Sweep',            
 // v17.0 — CVD divergence at confirmed swing pivots.
 alertcondition(currentAlerts.bullishCVDDivergence,      'Bullish CVD Divergence',       'Bullish CVD divergence at swing low (potential accumulation)')
 alertcondition(currentAlerts.bearishCVDDivergence,      'Bearish CVD Divergence',       'Bearish CVD divergence at swing high (potential distribution)')
+// v18.0 — Volume Imbalance, MSS AVWAP tag, PO3 phase change.
+alertcondition(currentAlerts.volumeImbalanceFormed,     'Volume Imbalance Formed',      'Volume Imbalance (body-to-body gap) formed')
+alertcondition(currentAlerts.mssAVWAPTagged,            'Price Tagged MSS AVWAP',       'Price wicked the Anchored VWAP from the latest MSS')
+alertcondition(currentAlerts.po3PhaseChange,            'PO3 Phase Change',             'Power-of-3 intraday phase changed (Accumulation / Manipulation / Distribution)')
 alertcondition(currentAlerts.bullishBreakerFormed,      'Bullish Breaker Formed',       'Bullish breaker block formed')
 alertcondition(currentAlerts.bearishBreakerFormed,      'Bearish Breaker Formed',       'Bearish breaker block formed')
 alertcondition(currentAlerts.bullishBreakerMitigated,   'Bullish Breaker Mitigated',    'Bullish breaker block mitigated')
