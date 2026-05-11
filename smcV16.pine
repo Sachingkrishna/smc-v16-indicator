@@ -67,6 +67,24 @@
 //         mitigation, and hidden FVG tracking for iFVG-only mode.
 // v16.6 — Replaces MSS displacement plotshape offset markers with label markers
 //         so the script stays below TradingView's 64-plot hard limit.
+// v18.8 — CVD custom pivot length + EQH/EQL freshness timeout:
+//         • CVD divergence detection now supports three pivot sources:
+//             Swing    — existing swing pivots (Swing Length, default 20)
+//             Internal — existing internal pivots (Internal Length, def 5)
+//             Custom   — new dedicated CVD pivots at user-set length
+//                        (default 10, range 3-50)
+//           Resolves the user's request for a CVD lookback independent
+//           from both swing structure and internal structure. The toggle
+//           input (cvdUseInternalPivotsInput, bool) is replaced by a
+//           dropdown (cvdPivotSourceInput, string). Existing saved
+//           settings will reset to default "Swing"; users on Internal
+//           need to re-select.
+//         • EQH/EQL freshness timeout. New optional input
+//           "EQH/EQL Max Bars Between Matches". When > 0, an EQ match
+//           older than N bars resets the streak count back to 1 (the
+//           label still draws). Defaults to 0 (disabled) to preserve
+//           existing cumulative-streak behavior. Use this to suppress
+//           inflated EQH×N badges where matches span large time gaps.
 // v18.7 — Fix AVWAP plot 1-bar lag:
 //         • The plot() statement for the MSS AVWAP was positioned above
 //           the assignment block that computes mssAvwapValue / sets
@@ -260,7 +278,7 @@
 //           ICT timing is designed for FX/futures/crypto, not stocks.
 
 //@version=6
-indicator('Smart Money Concepts [v18.7]', 'SMC v18.7', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+indicator('Smart Money Concepts [v18.8]', 'SMC v18.8', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -400,6 +418,18 @@ showEqualHighsLowsInput        = input(true,   'Equal High/Low',           group
 equalHighsLowsLengthInput      = input.int(3,  'Bars Confirmation',        group=EQUAL_GROUP, minval=1)
 equalHighsLowsThresholdInput   = input.float(0.1, 'Threshold',             group=EQUAL_GROUP, minval=0, maxval=0.5, step=0.1)
 equalHighsLowsSizeInput        = input.string(TINY, 'Label Size',          group=EQUAL_GROUP, options=[TINY,SMALL,NORMAL])
+// v18.8 — Optional freshness timeout. If > 0, an EQ match where the
+//         previous EQ pivot is more than N bars old resets the streak
+//         counter to 1. Defaults to 0 (disabled) to preserve cumulative
+//         streak behavior. Use to suppress inflated EQH×N badges where
+//         the touches span large time gaps.
+eqMaxBarsBetweenMatchesInput   = input.int(0, 'Max Bars Between Matches', group=EQUAL_GROUP,
+     minval=0, maxval=500,
+     tooltip='If > 0, EQH/EQL matches more than this many bars after the\n' +
+             'previous match still draw an EQH/EQL label but reset the\n' +
+             'streak count to 1 (preventing inflated x N badges from\n' +
+             'unrelated price visits to the same level long ago).\n' +
+             'Default 0 = disabled.')
 
 showFairValueGapsInput         = input(false, 'Fair Value Gaps',            group=GAPS_GROUP)
 fairValueGapsThresholdInput    = input(true,  'Auto Threshold',             group=GAPS_GROUP)
@@ -580,14 +610,21 @@ showCVDTableInput      = input(false, 'Show CVD Status Table',           group=C
      tooltip='Top-right table showing live cumulative CVD value, sign, and bar delta.')
 cvdBullDivColorInput   = input.color(#00e676, 'Bullish Divergence Marker', group=CVD_GROUP)
 cvdBearDivColorInput   = input.color(#ff1744, 'Bearish Divergence Marker', group=CVD_GROUP)
-// v18.6 — Decouple CVD lookback from main swing-structure lookback.
-cvdUseInternalPivotsInput = input(false, 'Use Internal Pivots for CVD', group=CVD_GROUP,
-     tooltip='When OFF (default): CVD divergence triggers at Swing pivots\n' +
-             '  (Real Time Swing Structure → Swing Length, default 20).\n' +
-             'When ON: CVD divergence triggers at Internal pivots\n' +
-             '  (Real Time Internal Structure → Internal Swing Length,\n' +
-             '   default 5). Faster confirmation at the cost of more\n' +
-             '   false-positive divergence labels.')
+// v18.8 — CVD pivot source: Swing / Internal / Custom (dropdown, replaces
+//         the v18.6 bool toggle).
+cvdPivotSourceInput = input.string('Swing', 'CVD Pivot Source', group=CVD_GROUP,
+     options=['Swing', 'Internal', 'Custom'],
+     tooltip='Swing    — use existing swing pivots (Swing Length, default 20).\n' +
+             '           Cleanest signals, slowest confirmation.\n' +
+             'Internal — use existing internal pivots (Internal Swing\n' +
+             '           Length, default 5). Faster, more noise.\n' +
+             'Custom   — use a dedicated CVD pivot length (next setting),\n' +
+             '           independent from swing/internal structure.')
+cvdCustomPivotLengthInput = input.int(10, 'Custom CVD Pivot Length',
+     group=CVD_GROUP, minval=3, maxval=50,
+     tooltip='Only used when CVD Pivot Source = Custom.\n' +
+             'Lower = more divergence labels (faster + noisier).\n' +
+             'Higher = fewer divergence labels (slower + cleaner).')
 
 // ── RVOL stamping ────────────────────────────────────────────────────────────
 rvolEnableInput      = input(false, 'Enable RVOL Stamping (OB/FVG)', group=RVOL_GROUP,
@@ -811,6 +848,11 @@ var pivot snapInternalHigh                = pivot.new(na,na,false)
 var pivot snapInternalLow                 = pivot.new(na,na,false)
 var pivot snapSwingHigh                   = pivot.new(na,na,false)
 var pivot snapSwingLow                    = pivot.new(na,na,false)
+// v18.8 — Dedicated CVD pivot instances for the 'Custom' pivot source.
+//         Detected at cvdCustomPivotLengthInput bars, independently from
+//         swing/internal/equal pivot streams.
+var pivot cvdCustomHigh                   = pivot.new(na,na,false)
+var pivot cvdCustomLow                    = pivot.new(na,na,false)
 
 var trend swingTrend                      = trend.new(0)
 var trend internalTrend                   = trend.new(0)
@@ -1244,9 +1286,17 @@ getCurrentStructure(int size, bool equalHighLow = false, bool internal = false) 
             float candidateBodyLow = pivotSourceInput == 'Wick' ? low[size] : math.min(open[size], close[size])
             // v18.0 — Liquidity Pool streak counter. Increment on consecutive
             //         in-tolerance equal pivots; reset to 1 on a non-EQ pivot.
+            // v18.8 — Optional freshness timeout: matches more than
+            //         eqMaxBarsBetweenMatchesInput bars apart still draw the
+            //         label but reset the streak count, preventing stale
+            //         cumulative x N badges spanning unrelated visits.
             if equalHighLow and not na(p_ivot.currentLevel)
                 if math.abs(p_ivot.currentLevel - candidateBodyLow) < equalHighsLowsThresholdInput * atrMeasure
-                    eqLowStreak.value += 1
+                    bool tooStaleLow = eqMaxBarsBetweenMatchesInput > 0 and not na(p_ivot.barIndex) and (bar_index - size - p_ivot.barIndex) > eqMaxBarsBetweenMatchesInput
+                    if tooStaleLow
+                        eqLowStreak.value := 1
+                    else
+                        eqLowStreak.value += 1
                     drawEqualHighLow(p_ivot, candidateBodyLow, size, false)
                     currentAlerts.equalLows := true
                 else
@@ -1276,9 +1326,14 @@ getCurrentStructure(int size, bool equalHighLow = false, bool internal = false) 
             pivot p_ivot = equalHighLow ? equalHigh : internal ? internalHigh : swingHigh
             float candidateBodyHigh = pivotSourceInput == 'Wick' ? high[size] : math.max(open[size], close[size])
             // v18.0 — Liquidity Pool streak counter (high side).
+            // v18.8 — Optional freshness timeout (see low-side branch above).
             if equalHighLow and not na(p_ivot.currentLevel)
                 if math.abs(p_ivot.currentLevel - candidateBodyHigh) < equalHighsLowsThresholdInput * atrMeasure
-                    eqHighStreak.value += 1
+                    bool tooStaleHigh = eqMaxBarsBetweenMatchesInput > 0 and not na(p_ivot.barIndex) and (bar_index - size - p_ivot.barIndex) > eqMaxBarsBetweenMatchesInput
+                    if tooStaleHigh
+                        eqHighStreak.value := 1
+                    else
+                        eqHighStreak.value += 1
                     drawEqualHighLow(p_ivot, candidateBodyHigh, size, true)
                     currentAlerts.equalHighs := true
                 else
@@ -1301,6 +1356,35 @@ getCurrentStructure(int size, bool equalHighLow = false, bool internal = false) 
                 trailing.lastTopTime := p_ivot.barTime
             if showSwingsInput and not internal and not equalHighLow
                 drawLabel(time[size], p_ivot.currentLevel, p_ivot.currentLevel > p_ivot.lastLevel ? 'HH' : 'LH', swingBearishColor, label.style_label_down)
+
+//──────────────────────────────────────────────────────────────────────────────
+// v18.8 — Custom CVD pivot detection
+//   Self-contained pivot detector for the 'Custom' CVD pivot source. Mirrors
+//   the swing-pivot logic in getCurrentStructure() but writes into the
+//   dedicated cvdCustomHigh / cvdCustomLow instances at user-set length.
+//   leg() / startOfBullish-Bearish-Leg() maintain per-call-site state, so
+//   this runs independently of the main swing detector.
+//──────────────────────────────────────────────────────────────────────────────
+detectCVDCustomPivot(int size) =>
+    int curLeg = leg(size)
+    if startOfBullishLeg(curLeg)
+        cvdCustomLow.lastLevel    := cvdCustomLow.currentLevel
+        cvdCustomLow.currentLevel := pivotSourceInput == 'Wick' ? low[size] : math.min(open[size], close[size])
+        cvdCustomLow.crossed      := false
+        cvdCustomLow.barTime      := time[size]
+        cvdCustomLow.barIndex     := bar_index[size]
+        cvdCustomLow.actualLevel  := low[size]
+        cvdCustomLow.lastCVD      := cvdCustomLow.currentCVD
+        cvdCustomLow.currentCVD   := cumCVD[size]
+    else if startOfBearishLeg(curLeg)
+        cvdCustomHigh.lastLevel    := cvdCustomHigh.currentLevel
+        cvdCustomHigh.currentLevel := pivotSourceInput == 'Wick' ? high[size] : math.max(open[size], close[size])
+        cvdCustomHigh.crossed      := false
+        cvdCustomHigh.barTime      := time[size]
+        cvdCustomHigh.barIndex     := bar_index[size]
+        cvdCustomHigh.actualLevel  := high[size]
+        cvdCustomHigh.lastCVD      := cvdCustomHigh.currentCVD
+        cvdCustomHigh.currentCVD   := cumCVD[size]
 
 //──────────────────────────────────────────────────────────────────────────────
 // Structure Drawing
@@ -2417,6 +2501,10 @@ getCurrentStructure(internalLengthInput, false, true)
 if showEqualHighsLowsInput
     getCurrentStructure(equalHighsLowsLengthInput, true)
 
+// v18.8 — Run the dedicated CVD pivot detector only when needed.
+if showCVDDivergenceInput and cvdPivotSourceInput == 'Custom'
+    detectCVDCustomPivot(cvdCustomPivotLengthInput)
+
 if showInternalsInput or needInternalOBTracking or showTrendInput
     displayStructure(true)
 
@@ -2574,10 +2662,13 @@ if showLiquiditySweepsInput and barstate.isconfirmed
 //         Triggered once per pivot, gated on barIndex change so it doesn't
 //         re-fire while the swing is still the most-recent pivot.
 if showCVDDivergenceInput and barstate.isconfirmed
-    // v18.6 — Pivot-stream selection: swing (slower, structural quality)
-    //         or internal (faster, more noise).
-    pivot cvdHighPivot = cvdUseInternalPivotsInput ? internalHigh : swingHigh
-    pivot cvdLowPivot  = cvdUseInternalPivotsInput ? internalLow  : swingLow
+    // v18.8 — Pivot-stream selection: Swing / Internal / Custom (dropdown).
+    pivot cvdHighPivot = cvdPivotSourceInput == 'Internal' ? internalHigh
+                       : cvdPivotSourceInput == 'Custom'   ? cvdCustomHigh
+                       :                                     swingHigh
+    pivot cvdLowPivot  = cvdPivotSourceInput == 'Internal' ? internalLow
+                       : cvdPivotSourceInput == 'Custom'   ? cvdCustomLow
+                       :                                     swingLow
     if cvdHighPivot.barIndex != lastCVDDivHighIdx
         if not na(cvdHighPivot.lastLevel) and not na(cvdHighPivot.lastCVD) and not na(cvdHighPivot.currentCVD) and cvdHighPivot.currentLevel > cvdHighPivot.lastLevel and cvdHighPivot.currentCVD < cvdHighPivot.lastCVD
             currentAlerts.bearishCVDDivergence := true
