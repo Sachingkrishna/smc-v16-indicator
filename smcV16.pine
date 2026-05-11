@@ -67,6 +67,16 @@
 //         mitigation, and hidden FVG tracking for iFVG-only mode.
 // v16.6 — Replaces MSS displacement plotshape offset markers with label markers
 //         so the script stays below TradingView's 64-plot hard limit.
+// v18.6 — Decouple CVD divergence lookback from swing-structure lookback:
+//         • New input "CVD Use Internal Pivots". When ON, CVD divergence
+//           triggers off the internal pivot stream (Internal Swing Length,
+//           default 5) instead of the swing pivot stream (Swing Length,
+//           default 20). Use case: keep swing structure quality at 20 bars
+//           while getting faster divergence confirmation at 5 bars.
+//         • Implemented by snapshotting cumCVD on internal pivots too
+//           (previously only swing pivots got CVD snapshots).
+//         • No new alerts. Single existing alertcondition fires regardless
+//           of which pivot stream produced the divergence.
 // v18.5 — AVWAP MSS scope option:
 //         • Split the AVWAP anchor-type dropdown's 'MSS' option into two:
 //             'MSS'       — reset on any confirmed MSS (internal + swing)
@@ -241,7 +251,7 @@
 //           ICT timing is designed for FX/futures/crypto, not stocks.
 
 //@version=6
-indicator('Smart Money Concepts [v18.5]', 'SMC v18.5', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+indicator('Smart Money Concepts [v18.6]', 'SMC v18.6', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -561,6 +571,14 @@ showCVDTableInput      = input(false, 'Show CVD Status Table',           group=C
      tooltip='Top-right table showing live cumulative CVD value, sign, and bar delta.')
 cvdBullDivColorInput   = input.color(#00e676, 'Bullish Divergence Marker', group=CVD_GROUP)
 cvdBearDivColorInput   = input.color(#ff1744, 'Bearish Divergence Marker', group=CVD_GROUP)
+// v18.6 — Decouple CVD lookback from main swing-structure lookback.
+cvdUseInternalPivotsInput = input(false, 'Use Internal Pivots for CVD', group=CVD_GROUP,
+     tooltip='When OFF (default): CVD divergence triggers at Swing pivots\n' +
+             '  (Real Time Swing Structure → Swing Length, default 20).\n' +
+             'When ON: CVD divergence triggers at Internal pivots\n' +
+             '  (Real Time Internal Structure → Internal Swing Length,\n' +
+             '   default 5). Faster confirmation at the cost of more\n' +
+             '   false-positive divergence labels.')
 
 // ── RVOL stamping ────────────────────────────────────────────────────────────
 rvolEnableInput      = input(false, 'Enable RVOL Stamping (OB/FVG)', group=RVOL_GROUP,
@@ -1231,9 +1249,11 @@ getCurrentStructure(int size, bool equalHighLow = false, bool internal = false) 
             p_ivot.barIndex     := bar_index[size]
             p_ivot.actualLevel  := low[size]
             // v17.0 — Snapshot CVD at the pivot bar for divergence detection.
-            //         Only on swing-level pivots (not internal / not EQ) since
-            //         divergence at internal-structure level is too noisy.
-            if not equalHighLow and not internal
+            // v18.6 — Now also snapshots on internal pivots so users can
+            //         opt into faster CVD divergence via the
+            //         cvdUseInternalPivotsInput toggle. equalHighLow is still
+            //         excluded because EQ pivots aren't a directional swing.
+            if not equalHighLow
                 p_ivot.lastCVD    := p_ivot.currentCVD
                 p_ivot.currentCVD := cumCVD[size]
             if not equalHighLow and not internal
@@ -1260,8 +1280,9 @@ getCurrentStructure(int size, bool equalHighLow = false, bool internal = false) 
             p_ivot.barTime      := time[size]
             p_ivot.barIndex     := bar_index[size]
             p_ivot.actualLevel  := high[size]
-            // v17.0 — Snapshot CVD at the pivot bar (swing-level only).
-            if not equalHighLow and not internal
+            // v17.0 / v18.6 — Snapshot CVD at the pivot bar (both swing and
+            //                 internal; selection happens at divergence-check time).
+            if not equalHighLow
                 p_ivot.lastCVD    := p_ivot.currentCVD
                 p_ivot.currentCVD := cumCVD[size]
             if not equalHighLow and not internal
@@ -2540,10 +2561,14 @@ if showLiquiditySweepsInput and barstate.isconfirmed
 //         Triggered once per pivot, gated on barIndex change so it doesn't
 //         re-fire while the swing is still the most-recent pivot.
 if showCVDDivergenceInput and barstate.isconfirmed
-    if swingHigh.barIndex != lastCVDDivHighIdx
-        if not na(swingHigh.lastLevel) and not na(swingHigh.lastCVD) and not na(swingHigh.currentCVD) and swingHigh.currentLevel > swingHigh.lastLevel and swingHigh.currentCVD < swingHigh.lastCVD
+    // v18.6 — Pivot-stream selection: swing (slower, structural quality)
+    //         or internal (faster, more noise).
+    pivot cvdHighPivot = cvdUseInternalPivotsInput ? internalHigh : swingHigh
+    pivot cvdLowPivot  = cvdUseInternalPivotsInput ? internalLow  : swingLow
+    if cvdHighPivot.barIndex != lastCVDDivHighIdx
+        if not na(cvdHighPivot.lastLevel) and not na(cvdHighPivot.lastCVD) and not na(cvdHighPivot.currentCVD) and cvdHighPivot.currentLevel > cvdHighPivot.lastLevel and cvdHighPivot.currentCVD < cvdHighPivot.lastCVD
             currentAlerts.bearishCVDDivergence := true
-            label divLabel = label.new(swingHigh.barTime, swingHigh.actualLevel, 'CVD÷',
+            label divLabel = label.new(cvdHighPivot.barTime, cvdHighPivot.actualLevel, 'CVD÷',
                  xloc=xloc.bar_time,
                  color=color(na),
                  textcolor=cvdBearDivColorInput,
@@ -2552,11 +2577,11 @@ if showCVDDivergenceInput and barstate.isconfirmed
             cvdDivLabels.push(divLabel)
             if cvdDivLabels.size() > MAX_SWEEP_LABELS
                 label.delete(cvdDivLabels.shift())
-        lastCVDDivHighIdx := swingHigh.barIndex
-    if swingLow.barIndex != lastCVDDivLowIdx
-        if not na(swingLow.lastLevel) and not na(swingLow.lastCVD) and not na(swingLow.currentCVD) and swingLow.currentLevel < swingLow.lastLevel and swingLow.currentCVD > swingLow.lastCVD
+        lastCVDDivHighIdx := cvdHighPivot.barIndex
+    if cvdLowPivot.barIndex != lastCVDDivLowIdx
+        if not na(cvdLowPivot.lastLevel) and not na(cvdLowPivot.lastCVD) and not na(cvdLowPivot.currentCVD) and cvdLowPivot.currentLevel < cvdLowPivot.lastLevel and cvdLowPivot.currentCVD > cvdLowPivot.lastCVD
             currentAlerts.bullishCVDDivergence := true
-            label divLabel = label.new(swingLow.barTime, swingLow.actualLevel, 'CVD÷',
+            label divLabel = label.new(cvdLowPivot.barTime, cvdLowPivot.actualLevel, 'CVD÷',
                  xloc=xloc.bar_time,
                  color=color(na),
                  textcolor=cvdBullDivColorInput,
@@ -2565,7 +2590,7 @@ if showCVDDivergenceInput and barstate.isconfirmed
             cvdDivLabels.push(divLabel)
             if cvdDivLabels.size() > MAX_SWEEP_LABELS
                 label.delete(cvdDivLabels.shift())
-        lastCVDDivLowIdx := swingLow.barIndex
+        lastCVDDivLowIdx := cvdLowPivot.barIndex
 
 // v15.4 — Correct execution order: delete OBs FIRST (mitigation → BB conversion),
 //         THEN count touches on surviving OBs. Previously updateOrderBlockTouches()
