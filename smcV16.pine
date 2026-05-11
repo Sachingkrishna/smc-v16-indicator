@@ -669,6 +669,13 @@ type volumeImbalance
     box   viBox
     int   createdBarIndex = 0
 
+// v18.0 — One-int wrapper for the EQH/EQL streak counter. Pine forbids
+//         modifying a global scalar from inside a function, but mutating a
+//         field of a global type instance is fine — same trick we already
+//         use for pivots, trends, alerts, and trailingExtremes.
+type streakCounter
+    int value = 1
+
 type openingGap
     float  top
     float  bottom
@@ -790,8 +797,10 @@ var array<label> sweepLabels     = array.new<label>()
 var array<label> displacementLabels = array.new<label>()
 var array<label> cvdDivLabels    = array.new<label>()
 // v18.0 — Liquidity Pool clustering: consecutive equal-touch streak counts.
-var int eqHighStreak             = 1
-var int eqLowStreak              = 1
+//         Wrapped in streakCounter so getCurrentStructure() (a function)
+//         can mutate the value via a field assignment.
+var streakCounter eqHighStreak = streakCounter.new()
+var streakCounter eqLowStreak  = streakCounter.new()
 // v18.0 — AVWAP from latest MSS.
 var int   mssAvwapAnchorTime     = na
 var int   mssAvwapAnchorBar      = na
@@ -1116,7 +1125,7 @@ drawEqualHighLow(pivot p_ivot, float level, int size, bool isEqualHigh) =>
     //         'EQH×N' once the same level has been kissed twice or more,
     //         making 3+ equal touches visible at a glance as a high-
     //         conviction sweep target.
-    int streakRef = isEqualHigh ? eqHighStreak : eqLowStreak
+    int streakRef = isEqualHigh ? eqHighStreak.value : eqLowStreak.value
     string countSuffix = streakRef >= 2 ? '×' + str.tostring(streakRef) : ''
     string tag        = 'EQL' + countSuffix
     color  equalColor = swingBullishColor
@@ -1153,11 +1162,11 @@ getCurrentStructure(int size, bool equalHighLow = false, bool internal = false) 
             //         in-tolerance equal pivots; reset to 1 on a non-EQ pivot.
             if equalHighLow and not na(p_ivot.currentLevel)
                 if math.abs(p_ivot.currentLevel - candidateBodyLow) < equalHighsLowsThresholdInput * atrMeasure
-                    eqLowStreak += 1
+                    eqLowStreak.value += 1
                     drawEqualHighLow(p_ivot, candidateBodyLow, size, false)
                     currentAlerts.equalLows := true
                 else
-                    eqLowStreak := 1
+                    eqLowStreak.value := 1
             p_ivot.lastLevel    := p_ivot.currentLevel
             p_ivot.currentLevel := candidateBodyLow
             p_ivot.crossed      := false
@@ -1183,11 +1192,11 @@ getCurrentStructure(int size, bool equalHighLow = false, bool internal = false) 
             // v18.0 — Liquidity Pool streak counter (high side).
             if equalHighLow and not na(p_ivot.currentLevel)
                 if math.abs(p_ivot.currentLevel - candidateBodyHigh) < equalHighsLowsThresholdInput * atrMeasure
-                    eqHighStreak += 1
+                    eqHighStreak.value += 1
                     drawEqualHighLow(p_ivot, candidateBodyHigh, size, true)
                     currentAlerts.equalHighs := true
                 else
-                    eqHighStreak := 1
+                    eqHighStreak.value := 1
             p_ivot.lastLevel    := p_ivot.currentLevel
             p_ivot.currentLevel := candidateBodyHigh
             p_ivot.crossed      := false
@@ -2056,8 +2065,18 @@ drawFairValueGaps() =>
     float ceLevel = na
     bullishFVG = recentLow > oldHigh and midClose > oldHigh and barDeltaPercent > threshold and newTimeframe and barstate.isconfirmed
     bearishFVG = recentHigh < oldLow and midClose < oldLow and -barDeltaPercent > threshold and newTimeframe and barstate.isconfirmed
-    // v18.0 — RVOL color modulation. Compute fvgIsInst now so it applies
-    //         to whichever direction (bullish/bearish) actually fires below.
+    // v18.0 — RVOL stamp for FVGs. The "originating" bar of an FVG is the
+    //         middle bar (offset 2 in this script's HTF FVG model — see
+    //         midClose / midOpen requested at offset [2]). Hoist ta.sma()
+    //         out of the conditional and read offset [2] post-hoc so the
+    //         function is called every bar for history consistency.
+    float fvgVolSMA    = ta.sma(nz(volume), rvolPeriodInput)
+    float fvgOriginVol = rvolEnableInput ? nz(volume[2]) : na
+    float fvgAvgVol    = rvolEnableInput ? fvgVolSMA[2] : na
+    float fvgRVOL      = (rvolEnableInput and not na(fvgAvgVol) and fvgAvgVol > 0) ? fvgOriginVol / fvgAvgVol : na
+    bool  fvgIsInst    = rvolEnableInput and not na(fvgRVOL) and fvgRVOL >= rvolFVGThresholdInput
+    // v18.0 — RVOL color modulation. Uses fvgIsInst computed above so it
+    //         applies to whichever direction (bullish/bearish) fires.
     color rvolBullCol = fairValueGapBullishColor
     color rvolBearCol = fairValueGapBearishColor
     if rvolEnableInput and not fvgIsInst
@@ -2065,14 +2084,6 @@ drawFairValueGaps() =>
         rvolBearCol := rvolHideRetailFVGInput ? color.new(fairValueGapBearishColor, 100) : color.new(fairValueGapBearishColor, 95)
     color activeBullFVGColor = showFairValueGapsInput ? rvolBullCol : color.new(fairValueGapBullishColor, 100)
     color activeBearFVGColor = showFairValueGapsInput ? rvolBearCol : color.new(fairValueGapBearishColor, 100)
-    // v18.0 — RVOL stamp for FVGs. The "originating" bar of an FVG is the
-    //         middle bar (offset 2 in this script's HTF FVG model — see
-    //         midClose / midOpen requested at offset [2]). Use ta.sma over
-    //         volume on that same offset window.
-    float fvgOriginVol = rvolEnableInput ? nz(volume[2]) : na
-    float fvgAvgVol    = rvolEnableInput ? ta.sma(volume, rvolPeriodInput)[2] : na
-    float fvgRVOL      = (rvolEnableInput and not na(fvgAvgVol) and fvgAvgVol > 0) ? fvgOriginVol / fvgAvgVol : na
-    bool  fvgIsInst    = rvolEnableInput and not na(fvgRVOL) and fvgRVOL >= rvolFVGThresholdInput
     if bullishFVG
         currentAlerts.bullishFairValueGap := true
         ceLevel  := math.avg(recentLow, oldHigh)
