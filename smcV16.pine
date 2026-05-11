@@ -67,6 +67,12 @@
 //         mitigation, and hidden FVG tracking for iFVG-only mode.
 // v16.6 — Replaces MSS displacement plotshape offset markers with label markers
 //         so the script stays below TradingView's 64-plot hard limit.
+// v18.5 — AVWAP MSS scope option:
+//         • Split the AVWAP anchor-type dropdown's 'MSS' option into two:
+//             'MSS'       — reset on any confirmed MSS (internal + swing)
+//             'MSS Swing' — reset on confirmed swing MSS only
+//           Lets users choose between frequent resets (more responsive but
+//           noisy) and rarer resets (cleaner trend reference).
 // v18.4 — Plot-budget rebalance + AVWAP anchor types + RVOL bug fixes:
 //         • Re-combined NDOG+NWOG → "Opening Gap Formed" and NY High+Low
 //           → "NY Range Touched" (each saves one output). RE10140 was
@@ -235,7 +241,7 @@
 //           ICT timing is designed for FX/futures/crypto, not stocks.
 
 //@version=6
-indicator('Smart Money Concepts [v18.4]', 'SMC v18.4', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+indicator('Smart Money Concepts [v18.5]', 'SMC v18.5', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -582,11 +588,12 @@ showMSSAVWAPInput   = input(false, 'Show Anchored VWAP',     group=AVWAP_GROUP,
              'Acts as a defended institutional reference between anchors.')
 // v18.4 — Anchor-type dropdown. Single AVWAP plot, multi-source.
 avwapAnchorTypeInput = input.string('MSS', 'Anchor Type',     group=AVWAP_GROUP,
-     options=['MSS', 'Swing', 'Daily', 'Weekly'],
-     tooltip='MSS    = reset on every confirmed Market Structure Shift.\n' +
-             'Swing  = reset on every new swing high or swing low pivot.\n' +
-             'Daily  = reset at the start of each new trading day.\n' +
-             'Weekly = reset at the start of each new trading week.')
+     options=['MSS', 'MSS Swing', 'Swing', 'Daily', 'Weekly'],
+     tooltip='MSS       = reset on any confirmed MSS (internal + swing).\n' +
+             'MSS Swing = reset on confirmed swing MSS only (less noisy).\n' +
+             'Swing     = reset on every new swing high or swing low pivot.\n' +
+             'Daily     = reset at the start of each new trading day.\n' +
+             'Weekly    = reset at the start of each new trading week.')
 mssAVWAPColorInput  = input.color(#ffeb3b, 'AVWAP Color',     group=AVWAP_GROUP)
 mssAVWAPWidthInput  = input.int(2, 'AVWAP Line Width',         group=AVWAP_GROUP, minval=1, maxval=4)
 
@@ -2403,13 +2410,15 @@ if showStructureInput or needSwingOBTracking or showHighLowSwingsInput
 //     Swing  — reset on every new swing high or swing low pivot (barIndex change)
 //     Daily  — reset on isNewDay
 //     Weekly — reset on isNewWeek
-bool mssAnyFired    = currentAlerts.internalBullishMSS or currentAlerts.swingBullishMSS or currentAlerts.internalBearishMSS or currentAlerts.swingBearishMSS
-bool swingHighNew   = not na(swingHigh.barIndex) and swingHigh.barIndex != lastAvwapSwingHighIdx
-bool swingLowNew    = not na(swingLow.barIndex)  and swingLow.barIndex  != lastAvwapSwingLowIdx
-bool avwapShouldReset = avwapAnchorTypeInput == 'MSS'    ? mssAnyFired
-                      : avwapAnchorTypeInput == 'Swing'  ? (swingHighNew or swingLowNew)
-                      : avwapAnchorTypeInput == 'Daily'  ? isNewDay
-                      : avwapAnchorTypeInput == 'Weekly' ? isNewWeek
+bool mssAnyFired       = currentAlerts.internalBullishMSS or currentAlerts.swingBullishMSS or currentAlerts.internalBearishMSS or currentAlerts.swingBearishMSS
+bool mssSwingOnlyFired = currentAlerts.swingBullishMSS or currentAlerts.swingBearishMSS
+bool swingHighNew      = not na(swingHigh.barIndex) and swingHigh.barIndex != lastAvwapSwingHighIdx
+bool swingLowNew       = not na(swingLow.barIndex)  and swingLow.barIndex  != lastAvwapSwingLowIdx
+bool avwapShouldReset = avwapAnchorTypeInput == 'MSS'       ? mssAnyFired
+                      : avwapAnchorTypeInput == 'MSS Swing' ? mssSwingOnlyFired
+                      : avwapAnchorTypeInput == 'Swing'     ? (swingHighNew or swingLowNew)
+                      : avwapAnchorTypeInput == 'Daily'     ? isNewDay
+                      : avwapAnchorTypeInput == 'Weekly'    ? isNewWeek
                       : false
 mssAvwapResetThisBar := false
 if showMSSAVWAPInput and avwapShouldReset
