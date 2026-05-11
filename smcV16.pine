@@ -67,6 +67,14 @@
 //         mitigation, and hidden FVG tracking for iFVG-only mode.
 // v16.6 — Replaces MSS displacement plotshape offset markers with label markers
 //         so the script stays below TradingView's 64-plot hard limit.
+// v18.1 — Removed Power of 3 (PO3) module:
+//         • Dropped the entire PO3 phase classifier (inputs, state vars,
+//           detection block, status label, alertcondition). User feedback
+//           was that the static phase label cluttered the chart and the
+//           session-window classification was too rigid for non-FX
+//           instruments. The freed output slot returns to the budget.
+//         • Net: 1 input group removed, 1 alertcondition removed, ~40
+//           lines of code removed. No effect on any other feature.
 // v18.0 — Institutional-footprint feature pack:
 //         • Volume-validated OB / FVG ("RVOL stamping"). At creation,
 //           computes RVOL = volume / SMA(volume, N) of the originating
@@ -88,11 +96,7 @@
 //           track a streak counter (`EQH×N` / `EQL×N` badges) so a 3rd
 //           or 4th consecutive equal touch is visible at a glance —
 //           higher-conviction sweep target.
-//         • Power of 3 (PO3) day cycle. Auto-classifies the current
-//           intraday phase into Accumulation (Asian), Manipulation
-//           (London open), or Distribution (NY) based on user-tunable
-//           sessions. Surfaces as a single status label and a phase-
-//           change alert.
+//         • Power of 3 (PO3) day cycle [REMOVED in v18.1].
 // v17.2 — Alert-budget cleanup ahead of v18 feature additions:
 //         • Removed 4 legacy *OB Breakout (mitigation) alerts. The same
 //           event is captured by the corresponding *Breaker Formed alert
@@ -186,7 +190,7 @@
 //           ICT timing is designed for FX/futures/crypto, not stocks.
 
 //@version=6
-indicator('Smart Money Concepts [v18.0]', 'SMC v18.0', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+indicator('Smart Money Concepts [v18.1]', 'SMC v18.1', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -245,7 +249,6 @@ CVD_GROUP      = 'Cumulative Volume Delta (CVD)'
 RVOL_GROUP     = 'Volume Validation (RVOL)'
 VI_GROUP       = 'Volume Imbalance (VI)'
 AVWAP_GROUP    = 'Anchored VWAP'
-PO3_GROUP      = 'Power of 3 (PO3)'
 
 MAX_SESSION_BOXES  = 50
 MAX_SESSION_LABELS = 50
@@ -535,17 +538,7 @@ showMSSAVWAPInput   = input(false, 'Show MSS Anchored VWAP',  group=AVWAP_GROUP,
 mssAVWAPColorInput  = input.color(#ffeb3b, 'AVWAP Color',     group=AVWAP_GROUP)
 mssAVWAPWidthInput  = input.int(2, 'AVWAP Line Width',         group=AVWAP_GROUP, minval=1, maxval=4)
 
-// ── Power of 3 ───────────────────────────────────────────────────────────────
-showPO3Input         = input(false, 'Show PO3 Phase Label',   group=PO3_GROUP,
-     tooltip='Auto-classifies current intraday phase as Accumulation (Asian),\n' +
-             'Manipulation (London open), or Distribution (NY).\n' +
-             'Sessions are user-tunable; times use Kill Zone Timezone.')
-po3AccumSessionInput = input.string('1800-0200', 'Accumulation Session', group=PO3_GROUP)
-po3ManipSessionInput = input.string('0200-0930', 'Manipulation Session', group=PO3_GROUP)
-po3DistSessionInput  = input.string('0930-1600', 'Distribution Session', group=PO3_GROUP)
-po3AccumColorInput   = input.color(#9c27b0, 'Accumulation Color',  group=PO3_GROUP)
-po3ManipColorInput   = input.color(#ff9800, 'Manipulation Color',  group=PO3_GROUP)
-po3DistColorInput    = input.color(#2196f3, 'Distribution Color',  group=PO3_GROUP)
+// ── Power of 3 (PO3) ─ removed in v18.1 ──────────────────────────────────────
 
 //──────────────────────────────────────────────────────────────────────────────
 // Types
@@ -598,10 +591,9 @@ type alerts
     // v17.0 — CVD divergence at confirmed swing pivots.
     bool bullishCVDDivergence        = false
     bool bearishCVDDivergence        = false
-    // v18.0 — Volume Imbalance, AVWAP tag, PO3 phase change.
+    // v18.0 — Volume Imbalance, AVWAP tag. (PO3 phase change removed in v18.1.)
     bool volumeImbalanceFormed       = false
     bool mssAVWAPTagged              = false
-    bool po3PhaseChange              = false
 
 type trailingExtremes
     float top
@@ -808,9 +800,7 @@ var float mssAvwapCumPV          = 0.0
 var float mssAvwapCumVol         = 0.0
 var float mssAvwapValue          = na
 var bool  mssAvwapResetThisBar   = false
-// v18.0 — PO3 phase tracking (state-machine over intraday session windows).
-var string po3CurrentPhase       = ''
-var label  po3PhaseLabel         = na
+// v18.1 — PO3 phase tracking state removed.
 
 var sessionTracker sydneySession  = sessionTracker.new(false, false, na, na, na, na, na, na)
 var sessionTracker tokyoSession   = sessionTracker.new(false, false, na, na, na, na, na, na)
@@ -2571,38 +2561,7 @@ bool inSilverBulletLDN = kzEnabled and kzSilverBulletLDNInput and inKillZone('03
 bgcolor(inSilverBulletAM ? kzSilverBulletAMColorInput : inSilverBulletPM ? kzSilverBulletPMColorInput : na, title='Silver Bullet AM/PM')
 bgcolor(inSilverBulletLDN ? kzSilverBulletLDNColorInput : na, title='Silver Bullet London')
 
-//──────────────────────────────────────────────────────────────────────────────
-// v18.0 — Power of 3 (PO3) day cycle
-//   Classifies the current intraday bar into one of three ICT phases:
-//     Accumulation (Asian-style range building),
-//     Manipulation (London-open sweep of the accumulation range),
-//     Distribution (NY trend in the direction opposite the manipulation).
-//   Session windows are user-tunable; times resolved via kzTimezoneInput.
-//──────────────────────────────────────────────────────────────────────────────
-bool po3InAccum = showPO3Input and not na(time(timeframe.period, po3AccumSessionInput, kzTimezoneInput))
-bool po3InManip = showPO3Input and not na(time(timeframe.period, po3ManipSessionInput, kzTimezoneInput))
-bool po3InDist  = showPO3Input and not na(time(timeframe.period, po3DistSessionInput,  kzTimezoneInput))
-string po3NewPhase = po3InAccum ? 'Accumulation' : po3InManip ? 'Manipulation' : po3InDist ? 'Distribution' : ''
-if showPO3Input and barstate.isconfirmed and po3NewPhase != '' and po3NewPhase != po3CurrentPhase
-    po3CurrentPhase := po3NewPhase
-    currentAlerts.po3PhaseChange := true
-
-if showPO3Input and barstate.islast
-    if not na(po3PhaseLabel)
-        po3PhaseLabel.delete()
-    color phaseColor = po3CurrentPhase == 'Accumulation' ? po3AccumColorInput
-         : po3CurrentPhase == 'Manipulation' ? po3ManipColorInput
-         : po3CurrentPhase == 'Distribution' ? po3DistColorInput
-         : color.gray
-    po3PhaseLabel := label.new(
-         last_bar_time + 30 * nz(time - time[1], 60000),
-         high,
-         'PO3: ' + (po3CurrentPhase == '' ? 'Idle' : po3CurrentPhase),
-         xloc=xloc.bar_time,
-         style=label.style_label_left,
-         color=color(na),
-         textcolor=phaseColor,
-         size=size.normal)
+// v18.1 — Power of 3 (PO3) day-cycle module removed.
 
 //──────────────────────────────────────────────────────────────────────────────
 // Session Boxes
@@ -3016,10 +2975,9 @@ alertcondition(currentAlerts.bullishEQLSweep,           'EQL Sweep',            
 // v17.0 — CVD divergence at confirmed swing pivots.
 alertcondition(currentAlerts.bullishCVDDivergence,      'Bullish CVD Divergence',       'Bullish CVD divergence at swing low (potential accumulation)')
 alertcondition(currentAlerts.bearishCVDDivergence,      'Bearish CVD Divergence',       'Bearish CVD divergence at swing high (potential distribution)')
-// v18.0 — Volume Imbalance, MSS AVWAP tag, PO3 phase change.
+// v18.0 — Volume Imbalance, MSS AVWAP tag. (PO3 alert removed in v18.1.)
 alertcondition(currentAlerts.volumeImbalanceFormed,     'Volume Imbalance Formed',      'Volume Imbalance (body-to-body gap) formed')
 alertcondition(currentAlerts.mssAVWAPTagged,            'Price Tagged MSS AVWAP',       'Price wicked the Anchored VWAP from the latest MSS')
-alertcondition(currentAlerts.po3PhaseChange,            'PO3 Phase Change',             'Power-of-3 intraday phase changed (Accumulation / Manipulation / Distribution)')
 alertcondition(currentAlerts.bullishBreakerFormed,      'Bullish Breaker Formed',       'Bullish breaker block formed')
 alertcondition(currentAlerts.bearishBreakerFormed,      'Bearish Breaker Formed',       'Bearish breaker block formed')
 alertcondition(currentAlerts.bullishBreakerMitigated,   'Bullish Breaker Mitigated',    'Bullish breaker block mitigated')
