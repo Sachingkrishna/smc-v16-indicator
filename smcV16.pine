@@ -67,6 +67,18 @@
 //         mitigation, and hidden FVG tracking for iFVG-only mode.
 // v16.6 — Replaces MSS displacement plotshape offset markers with label markers
 //         so the script stays below TradingView's 64-plot hard limit.
+// v18.2 — Restore per-side range / PD / opening-gap alerts:
+//         • v17.2 had combined PDH+PDL, NDOG+NWOG, Asian H+L, London H+L,
+//           and NY H+L into 5 single alerts to free output-budget for
+//           v18's institutional features. With v18.1 dropping PO3 we now
+//           have headroom (54 / 64) to restore the 10 per-side alerts.
+//         • Re-split into:
+//             PDH Touched, PDL Touched (2)
+//             NDOG Formed, NWOG Formed (2)
+//             Asian High Touched, Asian Low Touched (2)
+//             London High Touched, London Low Touched (2)
+//             NY High Touched, NY Low Touched (2)
+//         • Output budget after restore: 59 / 64 (5 slots still free).
 // v18.1 — Removed Power of 3 (PO3) module:
 //         • Dropped the entire PO3 phase classifier (inputs, state vars,
 //           detection block, status label, alertcondition). User feedback
@@ -190,7 +202,7 @@
 //           ICT timing is designed for FX/futures/crypto, not stocks.
 
 //@version=6
-indicator('Smart Money Concepts [v18.1]', 'SMC v18.1', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+indicator('Smart Money Concepts [v18.2]', 'SMC v18.2', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -3007,11 +3019,13 @@ alertcondition(anySilverBulletStart, 'Silver Bullet Start', 'A Silver Bullet win
 //         the level. Locking the comparison to a stable level kills that.
 bool pdHighSweep = showPDLevelsInput and showPDHighInput and not na(pdHigh) and not na(pdHigh[1]) and pdHigh == pdHigh[1] and high >= pdHigh and not na(high[1]) and high[1] < pdHigh
 bool pdLowSweep  = showPDLevelsInput and showPDLowInput  and not na(pdLow)  and not na(pdLow[1])  and pdLow  == pdLow[1]  and low  <= pdLow  and not na(low[1])  and low[1]  > pdLow
-// v17.2 — PDH+PDL collapsed to single "PD Level Touched", and NDOG+NWOG
-// to "Opening Gap Formed", to free output slots.
-alertcondition(pdHighSweep or pdLowSweep, 'PD Level Touched', 'Price reached a Previous Day level (high or low)')
-alertcondition((showNDOGInput and isNewDay  and not na(pdClose)      and not na(cdOpen)      and math.abs(cdOpen      - pdClose)      > syminfo.mintick) or (showNWOGInput and isNewWeek and not na(nwogPrevClose) and not na(nwogCurrOpen) and math.abs(nwogCurrOpen - nwogPrevClose) > syminfo.mintick),
-    'Opening Gap Formed', 'New Day or New Week Opening Gap formed')
+// v18.2 — Restored per-side alerts (were combined in v17.2 for budget).
+alertcondition(pdHighSweep, 'PDH Touched', 'Price reached Previous Day High')
+alertcondition(pdLowSweep,  'PDL Touched', 'Price reached Previous Day Low')
+alertcondition(showNDOGInput and isNewDay  and not na(pdClose)      and not na(cdOpen)      and math.abs(cdOpen      - pdClose)      > syminfo.mintick,
+    'NDOG Formed', 'New Day Opening Gap formed')
+alertcondition(showNWOGInput and isNewWeek and not na(nwogPrevClose) and not na(nwogCurrOpen) and math.abs(nwogCurrOpen - nwogPrevClose) > syminfo.mintick,
+    'NWOG Formed', 'New Week Opening Gap formed')
 
 alertcondition(currentAlerts.internalBullishMSS, 'Internal Bullish MSS', 'Internal Bullish Market Structure Shift detected')
 alertcondition(currentAlerts.internalBearishMSS, 'Internal Bearish MSS', 'Internal Bearish Market Structure Shift detected')
@@ -3037,8 +3051,9 @@ if showOTEInput and swingTrend.bias != 0 and not na(trailing.top) and not na(tra
              : trailing.bottom + oteFib1Input * _oteRange
         priceInOTE := close <= _oteUpper and close >= _oteLower
 
-// v17.2 — H+L touch alerts collapsed per session to free output slots.
-alertcondition(asianHighTouched or asianLowTouched, 'Asian Range Touched', 'Price reached the Asian Range high or low')
+// v18.2 — Restored per-side Asian range alerts.
+alertcondition(asianHighTouched, 'Asian High Touched', 'Price reached Asian Range High')
+alertcondition(asianLowTouched,  'Asian Low Touched',  'Price reached Asian Range Low')
 alertcondition(priceInOTE and not priceInOTE[1], 'Price Enters OTE', 'Price entered Optimal Trade Entry zone')
 // v16.7 — Same day-rollover guard as PDH/PDL: require midnightOpenPrice to
 //         be stable from the previous bar so the level "jumping" at the
@@ -3056,5 +3071,8 @@ bool londonLowTouched  = showLondonRangeInput and not londonActiveForAlert and n
 bool nyHighTouched     = showNYRangeInput     and not nyActiveForAlert     and not na(nyRangeHigh)     and high >= nyRangeHigh     and (na(high[1]) or high[1] < nyRangeHigh)
 bool nyLowTouched      = showNYRangeInput     and not nyActiveForAlert     and not na(nyRangeLow)      and low  <= nyRangeLow      and (na(low[1])  or low[1]  > nyRangeLow)
 
-alertcondition(londonHighTouched or londonLowTouched, 'London Range Touched', 'Price reached the London Range high or low')
-alertcondition(nyHighTouched or nyLowTouched,         'NY Range Touched',     'Price reached the New York Range high or low')
+// v18.2 — Restored per-side London / NY range alerts.
+alertcondition(londonHighTouched, 'London High Touched', 'Price reached London Range High')
+alertcondition(londonLowTouched,  'London Low Touched',  'Price reached London Range Low')
+alertcondition(nyHighTouched,     'NY High Touched',     'Price reached New York Range High')
+alertcondition(nyLowTouched,      'NY Low Touched',      'Price reached New York Range Low')
