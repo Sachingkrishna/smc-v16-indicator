@@ -67,6 +67,23 @@
 //         mitigation, and hidden FVG tracking for iFVG-only mode.
 // v16.6 — Replaces MSS displacement plotshape offset markers with label markers
 //         so the script stays below TradingView's 64-plot hard limit.
+// v19.1 — Fixes from external analysis pass:
+//         • bullishBar / bearishBar inverted in displayStructure (confluence
+//           filter). The flags `bullishBar := upperWick >= lowerWick` and
+//           `bearishBar := lowerWick >= upperWick` were the OPPOSITE of
+//           ICT/SMC convention — a large lower wick is buying pressure
+//           (bullish-character bar), a large upper wick is selling
+//           rejection (bearish-character). Swapped the assignments so the
+//           confluence filter accepts the right kind of confirming candle.
+//           Effective only when internalFilterConfluenceInput = ON (was
+//           OFF by default, so most users were never affected).
+//         • Swing OB search cap bumped from 3x to 5x of Swing Length
+//           (60 → 100 bars at default Swing Length = 20). Fixes occasional
+//           wrong-origin-candle landings on long consolidations or wide
+//           CHoCH where the actual OB candle is older than the previous
+//           60-bar limit. Internal OB cap unchanged at 3x.
+//         • AVWAP tooltip now notes that symbols without volume data
+//           (some indices) won't render an AVWAP line.
 // v19.0 — Rename EQH/EQL pivot-length input for discoverability:
 //         • Renamed input label "Bars Confirmation" → "EQH/EQL Pivot Length"
 //           and expanded tooltip. No behavior change; the input
@@ -300,7 +317,7 @@
 //           ICT timing is designed for FX/futures/crypto, not stocks.
 
 //@version=6
-indicator('Smart Money Concepts [v19.0]', 'SMC v19.0', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+indicator('Smart Money Concepts [v19.1]', 'SMC v19.1', overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -687,7 +704,9 @@ viMitigationInput  = input.string(BODY_SRC, 'VI Mitigation', group=VI_GROUP, opt
 // ── Anchored VWAP ────────────────────────────────────────────────────────────
 showMSSAVWAPInput   = input(false, 'Show Anchored VWAP',     group=AVWAP_GROUP,
      tooltip='Cumulative VWAP that resets at the chosen anchor event.\n' +
-             'Acts as a defended institutional reference between anchors.')
+             'Acts as a defended institutional reference between anchors.\n' +
+             'Note: requires volume data. Symbols without volume\n' +
+             '      (some indices) will not render an AVWAP line.')
 // v18.4 — Anchor-type dropdown. Single AVWAP plot, multi-source.
 avwapAnchorTypeInput = input.string('MSS', 'Anchor Type',     group=AVWAP_GROUP,
      options=['MSS', 'MSS Swing', 'Swing', 'Daily', 'Weekly'],
@@ -1622,7 +1641,11 @@ storeOrderBlock(pivot brokenPivot, pivot originPivot, bool internal = false, int
             int searchEnd   = math.max(originIdx, brokenIdx)
             searchStart := math.max(searchStart, 0)
             searchEnd   := math.min(searchEnd, closes.size() - 1)
-            int obSearchCap = internal ? math.max(15, internalLengthInput * 3) : math.max(15, swingsLengthInput * 3)
+            // v19.1 — Bumped swing multiplier from 3 to 5 (cap 60 → 100 bars
+            //         at default Swing Length 20). Internal cap unchanged.
+            //         Avoids landing on the wrong origin candle when the
+            //         actual OB is older than the previous 60-bar window.
+            int obSearchCap = internal ? math.max(15, internalLengthInput * 3) : math.max(15, swingsLengthInput * 5)
             searchEnd       := math.min(searchEnd, searchStart + obSearchCap)
             int _closesSize  = closes.size()
             int _opensSize   = opens.size()
@@ -1899,8 +1922,13 @@ displayStructure(bool internal = false) =>
         if internalFilterConfluenceInput
             float upperWick = high - math.max(close, open)
             float lowerWick = math.min(close, open) - low
-            bullishBar := upperWick >= lowerWick
-            bearishBar := lowerWick >= upperWick
+            // v19.1 — Inverted-flag fix. Convention: large lower wick =
+            //         buying pressure = bullish-character bar; large upper
+            //         wick = selling rejection = bearish-character bar.
+            //         Previously these assignments were swapped, causing
+            //         the confluence filter to gate breaks the wrong way.
+            bullishBar := lowerWick >= upperWick
+            bearishBar := upperWick >= lowerWick
 
         pivot snapHigh = internal ? snapInternalHigh : snapSwingHigh
         pivot snapLow  = internal ? snapInternalLow  : snapSwingLow
