@@ -1,0 +1,1475 @@
+// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v2.1]
+// Smart Money Technique (multi-symbol divergence) + session Volume Profile
+// with previous-session levels, naked POC tracking, confluence alerts, status
+// dashboard, session-anchored VWAP with σ bands, and iceberg/absorption
+// detection.
+//
+// v1.0 — SMT divergence (multi-symbol, confirmed-pivot based).
+// v1.1 — Volume Profile with developing POC/VAH/VAL + histogram; Pine v6
+//        syntax fixes; div tooltip with values; pivot-marker toggle.
+// v1.2 — Previous-session fixed POC/VAH/VAL lines; naked POC tracking with
+//        auto-removal on touch; confluence-aware SMT alerts; status table
+//        dashboard.
+// v1.3 — Session-anchored VWAP + σ bands (1σ/2σ/3σ, optional fill); live
+//        realtime projection (current-bar tick data added on top of confirmed
+//        accumulation); plot-break at session start; AVWAP/σ levels added to
+//        confluence detection and the dashboard.
+// v1.4 — Iceberg / absorption detection (volume × range × close-position
+//        proxy for hidden iceberg-order footprints); optional confluence
+//        gating against VP and AVWAP levels; bull/bear bias from close
+//        position; rich tooltip with vol/range/close stats; dashboard rows
+//        for session count and last event.
+// v1.5 — Verified bug-fix release:
+//        • Naked-POC grace period now actually works. The 1-bar grace check
+//          was previously comparing `bar_index` against `prevSessStartBar`
+//          (the start bar of the prior session, far in the past), so the
+//          condition was effectively always true and a new session's
+//          first-bar straddle could immediately invalidate a just-created
+//          nPOC. Now stores `bar_index` (creation bar) in a dedicated
+//          `nakedPOCCreationBars` array.
+//        • SMT alert + dashboard dedup per pivot bar. Previously, a pivot
+//          that diverged against all three comparison symbols fired three
+//          separate alerts and the dashboard would only show whichever
+//          symbol happened to be evaluated last (sym3), losing context for
+//          the other two. Now collects all diverging symbols on the pivot,
+//          fires ONE combined alert ("Bearish SMT vs ES1!, NQ1!, YM1! | ..."),
+//          and updates dashboard state once.
+//        • VP histogram redraw gated to once-per-bar-change-or-close instead
+//          of every realtime tick. Bins only update on `barstate.isconfirmed`,
+//          so the previous every-tick delete-and-rebuild of ~24 boxes
+//          produced identical output. Tracked via `lastVpDrawBar` var.
+// v2.1 — Review follow-up. Performance fix for v2.0's bin recompute, plus
+//        three real-but-narrow correctness fixes flagged by code review:
+//        • CRITICAL — VP bin recompute is now incremental when the session
+//          range is stable. v2.0 did a full `recomputeBinsFromRaw` on EVERY
+//          confirmed bar, which is correct but O(N²·R) cumulatively across
+//          a session. On extreme combos (Weekly+ anchor on M1 chart with
+//          vpRows=80) late-session recomputes exceeded Pine's per-bar loop
+//          budget (~200k iterations) and the indicator would crash.
+//          Now: track `lastRecompHigh / lastRecompLow`. Full recompute only
+//          when the session range actually expands (rare after the first
+//          few bars); otherwise `accumulateCurrentBar` adds the current bar
+//          incrementally in O(vpRows). Typical case is now O(N·R), same as
+//          a naive incremental approach, while remaining drift-free.
+//        • `levelsInBar` now checks the σ3 bands (only σ1/σ2 before). v1.9's
+//          σ3 toggle was respected in `checkConfluence` but missed in
+//          `levelsInBar`, so an iceberg sitting at ±3σ would not get the
+//          confluence tag even though an SMT pivot at the same price would.
+//        • Iceberg bull/bear classification is mutually exclusive at the
+//          threshold = 0.5 edge case. Previously a doji bar (close exactly
+//          at midpoint) would satisfy both `closeHigh` and `closeLow`, and
+//          the code silently picked Bull. Now neither fires — a midpoint
+//          close is genuinely ambiguous (no absorption side).
+//        • `InVA` confluence tag no longer fires redundantly alongside
+//          `pVAH` / `pVAL`. A price exactly at VAH used to produce both
+//          tags; now `InVA` requires being strictly past both edges by more
+//          than the tick tolerance.
+// v2.0 — Correctness release. Three real bugs and two signal-quality gaps:
+//        • SMT inverse-correlation SAMPLING fix. For Positive-correlated
+//          comparison symbols we sample cmp.HIGH at chart pivot highs and
+//          cmp.LOW at chart pivot lows — which captures cmp's matching pivot
+//          value. For Inverse pairs (e.g., DXY vs EURUSD) the cmp pivots in
+//          the OPPOSITE direction; the previous code still sampled the same
+//          side as the chart pivot, so the divergence comparison was reading
+//          off the wrong side of the cmp's bar. Now flips: inverse symbols
+//          sample cmp.LOW at chart pivot HIGH and cmp.HIGH at chart pivot
+//          LOW. Bull/Bear semantics unchanged; only the underlying sampled
+//          values change, producing cleaner ICT-aligned divergence detection
+//          on inverse pairs.
+//        • VP bin drift eliminated. Bins were previously accumulated
+//          incrementally as vpSessHigh/Low expanded — so volume deposited
+//          early in the session (under a narrower range) referred to
+//          different price levels than bins deposited later. POC and value
+//          area drifted with the range. Replaced incremental accumulation
+//          with `recomputeBinsFromRaw` (called on each confirmed bar and at
+//          session finalization) — rebuilds bins from raw bar history using
+//          the FINAL range. O(barsInSession × vpRows) per call but well
+//          within Pine's compute budget; max_bars_back raised to 5000 to
+//          cover long sessions.
+//        • Naked-POC grace period off-by-one. The check was `> created + 1`
+//          which is a 2-bar grace, but the documented intent was 1-bar.
+//          Fixed to `> created` (skip only the creation bar itself).
+//        • AVWAP confluence on session-boundary pivots was triggering
+//          spuriously. On the first bar of a new session, AVWAP = hlc3 and
+//          σ = 0 (single-bar VWAP), so any nearby price would falsely
+//          "match" AVWAP. Added `pivSigma > 0` guard to both `checkConfluence`
+//          and `levelsInBar` — skips AVWAP/σ confluence when the AVWAP
+//          hasn't yet developed.
+//        • Iceberg confluence now checks the developing-session POC/VAH/VAL
+//          (`currDevPOC/VAH/VAL`) in addition to the previous-session
+//          levels, naked POCs, and AVWAP/σ. An iceberg sitting at the
+//          developing POC is a high-quality signal that was previously
+//          silent in the confluence tag.
+// v1.9 — Audit bug-fix release:
+//        • Iceberg detection no longer self-dilutes its own threshold. The
+//          volume SMA and ATR are now computed with a [1]-offset (trailing
+//          20 / 14 bars EXCLUDING the current bar). Previously a 2× volume
+//          spike raised its own SMA enough that the realised ratio came in
+//          just under iceVolMult, causing real iceberg bars to be missed.
+//          Same fix applied to ATR for consistency. Volume-ratio displayed
+//          in the iceberg tooltip is now accurate too.
+//        • HVN/LVN lines no longer extend right across session boundaries.
+//          They are session-bound markers — extending them right (alongside
+//          POC/VAH/VAL, the genuine forward-reference levels) was visually
+//          polluting subsequent sessions. Now always extend.none.
+//        • HVN/LVN lines and per-bin volume labels are DELETED on session
+//          reset, not orphaned. Histogram boxes are still orphaned (they
+//          anchor to the past session's right edge and serve as a historical
+//          profile reference); HVN/LVN lines and per-bin labels would either
+//          clutter the new session or eat into Pine's 500-label budget over
+//          many sessions.
+//        • Confluence strings are now right-trimmed (no trailing space).
+//        • Sentiment histogram bins in Twin layout no longer round up to a
+//          minimum 1-bar width — near-balanced bins are now visually quiet
+//          instead of falsely displaying a thin neutral bar.
+// v1.8 — Inverse correlation support for SMT divergence:
+//        Previously the SMT logic implicitly assumed all comparison symbols
+//        were POSITIVELY correlated with the chart (move together). For
+//        inverse pairs (EURUSD vs DXY, SPY vs VIX, BTC vs gold, etc.) the
+//        divergence condition is actually the OPPOSITE — they're expected to
+//        move in opposite directions, so a divergence is when they move the
+//        SAME direction.
+//        • Per-symbol Positive/Inverse correlation dropdown added to each
+//          comparison row. Each symbol can be configured independently.
+//        • Divergence check now flips based on correlation: positive pairs
+//          fire on opposite movement, inverse pairs fire on matching
+//          movement, exactly as ICT defines SMT divergence on inverse pairs.
+//        • Diverged-symbol list (used in alerts + dashboard) tags inverse
+//          pairs with " (inv)" suffix so you can see at a glance which
+//          correlation type triggered the signal.
+// v1.7 — VP Visualization upgrade (LuxAlgo-style, signature pieces only):
+//        • Twin Profile layout: optional side-by-side rendering — sentiment
+//          histogram (BBP per bin, green/red) on the left and volume
+//          histogram on the right. Each shares the same vertical price
+//          range, anchored at the right edge of the latest bar. Single-mode
+//          layout (overlay sentiment color on volume bins) remains default.
+//        • Per-bin volume labels (optional). Each bin gets a small label
+//          showing `{vol} ({%-of-session})` for analytical depth.
+//        • Profile edge labels (optional, on by default). Profile High and
+//          Profile Low labels at the session range extremes, with tooltips
+//          carrying total volume, bar count, and range %.
+//        • Tracked drawings expanded to include `vpSentBoxes`, `vpBinLabels`,
+//          `vpHighLabel`, `vpLowLabel` — all cleaned up on session reset
+//          and re-created on each redraw cycle.
+//        • Deliberate skips (per analyst's recommendation): no heatmap, no
+//          developing-POC polyline, no three-tier color gradient, no
+//          fixed-range anchor mode, no LuxAlgo sentiment-zone marker.
+// v1.6 — Sentiment Profile + Money Flow + HVN/LVN (LuxAlgo-inspired):
+//        • Per-bin bull/bear split (Sentiment Profile). A parallel
+//          `vpBinsBull` array tracks the bull-classified volume per bin;
+//          bear = total − bull. Bins colored by net sign when enabled —
+//          green for buyer-dominated, red for seller-dominated, neutral
+//          otherwise. Two classification methods: bar polarity (close vs
+//          open) or buying pressure (close position in bar range).
+//        • Money Flow weighting toggle. When ON, bin weight is
+//          `volume × overlap × bin-midprice` (dollar value transacted) vs
+//          the default `volume × overlap` (share count). More meaningful
+//          on instruments with wide price variation.
+//        • HVN / LVN classification. High Volume Nodes (≥ threshold % of
+//          POC) and Low Volume Nodes (≤ threshold %) drawn as horizontal
+//          lines through the current session, identifying value zones and
+//          thin "no-mans-land" pass-through levels respectively.
+//        • Prev-session POC sentiment captured at finalization and surfaced
+//          in confluence tags as `pPOC(Bull)` / `pPOC(Bear)` so a bearish
+//          iceberg at a buyer-dominated prior POC reads as a sharper
+//          divergence signal than one at a neutral level.
+//        • Dashboard: session sentiment summary (Bull% / Bear%), HVN/LVN
+//          counts, prev-POC dashboard cell tagged with sentiment.
+//
+// NOTE on icebergs: true iceberg detection needs Level 2 / order-book data,
+// which Pine does not have. This implementation uses the standard candlestick
+// proxy: high volume + narrow range + extreme close = absorption footprint.
+// Best paired with VP/AVWAP confluence gating for high-quality signals.
+
+//@version=6
+indicator('SMT + VP + AVWAP + Ice [v2.1]', 'SMT+VP v2.1', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Constants
+//──────────────────────────────────────────────────────────────────────────────
+GREEN = #089981
+RED   = #F23645
+GRAY  = #878b94
+GOLD  = #FFC107
+BLUE  = #2196F3
+AMBER = #FF9800
+
+//──────────────────────────────────────────────────────────────────────────────
+// Inputs — SMT
+//──────────────────────────────────────────────────────────────────────────────
+grpPivot = 'SMT — Pivot Detection'
+pivotLen     = input.int(5, 'Pivot Length', minval = 1, maxval = 50, tooltip = 'Bars on each side required to confirm a swing pivot.', group = grpPivot)
+pivotSrcMode = input.string('Wick', 'Pivot Source', options = ['Wick', 'Body'], tooltip = 'Wick uses high/low; Body uses max/min of open/close.', group = grpPivot)
+showPivotMarkers = input.bool(false, 'Show Pivot Markers', group = grpPivot)
+
+grpSymbols = 'SMT — Comparison Symbols'
+// Each symbol row: [enable checkbox] [symbol picker] [Positive/Inverse correlation].
+// Positive: chart and comparison are expected to move TOGETHER (ES/NQ/YM, BTC/ETH).
+// Inverse:  chart and comparison are expected to move OPPOSITE (EURUSD/DXY, SPY/VIX).
+// Divergence logic flips automatically based on this setting.
+sym1Enabled = input.bool(true,  '', inline = 's1', group = grpSymbols)
+sym1        = input.symbol('CME_MINI:ES1!', 'Symbol 1', inline = 's1', group = grpSymbols)
+sym1Corr    = input.string('Positive', '', options = ['Positive', 'Inverse'], inline = 's1', group = grpSymbols, tooltip = 'Positive: chart and symbol move together (ES vs NQ, BTC vs ETH). Inverse: chart and symbol move opposite (EURUSD vs DXY, SPY vs VIX). The divergence condition flips automatically for Inverse.')
+sym2Enabled = input.bool(true,  '', inline = 's2', group = grpSymbols)
+sym2        = input.symbol('CME_MINI:NQ1!', 'Symbol 2', inline = 's2', group = grpSymbols)
+sym2Corr    = input.string('Positive', '', options = ['Positive', 'Inverse'], inline = 's2', group = grpSymbols)
+sym3Enabled = input.bool(false, '', inline = 's3', group = grpSymbols)
+sym3        = input.symbol('CBOT_MINI:YM1!', 'Symbol 3', inline = 's3', group = grpSymbols)
+sym3Corr    = input.string('Positive', '', options = ['Positive', 'Inverse'], inline = 's3', group = grpSymbols)
+
+grpStyle = 'SMT — Style'
+bullColor   = input.color(GREEN, 'Bullish SMT', group = grpStyle)
+bearColor   = input.color(RED,   'Bearish SMT', group = grpStyle)
+lineWidth   = input.int(2, 'Line Width', minval = 1, maxval = 5, group = grpStyle)
+lineStyleIn = input.string('Dashed', 'Line Style', options = ['Solid', 'Dashed', 'Dotted'], group = grpStyle)
+showLabel   = input.bool(true, 'Show Symbol Label', group = grpStyle)
+labelSize   = input.string('small', 'Label Size', options = ['tiny', 'small', 'normal'], group = grpStyle)
+
+grpAlerts = 'SMT — Alerts'
+alertBull = input.bool(true, 'Alert on Bullish SMT', group = grpAlerts)
+alertBear = input.bool(true, 'Alert on Bearish SMT', group = grpAlerts)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Inputs — Volume Profile (Current + Previous Session)
+//──────────────────────────────────────────────────────────────────────────────
+grpVP = 'Volume Profile'
+vpEnabled    = input.bool(true, 'Show Volume Profile', group = grpVP)
+vpAnchorIn   = input.string('Daily', 'Anchor', options = ['Daily', 'Weekly', 'Monthly'], group = grpVP)
+vpRows       = input.int(24, 'Profile Rows', minval = 5, maxval = 80, tooltip = 'More rows = finer resolution but more boxes.', group = grpVP)
+vpValueAreaP = input.float(70.0, 'Value Area %', minval = 50, maxval = 95, step = 1, group = grpVP) / 100.0
+vpShowHist   = input.bool(true, 'Show Histogram', group = grpVP)
+vpHistWidth  = input.int(40, 'Histogram Width (bars)', minval = 5, maxval = 200, group = grpVP)
+vpShowPOC    = input.bool(true, 'Show Current POC',    group = grpVP)
+vpShowVA     = input.bool(true, 'Show Current VAH/VAL', group = grpVP)
+vpShowLabels = input.bool(true, 'Show Price Labels', group = grpVP)
+vpExtend     = input.bool(true, 'Extend Current Levels Right', group = grpVP)
+vpPocColor   = input.color(GOLD, 'POC Color', group = grpVP)
+vpVaColor    = input.color(BLUE, 'VAH/VAL Color', group = grpVP)
+vpVaFill     = input.color(color.new(BLUE, 80), 'Value Area Fill', group = grpVP)
+vpOutFill    = input.color(color.new(GRAY, 80), 'Outside VA Fill', group = grpVP)
+
+grpPrev = 'Previous Session Levels'
+vpShowPrev      = input.bool(true, 'Show Previous Session POC/VAH/VAL', group = grpPrev)
+vpPrevPocColor  = input.color(color.new(GOLD, 20), 'Prev POC Color', group = grpPrev)
+vpPrevVaColor   = input.color(color.new(BLUE, 20), 'Prev VAH/VAL Color', group = grpPrev)
+vpPrevLineWidth = input.int(2, 'Prev POC Line Width', minval = 1, maxval = 4, group = grpPrev)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Inputs — Volume Profile Advanced (Money Flow, Sentiment, HVN/LVN)
+//──────────────────────────────────────────────────────────────────────────────
+grpVPAdv = 'VP Advanced — Sentiment & Money Flow'
+vpSource          = input.string('Volume', 'Profile Source', options = ['Volume', 'Money Flow'], tooltip = 'Volume: bin = overlap × volume (share/contract count). Money Flow: bin = overlap × volume × bin-midprice (dollar value transacted). Money Flow gives a more meaningful picture on instruments with wide price variation (crypto, equities); for tight-range forex pairs the difference is small.', group = grpVPAdv)
+vpSentiment       = input.bool(true, 'Color Bins by Sentiment (Bull/Bear)', tooltip = 'Splits each bin into bull vs bear volume; bin is colored green if buyers dominated at that price level, red if sellers did, gray if balanced. When OFF, bins use the standard inside-VA / outside-VA colors.', group = grpVPAdv)
+vpSentimentMethod = input.string('Bar Polarity', 'Sentiment Method', options = ['Bar Polarity', 'Buying Pressure'], tooltip = 'Bar Polarity: bullish if close > open. Buying Pressure: bullish if (close-low) > (high-close), i.e. closed in upper half of bar range.', group = grpVPAdv)
+vpBullBinColor    = input.color(color.new(GREEN, 60), 'Bullish Bin Color', group = grpVPAdv)
+vpBearBinColor    = input.color(color.new(RED, 60), 'Bearish Bin Color', group = grpVPAdv)
+vpNeutralBinColor = input.color(color.new(GRAY, 70), 'Neutral Bin Color', group = grpVPAdv)
+
+grpHVN = 'HVN / LVN Classification'
+vpShowHVN      = input.bool(false, 'Mark HVN / LVN Levels', tooltip = 'High Volume Nodes (HVN) = consolidation/value zones — price tends to dwell. Low Volume Nodes (LVN) = thin zones — price tends to traverse quickly, good no-mans-land for stop placement.', group = grpHVN)
+vpHVNThreshold = input.float(0.7, 'HVN Threshold (% of POC)', minval = 0.3, maxval = 0.95, step = 0.05, tooltip = 'Bin counts as HVN if its volume is at least this fraction of the POC bin. 0.7 = 70%.', group = grpHVN)
+vpLVNThreshold = input.float(0.2, 'LVN Threshold (% of POC)', minval = 0.05, maxval = 0.4, step = 0.05, tooltip = 'Bin counts as LVN if its volume is between 0 and this fraction of the POC bin. 0.2 = 20%.', group = grpHVN)
+vpHVNColor     = input.color(color.new(GOLD, 50), 'HVN Line Color', group = grpHVN)
+vpLVNColor     = input.color(color.new(GRAY, 60), 'LVN Line Color', group = grpHVN)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Inputs — VP Visualization (Twin Layout, Bin Labels, Edge Labels)
+//──────────────────────────────────────────────────────────────────────────────
+grpVPViz = 'VP Visualization'
+vpProfileLayout  = input.string('Single', 'Profile Layout', options = ['Single', 'Twin (Volume + Sentiment)'], tooltip = 'Single: one histogram with bins colored by sentiment or VA. Twin: separate sentiment histogram (closer to chart, width proportional to |Bull-Bear| per bin) and volume histogram (further right, width proportional to total volume).', group = grpVPViz)
+vpShowBinLabels  = input.bool(false, 'Show Per-Bin Volume Labels', tooltip = 'Each histogram bin gets a small label showing its volume amount and % of session total. Adds visual density — use selectively.', group = grpVPViz)
+vpShowEdgeLabels = input.bool(true, 'Show Profile High / Low Labels', tooltip = 'Mark the top and bottom of the session profile range with labels. Hover for total volume, bar count, range %.', group = grpVPViz)
+vpTwinSentBull   = input.color(color.new(GREEN, 55), 'Twin: Bull Sentiment Color', group = grpVPViz)
+vpTwinSentBear   = input.color(color.new(RED, 55),   'Twin: Bear Sentiment Color', group = grpVPViz)
+vpTwinVolColor   = input.color(color.new(BLUE, 70),  'Twin: Volume Color', tooltip = 'In Twin layout the volume bins are color-neutral by default since sentiment is already shown on the other histogram.', group = grpVPViz)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Inputs — Naked POCs
+//──────────────────────────────────────────────────────────────────────────────
+grpNPOC = 'Naked POCs'
+nPocEnabled = input.bool(true, 'Track Naked POCs', tooltip = 'Save each completed session POC; remove when price re-touches.', group = grpNPOC)
+nPocMax     = input.int(20, 'Max Tracked', minval = 1, maxval = 100, group = grpNPOC)
+nPocColor   = input.color(color.new(AMBER, 30), 'Color', group = grpNPOC)
+nPocStyleIn = input.string('Dotted', 'Line Style', options = ['Solid', 'Dashed', 'Dotted'], group = grpNPOC)
+nPocLabels  = input.bool(true, 'Show Labels', group = grpNPOC)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Inputs — Anchored VWAP + σ Bands
+//──────────────────────────────────────────────────────────────────────────────
+grpAvwap = 'Anchored VWAP'
+avwapEnabled = input.bool(true, 'Show Anchored VWAP', tooltip = 'Session-anchored VWAP using the same anchor as Volume Profile.', group = grpAvwap)
+avwapColor   = input.color(#FF6D00, 'AVWAP Color', group = grpAvwap)
+avwapWidth   = input.int(2, 'AVWAP Line Width', minval = 1, maxval = 4, group = grpAvwap)
+
+showSigma1  = input.bool(true,  '', inline = 'sg1', group = grpAvwap)
+sigma1Mult  = input.float(1.0, '±σ #1 ×', minval = 0.1, maxval = 5, step = 0.1, inline = 'sg1', group = grpAvwap)
+sigma1Color = input.color(color.new(#FF6D00, 40), '', inline = 'sg1', group = grpAvwap)
+
+showSigma2  = input.bool(true,  '', inline = 'sg2', group = grpAvwap)
+sigma2Mult  = input.float(2.0, '±σ #2 ×', minval = 0.1, maxval = 5, step = 0.1, inline = 'sg2', group = grpAvwap)
+sigma2Color = input.color(color.new(#FF6D00, 60), '', inline = 'sg2', group = grpAvwap)
+
+showSigma3  = input.bool(false, '', inline = 'sg3', group = grpAvwap)
+sigma3Mult  = input.float(3.0, '±σ #3 ×', minval = 0.1, maxval = 5, step = 0.1, inline = 'sg3', group = grpAvwap)
+sigma3Color = input.color(color.new(#FF6D00, 75), '', inline = 'sg3', group = grpAvwap)
+
+fillBands    = input.bool(true, 'Fill Between Bands', group = grpAvwap)
+fillOpacity  = input.int(92, 'Fill Opacity (lower = darker)', minval = 60, maxval = 99, group = grpAvwap)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Inputs — Confluence
+//──────────────────────────────────────────────────────────────────────────────
+grpConf = 'Confluence'
+confEnabled = input.bool(true, 'Detect Confluence at SMT', group = grpConf)
+confTicks   = input.int(10, 'Distance (ticks)', minval = 1, maxval = 200, tooltip = 'SMT pivots within this many ticks of a VP/AVWAP level count as confluence.', group = grpConf)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Inputs — Iceberg / Absorption
+//──────────────────────────────────────────────────────────────────────────────
+grpIce = 'Iceberg / Absorption'
+iceEnabled        = input.bool(true, 'Detect Iceberg / Absorption', tooltip = 'Flags high-volume narrow-range bars that close at one extreme — a proxy for hidden iceberg-order absorption.', group = grpIce)
+iceVolMult        = input.float(2.0, 'Volume Multiplier (× SMA20)', minval = 1.0, maxval = 10, step = 0.1, tooltip = 'Bar volume must exceed this multiple of the 20-bar volume SMA.', group = grpIce)
+iceRangeMult      = input.float(0.5, 'Max Range (× ATR14)', minval = 0.1, maxval = 2.0, step = 0.05, tooltip = 'Bar range must be LESS than this multiple of ATR(14). Narrow range = absorption.', group = grpIce)
+iceCloseThreshold = input.float(0.33, 'Close Position Threshold', minval = 0.1, maxval = 0.5, step = 0.05, tooltip = 'Close must be in top/bottom N of bar range. 0.33 = top/bottom third.', group = grpIce)
+iceRequireConf    = input.bool(true, 'Require VP/AVWAP Confluence', tooltip = 'Only fire icebergs whose bar range straddles a tracked level.', group = grpIce)
+iceAlertEnabled   = input.bool(true, 'Alert on Iceberg', group = grpIce)
+iceBullColor      = input.color(GREEN, 'Bullish Iceberg', group = grpIce)
+iceBearColor      = input.color(RED,   'Bearish Iceberg', group = grpIce)
+iceMarkerSize     = input.string('small', 'Marker Size', options = ['tiny', 'small', 'normal'], group = grpIce)
+iceMarkerText     = input.string('🧊', 'Marker Text', tooltip = 'Falls back to text if emoji does not render on your platform.', group = grpIce)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Inputs — Dashboard
+//──────────────────────────────────────────────────────────────────────────────
+grpDash = 'Dashboard'
+showDash = input.bool(true, 'Show Dashboard', group = grpDash)
+dashPos  = input.string('Top Right', 'Position', options = ['Top Right', 'Top Left', 'Bottom Right', 'Bottom Left', 'Middle Right'], group = grpDash)
+dashSize = input.string('small', 'Text Size', options = ['tiny', 'small', 'normal'], group = grpDash)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Helpers
+//──────────────────────────────────────────────────────────────────────────────
+getLineStyle(string s) =>
+    switch s
+        'Solid'  => line.style_solid
+        'Dashed' => line.style_dashed
+        'Dotted' => line.style_dotted
+        =>          line.style_dashed
+
+getLabelSize(string s) =>
+    switch s
+        'tiny'   => size.tiny
+        'small'  => size.small
+        'normal' => size.normal
+        =>          size.small
+
+getDashPosition(string s) =>
+    switch s
+        'Top Left'      => position.top_left
+        'Top Right'     => position.top_right
+        'Bottom Left'   => position.bottom_left
+        'Bottom Right'  => position.bottom_right
+        'Middle Right'  => position.middle_right
+        =>                 position.top_right
+
+shortName(string s) =>
+    int colonIdx = str.pos(s, ':')
+    na(colonIdx) ? s : str.substring(s, colonIdx + 1)
+
+pivotSrcHigh = pivotSrcMode == 'Body' ? math.max(open, close) : high
+pivotSrcLow  = pivotSrcMode == 'Body' ? math.min(open, close) : low
+
+// Session boundary detection — used by both Volume Profile and Anchored VWAP.
+vpAnchorTF = vpAnchorIn == 'Daily' ? 'D' : vpAnchorIn == 'Weekly' ? 'W' : 'M'
+isNewVPSession = ta.change(time(vpAnchorTF)) != 0
+
+// Profile computation — returns POC bin index, value-area bin indices, total volume.
+computeProfile(array<float> bins, int rows, float vaTargetRatio) =>
+    int   pocIdx = 0
+    float maxV   = 0.0
+    float totalV = 0.0
+    for i = 0 to rows - 1
+        float v = array.get(bins, i)
+        totalV += v
+        if v > maxV
+            maxV   := v
+            pocIdx := i
+    int   vaL = pocIdx
+    int   vaH = pocIdx
+    float vaV = array.get(bins, pocIdx)
+    float target = totalV * vaTargetRatio
+    while vaV < target and (vaL > 0 or vaH < rows - 1)
+        float upV = vaH < rows - 1 ? array.get(bins, vaH + 1) : -1.0
+        float dnV = vaL > 0        ? array.get(bins, vaL - 1) : -1.0
+        if upV < 0 and dnV < 0
+            break
+        if upV >= dnV
+            vaH += 1
+            vaV += upV
+        else
+            vaL -= 1
+            vaV += dnV
+    [pocIdx, vaL, vaH, totalV]
+
+
+//══════════════════════════════════════════════════════════════════════════════
+// COMPARISON SYMBOL DATA + PIVOTS (must run on every bar before SMT block)
+//══════════════════════════════════════════════════════════════════════════════
+[s1High, s1Low] = request.security(sym1, timeframe.period, [pivotSrcHigh, pivotSrcLow], lookahead = barmerge.lookahead_off)
+[s2High, s2Low] = request.security(sym2, timeframe.period, [pivotSrcHigh, pivotSrcLow], lookahead = barmerge.lookahead_off)
+[s3High, s3Low] = request.security(sym3, timeframe.period, [pivotSrcHigh, pivotSrcLow], lookahead = barmerge.lookahead_off)
+
+phVal = ta.pivothigh(pivotSrcHigh, pivotLen, pivotLen)
+plVal = ta.pivotlow (pivotSrcLow,  pivotLen, pivotLen)
+
+//══════════════════════════════════════════════════════════════════════════════
+// ANCHORED VWAP + σ BANDS
+//══════════════════════════════════════════════════════════════════════════════
+// Session-anchored VWAP. Confirmed-bar accumulation gives exact historical
+// values; the realtime bar adds a live projection on top so the displayed
+// VWAP is up-to-date instead of one bar stale.
+//
+// σ formula:  variance = Σ(P²·V)/ΣV − VWAP²    (O(1) per bar, no growing array)
+
+var float cumPV   = 0.0   // Σ(typical price · volume)
+var float cumV    = 0.0   // Σ(volume)
+var float cumPV2  = 0.0   // Σ(typical² · volume)
+
+// Confirmed-bar accumulation. On a session boundary, reset to this bar only.
+// nz(volume) — some feeds (OANDA forex, certain index feeds) report `na`
+// volume on individual bars. Without nz(), a single na bar poisons the whole
+// cumulative sum via NaN propagation and AVWAP becomes na forever.
+if avwapEnabled and barstate.isconfirmed
+    float tp = hlc3
+    float vol = nz(volume)
+    float pv = tp * vol
+    if isNewVPSession or cumV == 0
+        cumPV  := pv
+        cumV   := vol
+        cumPV2 := tp * pv
+    else
+        cumPV  += pv
+        cumV   += vol
+        cumPV2 += tp * pv
+
+// Live projection — for the realtime bar before close, add the running
+// hlc3·volume on top of the confirmed accumulation so the AVWAP displayed
+// includes the current tick.
+float liveCumPV  = cumPV
+float liveCumV   = cumV
+float liveCumPV2 = cumPV2
+if avwapEnabled and not barstate.isconfirmed
+    float tp = hlc3
+    float vol = nz(volume)
+    float pv = tp * vol
+    if isNewVPSession or cumV == 0
+        liveCumPV  := pv
+        liveCumV   := vol
+        liveCumPV2 := tp * pv
+    else
+        liveCumPV  := cumPV  + pv
+        liveCumV   := cumV   + vol
+        liveCumPV2 := cumPV2 + tp * pv
+
+float avwap      = avwapEnabled and liveCumV > 0 ? liveCumPV / liveCumV : na
+float avwapVar   = avwapEnabled and liveCumV > 0 ? math.max(0.0, liveCumPV2 / liveCumV - avwap * avwap) : na
+float avwapSigma = na(avwapVar) ? na : math.sqrt(avwapVar)
+
+float avwapU1 = na(avwap) or na(avwapSigma) ? na : avwap + sigma1Mult * avwapSigma
+float avwapL1 = na(avwap) or na(avwapSigma) ? na : avwap - sigma1Mult * avwapSigma
+float avwapU2 = na(avwap) or na(avwapSigma) ? na : avwap + sigma2Mult * avwapSigma
+float avwapL2 = na(avwap) or na(avwapSigma) ? na : avwap - sigma2Mult * avwapSigma
+float avwapU3 = na(avwap) or na(avwapSigma) ? na : avwap + sigma3Mult * avwapSigma
+float avwapL3 = na(avwap) or na(avwapSigma) ? na : avwap - sigma3Mult * avwapSigma
+
+//══════════════════════════════════════════════════════════════════════════════
+// STATE
+//══════════════════════════════════════════════════════════════════════════════
+
+// SMT state — previous-pivot snapshots, used to evaluate consecutive divergences.
+var float prevPHChart = na
+var float prevPHS1    = na
+var float prevPHS2    = na
+var float prevPHS3    = na
+var int   prevPHBar   = na
+
+var float prevPLChart = na
+var float prevPLS1    = na
+var float prevPLS2    = na
+var float prevPLS3    = na
+var int   prevPLBar   = na
+
+// Last-fired SMT event for the dashboard.
+var int    lastBullBar = na
+var string lastBullSym = ''
+var float  lastBullPrice = na
+var bool   lastBullConf = false
+var int    lastBearBar = na
+var string lastBearSym = ''
+var float  lastBearPrice = na
+var bool   lastBearConf = false
+
+// Iceberg tracking — session count + last event.
+var int    iceCount    = 0
+var int    lastIceBar  = na
+var string lastIceType = ''   // 'Bull' or 'Bear'
+var bool   lastIceConf = false
+
+// VP session aggregates.
+var float vpSessHigh  = na
+var float vpSessLow   = na
+var int   vpSessStart = na
+var array<float> vpBins     = array.new<float>(vpRows, 0.0)   // total volume per bin
+var array<float> vpBinsBull = array.new<float>(vpRows, 0.0)   // bull-classified volume per bin; bear = vpBins - vpBinsBull
+
+// VP developing-session drawings.
+var array<box>   vpBoxes     = array.new<box>()     // volume histogram bins
+var array<box>   vpSentBoxes = array.new<box>()     // sentiment histogram bins (twin layout only)
+var array<line>  vpHVNLines  = array.new<line>()    // HVN/LVN markers (developing-session only)
+var array<label> vpBinLabels = array.new<label>()   // per-bin volume labels (toggle)
+var line  vpPocLine   = na
+var line  vpVahLine   = na
+var line  vpValLine   = na
+var label vpPocLabel  = na
+var label vpVahLabel  = na
+var label vpValLabel  = na
+var label vpHighLabel = na   // profile high edge label
+var label vpLowLabel  = na   // profile low edge label
+
+// Cached current developing levels (for confluence + dashboard).
+var float currDevPOC = na
+var float currDevVAH = na
+var float currDevVAL = na
+
+// HVN/LVN counts (for dashboard).
+var int hvnCount = 0
+var int lvnCount = 0
+
+// State for the incremental-vs-recompute decision. We only do a full
+// `recomputeBinsFromRaw` when the session range has actually expanded since
+// the last recompute. While the range is stable, each confirmed bar just
+// adds its volume into the existing (already-correctly-aligned) bins. This
+// turns the worst case from O(N²·R) per session down to O(N·R) for typical
+// sessions where the range stabilizes after the first few bars.
+var float lastRecompHigh = na
+var float lastRecompLow  = na
+
+// Per-session bar counter — used in the profile edge-label tooltip so the user
+// can see how many bars are aggregated into the developing profile.
+var int vpSessBarCount = 0
+
+// Tracks the last bar on which the VP histogram was redrawn so we don't
+// delete-and-rebuild ~24 boxes on every realtime tick when nothing changed.
+var int lastVpDrawBar = na
+
+// Previous session finalized levels.
+var float  prevSessPOC = na
+var float  prevSessVAH = na
+var float  prevSessVAL = na
+var int    prevSessStartBar = na
+var int    prevSessEndBar   = na
+var string prevSessPOCSentiment = na   // 'Bull' / 'Bear' / 'Neutral' — used to enrich confluence tags
+var line   prevPocLine  = na
+var line   prevVahLine  = na
+var line   prevValLine  = na
+var label  prevPocLabel = na
+var label  prevVahLabel = na
+var label  prevValLabel = na
+
+// Naked POC tracking — each entry is a session-finalized POC that hasn't been
+// re-touched yet. Parallel arrays for price, creation bar (= the bar where the
+// POC was pushed, used for the 1-bar grace period in the touch check), line,
+// and label.
+var array<float> nakedPOCs            = array.new<float>()
+var array<int>   nakedPOCCreationBars = array.new<int>()
+var array<line>  nakedPOCLines        = array.new<line>()
+var array<label> nakedPOCLabels       = array.new<label>()
+
+// Dashboard table.
+var table dashTable = na
+
+// Style derivations.
+lineStyle  = getLineStyle(lineStyleIn)
+nPocStyle  = getLineStyle(nPocStyleIn)
+lblSize    = getLabelSize(labelSize)
+dashTxtSz  = getLabelSize(dashSize)
+
+//══════════════════════════════════════════════════════════════════════════════
+// HELPERS — drift-free VP recomputation
+//══════════════════════════════════════════════════════════════════════════════
+// Recompute vpBins / vpBinsBull from raw bar history using the CURRENT
+// vpSessHigh / vpSessLow as the bin range. Required because vpSessHigh/Low
+// expand during the session — under incremental accumulation, bins assigned
+// in early bars would refer to different price ranges than bins assigned
+// later. Recomputing from raw on each redraw eliminates this drift.
+//
+// Must be defined AFTER the STATE section because it references the global
+// `vpBins` / `vpBinsBull` arrays and the `vpSessHigh` / `vpSessLow` /
+// `vpSessStart` / `vpRows` / `vpSource` / `vpSentimentMethod` symbols. Pine
+// does not forward-resolve function-body identifiers.
+//
+// startOffset = 0 → include the current bar (developing redraw)
+// startOffset = 1 → exclude the current bar (used at session finalization,
+//                   where the current bar is the first bar of the NEW session
+//                   and shouldn't be counted in the prior session's profile).
+recomputeBinsFromRaw(int startOffset, int endOffset) =>
+    array.fill(vpBins,     0.0)
+    array.fill(vpBinsBull, 0.0)
+    if endOffset >= startOffset and not na(vpSessHigh) and not na(vpSessLow) and vpSessHigh > vpSessLow
+        float binSize  = (vpSessHigh - vpSessLow) / vpRows
+        bool  moneyFlow = vpSource == 'Money Flow'
+        if binSize > 0
+            for offset = startOffset to endOffset
+                float bH = high[offset]
+                float bL = low[offset]
+                float bC = close[offset]
+                float bO = open[offset]
+                float bV = nz(volume[offset])
+                float bRange = bH - bL
+                if bRange > 0 and bV > 0
+                    bool barBull = vpSentimentMethod == 'Bar Polarity' ? bC > bO : (bC - bL) > (bH - bC)
+                    for i = 0 to vpRows - 1
+                        float binLow  = vpSessLow + i * binSize
+                        float binHigh = binLow + binSize
+                        float overlap = math.max(0.0, math.min(bH, binHigh) - math.max(bL, binLow))
+                        if overlap > 0
+                            float ratio       = overlap / bRange
+                            float binMidPrice = binLow + binSize * 0.5
+                            float weight      = moneyFlow ? bV * ratio * binMidPrice : bV * ratio
+                            array.set(vpBins, i, array.get(vpBins, i) + weight)
+                            if barBull
+                                array.set(vpBinsBull, i, array.get(vpBinsBull, i) + weight)
+    0
+
+// Incremental: add ONLY the current bar's volume into the existing bin array
+// using the current session range. Safe to call when the range is unchanged
+// from the last full recompute — bin boundaries are stable, so adding to
+// existing indices is correct. O(vpRows) per call.
+accumulateCurrentBar() =>
+    if not na(vpSessHigh) and not na(vpSessLow) and vpSessHigh > vpSessLow
+        float binSize  = (vpSessHigh - vpSessLow) / vpRows
+        float barRange = high - low
+        float vol      = nz(volume)
+        if barRange > 0 and binSize > 0 and vol > 0
+            bool barBull   = vpSentimentMethod == 'Bar Polarity' ? close > open : (close - low) > (high - close)
+            bool moneyFlow = vpSource == 'Money Flow'
+            for i = 0 to vpRows - 1
+                float binLow  = vpSessLow + i * binSize
+                float binHigh = binLow + binSize
+                float overlap = math.max(0.0, math.min(high, binHigh) - math.max(low, binLow))
+                if overlap > 0
+                    float ratio       = overlap / barRange
+                    float binMidPrice = binLow + binSize * 0.5
+                    float weight      = moneyFlow ? vol * ratio * binMidPrice : vol * ratio
+                    array.set(vpBins, i, array.get(vpBins, i) + weight)
+                    if barBull
+                        array.set(vpBinsBull, i, array.get(vpBinsBull, i) + weight)
+    0
+
+//══════════════════════════════════════════════════════════════════════════════
+// HELPERS — confluence
+//══════════════════════════════════════════════════════════════════════════════
+// Returns a confluence description string, empty if none. Checks the pivot
+// price against previous-session levels, active naked POCs, and the AVWAP/σ
+// bands at the pivot bar (offset back by `barOffset`).
+checkConfluence(float price, float tickDist, int barOffset) =>
+    string out = ''
+    if not confEnabled or na(price)
+        out
+    else
+        float td = tickDist * syminfo.mintick
+        bool atVAH = not na(prevSessVAH) and math.abs(price - prevSessVAH) <= td
+        bool atVAL = not na(prevSessVAL) and math.abs(price - prevSessVAL) <= td
+        if not na(prevSessPOC) and math.abs(price - prevSessPOC) <= td
+            string sentSuffix = na(prevSessPOCSentiment) or prevSessPOCSentiment == 'Neutral' ? '' : '(' + prevSessPOCSentiment + ')'
+            out := out + 'pPOC' + sentSuffix + ' '
+        if atVAH
+            out := out + 'pVAH '
+        if atVAL
+            out := out + 'pVAL '
+        // InVA fires only when CLEARLY inside the value area (strictly past
+        // both edges by more than the tick tolerance). Prevents redundant
+        // "pVAH InVA" tag pairs on boundary-hugging prices.
+        if not atVAH and not atVAL and not na(prevSessVAH) and not na(prevSessVAL) and price > prevSessVAL + td and price < prevSessVAH - td
+            out := out + 'InVA '
+        int sz = array.size(nakedPOCs)
+        if sz > 0
+            for i = 0 to sz - 1
+                float p = array.get(nakedPOCs, i)
+                if math.abs(price - p) <= td
+                    out := out + 'nPOC@' + str.tostring(p, format.mintick) + ' '
+                    break
+        // AVWAP + σ bands at the pivot bar. Require pivSigma > 0 to avoid
+        // false-positive confluence on session-boundary bars, where the
+        // AVWAP has only 1 bar of accumulation and equals hlc3 of that bar
+        // (so any nearby price would otherwise "match").
+        if avwapEnabled
+            float pivAvwap = avwap[barOffset]
+            float pivSigma = avwapSigma[barOffset]
+            if not na(pivAvwap) and not na(pivSigma) and pivSigma > 0 and math.abs(price - pivAvwap) <= td
+                out := out + 'AVWAP '
+            if not na(pivAvwap) and not na(pivSigma) and pivSigma > 0
+                if showSigma1 and math.abs(price - (pivAvwap + sigma1Mult * pivSigma)) <= td
+                    out := out + '+' + str.tostring(sigma1Mult, '#.#') + 'σ '
+                if showSigma1 and math.abs(price - (pivAvwap - sigma1Mult * pivSigma)) <= td
+                    out := out + '-' + str.tostring(sigma1Mult, '#.#') + 'σ '
+                if showSigma2 and math.abs(price - (pivAvwap + sigma2Mult * pivSigma)) <= td
+                    out := out + '+' + str.tostring(sigma2Mult, '#.#') + 'σ '
+                if showSigma2 and math.abs(price - (pivAvwap - sigma2Mult * pivSigma)) <= td
+                    out := out + '-' + str.tostring(sigma2Mult, '#.#') + 'σ '
+                if showSigma3 and math.abs(price - (pivAvwap + sigma3Mult * pivSigma)) <= td
+                    out := out + '+' + str.tostring(sigma3Mult, '#.#') + 'σ '
+                if showSigma3 and math.abs(price - (pivAvwap - sigma3Mult * pivSigma)) <= td
+                    out := out + '-' + str.tostring(sigma3Mult, '#.#') + 'σ '
+        // Strip the trailing space left by the tag appends.
+        if str.endswith(out, ' ')
+            out := str.substring(out, 0, str.length(out) - 1)
+        out
+
+// Returns a string listing which tracked levels lie inside [barLow, barHigh].
+// Used for iceberg confluence — we care whether the bar's whole range
+// straddled a level, not just whether close was near it.
+levelsInBar(float barLow, float barHigh, int barOffset) =>
+    string out = ''
+    if barHigh >= barLow
+        // Developing-session levels — high-quality intra-session reference.
+        // (Only set during the redraw block on barstate.islast, so meaningful
+        // primarily in realtime; historical icebergs won't capture this.)
+        if not na(currDevPOC) and currDevPOC >= barLow and currDevPOC <= barHigh
+            out := out + 'POC '
+        if not na(currDevVAH) and currDevVAH >= barLow and currDevVAH <= barHigh
+            out := out + 'VAH '
+        if not na(currDevVAL) and currDevVAL >= barLow and currDevVAL <= barHigh
+            out := out + 'VAL '
+        // Previous-session levels.
+        if not na(prevSessPOC) and prevSessPOC >= barLow and prevSessPOC <= barHigh
+            string sentSuffix = na(prevSessPOCSentiment) or prevSessPOCSentiment == 'Neutral' ? '' : '(' + prevSessPOCSentiment + ')'
+            out := out + 'pPOC' + sentSuffix + ' '
+        if not na(prevSessVAH) and prevSessVAH >= barLow and prevSessVAH <= barHigh
+            out := out + 'pVAH '
+        if not na(prevSessVAL) and prevSessVAL >= barLow and prevSessVAL <= barHigh
+            out := out + 'pVAL '
+        int sz = array.size(nakedPOCs)
+        if sz > 0
+            for i = 0 to sz - 1
+                float p = array.get(nakedPOCs, i)
+                if p >= barLow and p <= barHigh
+                    out := out + 'nPOC@' + str.tostring(p, format.mintick) + ' '
+                    break
+        if avwapEnabled
+            float pivAvwap = avwap[barOffset]
+            float pivSigma = avwapSigma[barOffset]
+            // Require pivSigma > 0 (same reasoning as checkConfluence — skips
+            // session-boundary bars where AVWAP has only 1 bar of accumulation).
+            if not na(pivAvwap) and not na(pivSigma) and pivSigma > 0 and pivAvwap >= barLow and pivAvwap <= barHigh
+                out := out + 'AVWAP '
+            if not na(pivAvwap) and not na(pivSigma) and pivSigma > 0
+                float u1 = pivAvwap + sigma1Mult * pivSigma
+                float l1 = pivAvwap - sigma1Mult * pivSigma
+                float u2 = pivAvwap + sigma2Mult * pivSigma
+                float l2 = pivAvwap - sigma2Mult * pivSigma
+                float u3 = pivAvwap + sigma3Mult * pivSigma
+                float l3 = pivAvwap - sigma3Mult * pivSigma
+                if showSigma1 and u1 >= barLow and u1 <= barHigh
+                    out := out + '+' + str.tostring(sigma1Mult, '#.#') + 'σ '
+                if showSigma1 and l1 >= barLow and l1 <= barHigh
+                    out := out + '-' + str.tostring(sigma1Mult, '#.#') + 'σ '
+                if showSigma2 and u2 >= barLow and u2 <= barHigh
+                    out := out + '+' + str.tostring(sigma2Mult, '#.#') + 'σ '
+                if showSigma2 and l2 >= barLow and l2 <= barHigh
+                    out := out + '-' + str.tostring(sigma2Mult, '#.#') + 'σ '
+                if showSigma3 and u3 >= barLow and u3 <= barHigh
+                    out := out + '+' + str.tostring(sigma3Mult, '#.#') + 'σ '
+                if showSigma3 and l3 >= barLow and l3 <= barHigh
+                    out := out + '-' + str.tostring(sigma3Mult, '#.#') + 'σ '
+    // Strip the trailing space left by the tag appends.
+    if str.endswith(out, ' ')
+        out := str.substring(out, 0, str.length(out) - 1)
+    out
+
+//══════════════════════════════════════════════════════════════════════════════
+// SMT DIVERGENCE
+//══════════════════════════════════════════════════════════════════════════════
+drawDivergence(bool isBull, int prevBar, float prevChart, float currChart, float prevCmp, float currCmp, string sym, color col) =>
+    int curBar = bar_index - pivotLen
+    line.new(prevBar, prevChart, curBar, currChart, color = col, width = lineWidth, style = lineStyle)
+    if showLabel
+        float midPrice = (prevChart + currChart) / 2.0
+        int   midBar   = math.round((prevBar + curBar) / 2.0)
+        string tip = 'Chart: ' + str.tostring(prevChart, format.mintick) + ' → ' + str.tostring(currChart, format.mintick) + '\n' + shortName(sym) + ': ' + str.tostring(prevCmp, format.mintick) + ' → ' + str.tostring(currCmp, format.mintick)
+        label.new(midBar, midPrice, (isBull ? 'Bull SMT\n' : 'Bear SMT\n') + shortName(sym), style = isBull ? label.style_label_up : label.style_label_down, color = col, textcolor = color.white, size = lblSize, tooltip = tip)
+
+// ─── Bearish SMT (confirmed pivot HIGH) ─────────────────────────────────────
+// Per-pivot dedup: collect every symbol that diverges, then update dashboard
+// state ONCE and fire ONE combined alert. Avoids three alerts + the dashboard
+// only showing whichever symbol happened to be evaluated last.
+//
+// Inverse-correlation sampling: at a chart pivot HIGH the chart price is
+// peaking, so a TRUE inverse cmp should be at a pivot LOW. We sample the
+// cmp's LOW (not HIGH) at the chart's pivot-high bar so we compare the
+// "matching" cmp pivot value across consecutive chart pivots.
+if not na(phVal)
+    int pivotBar = bar_index - pivotLen
+    float s1At = sym1Corr == 'Inverse' ? s1Low[pivotLen]  : s1High[pivotLen]
+    float s2At = sym2Corr == 'Inverse' ? s2Low[pivotLen]  : s2High[pivotLen]
+    float s3At = sym3Corr == 'Inverse' ? s3Low[pivotLen]  : s3High[pivotLen]
+
+    if not na(prevPHChart)
+        bool chartHH = phVal > prevPHChart
+        bool chartLH = phVal < prevPHChart
+        string conf = checkConfluence(phVal, confTicks, pivotLen)
+
+        int    divCount     = 0
+        string divergedSyms = ''
+
+        if sym1Enabled and not na(s1At) and not na(prevPHS1)
+            bool s1HH = s1At > prevPHS1
+            bool s1LH = s1At < prevPHS1
+            // Positive: divergence when directions OPPOSE.  Inverse: divergence when directions MATCH.
+            bool d1 = sym1Corr == 'Positive' ? ((chartHH and s1LH) or (chartLH and s1HH)) : ((chartHH and s1HH) or (chartLH and s1LH))
+            if d1
+                drawDivergence(false, prevPHBar, prevPHChart, phVal, prevPHS1, s1At, sym1, bearColor)
+                divergedSyms := divergedSyms + (divCount > 0 ? ', ' : '') + shortName(sym1) + (sym1Corr == 'Inverse' ? ' (inv)' : '')
+                divCount     += 1
+
+        if sym2Enabled and not na(s2At) and not na(prevPHS2)
+            bool s2HH = s2At > prevPHS2
+            bool s2LH = s2At < prevPHS2
+            bool d2 = sym2Corr == 'Positive' ? ((chartHH and s2LH) or (chartLH and s2HH)) : ((chartHH and s2HH) or (chartLH and s2LH))
+            if d2
+                drawDivergence(false, prevPHBar, prevPHChart, phVal, prevPHS2, s2At, sym2, bearColor)
+                divergedSyms := divergedSyms + (divCount > 0 ? ', ' : '') + shortName(sym2) + (sym2Corr == 'Inverse' ? ' (inv)' : '')
+                divCount     += 1
+
+        if sym3Enabled and not na(s3At) and not na(prevPHS3)
+            bool s3HH = s3At > prevPHS3
+            bool s3LH = s3At < prevPHS3
+            bool d3 = sym3Corr == 'Positive' ? ((chartHH and s3LH) or (chartLH and s3HH)) : ((chartHH and s3HH) or (chartLH and s3LH))
+            if d3
+                drawDivergence(false, prevPHBar, prevPHChart, phVal, prevPHS3, s3At, sym3, bearColor)
+                divergedSyms := divergedSyms + (divCount > 0 ? ', ' : '') + shortName(sym3) + (sym3Corr == 'Inverse' ? ' (inv)' : '')
+                divCount     += 1
+
+        if divCount > 0
+            lastBearBar   := pivotBar
+            lastBearSym   := divergedSyms
+            lastBearPrice := phVal
+            lastBearConf  := str.length(conf) > 0
+            if alertBear
+                string base = 'Bearish SMT vs ' + divergedSyms
+                string msg  = str.length(conf) > 0 ? base + ' | Confluence: ' + conf : base
+                alert(msg, alert.freq_once_per_bar_close)
+
+    prevPHChart := phVal
+    prevPHS1    := s1At
+    prevPHS2    := s2At
+    prevPHS3    := s3At
+    prevPHBar   := pivotBar
+
+// ─── Bullish SMT (confirmed pivot LOW) ──────────────────────────────────────
+// Inverse sampling (mirror of the bearish block): at a chart pivot LOW the
+// chart price is troughing, so a TRUE inverse cmp should be at a pivot HIGH.
+// We sample cmp's HIGH (not LOW) at the chart's pivot-low bar.
+if not na(plVal)
+    int pivotBar = bar_index - pivotLen
+    float s1At = sym1Corr == 'Inverse' ? s1High[pivotLen] : s1Low[pivotLen]
+    float s2At = sym2Corr == 'Inverse' ? s2High[pivotLen] : s2Low[pivotLen]
+    float s3At = sym3Corr == 'Inverse' ? s3High[pivotLen] : s3Low[pivotLen]
+
+    if not na(prevPLChart)
+        bool chartLL = plVal < prevPLChart
+        bool chartHL = plVal > prevPLChart
+        string conf = checkConfluence(plVal, confTicks, pivotLen)
+
+        int    divCount     = 0
+        string divergedSyms = ''
+
+        if sym1Enabled and not na(s1At) and not na(prevPLS1)
+            bool s1LL = s1At < prevPLS1
+            bool s1HL = s1At > prevPLS1
+            // Positive: divergence when directions OPPOSE.  Inverse: divergence when directions MATCH.
+            bool d1 = sym1Corr == 'Positive' ? ((chartLL and s1HL) or (chartHL and s1LL)) : ((chartLL and s1LL) or (chartHL and s1HL))
+            if d1
+                drawDivergence(true, prevPLBar, prevPLChart, plVal, prevPLS1, s1At, sym1, bullColor)
+                divergedSyms := divergedSyms + (divCount > 0 ? ', ' : '') + shortName(sym1) + (sym1Corr == 'Inverse' ? ' (inv)' : '')
+                divCount     += 1
+
+        if sym2Enabled and not na(s2At) and not na(prevPLS2)
+            bool s2LL = s2At < prevPLS2
+            bool s2HL = s2At > prevPLS2
+            bool d2 = sym2Corr == 'Positive' ? ((chartLL and s2HL) or (chartHL and s2LL)) : ((chartLL and s2LL) or (chartHL and s2HL))
+            if d2
+                drawDivergence(true, prevPLBar, prevPLChart, plVal, prevPLS2, s2At, sym2, bullColor)
+                divergedSyms := divergedSyms + (divCount > 0 ? ', ' : '') + shortName(sym2) + (sym2Corr == 'Inverse' ? ' (inv)' : '')
+                divCount     += 1
+
+        if sym3Enabled and not na(s3At) and not na(prevPLS3)
+            bool s3LL = s3At < prevPLS3
+            bool s3HL = s3At > prevPLS3
+            bool d3 = sym3Corr == 'Positive' ? ((chartLL and s3HL) or (chartHL and s3LL)) : ((chartLL and s3LL) or (chartHL and s3HL))
+            if d3
+                drawDivergence(true, prevPLBar, prevPLChart, plVal, prevPLS3, s3At, sym3, bullColor)
+                divergedSyms := divergedSyms + (divCount > 0 ? ', ' : '') + shortName(sym3) + (sym3Corr == 'Inverse' ? ' (inv)' : '')
+                divCount     += 1
+
+        if divCount > 0
+            lastBullBar   := pivotBar
+            lastBullSym   := divergedSyms
+            lastBullPrice := plVal
+            lastBullConf  := str.length(conf) > 0
+            if alertBull
+                string base = 'Bullish SMT vs ' + divergedSyms
+                string msg  = str.length(conf) > 0 ? base + ' | Confluence: ' + conf : base
+                alert(msg, alert.freq_once_per_bar_close)
+
+    prevPLChart := plVal
+    prevPLS1    := s1At
+    prevPLS2    := s2At
+    prevPLS3    := s3At
+    prevPLBar   := pivotBar
+
+plotshape(showPivotMarkers and not na(phVal), title = 'Pivot High', style = shape.triangledown, location = location.abovebar, color = color.new(GRAY, 0), size = size.tiny, offset = -pivotLen)
+plotshape(showPivotMarkers and not na(plVal), title = 'Pivot Low',  style = shape.triangleup,   location = location.belowbar, color = color.new(GRAY, 0), size = size.tiny, offset = -pivotLen)
+
+//══════════════════════════════════════════════════════════════════════════════
+// VOLUME PROFILE — uses session boundary detection from the helpers section.
+//══════════════════════════════════════════════════════════════════════════════
+
+//──────────────────────────────────────────────────────────────────────────────
+// 1) Session finalization — compute the just-completed session's POC/VAH/VAL
+//    BEFORE we reset for the new session. Save as previous-session levels and
+//    push the POC to the naked-POC list.
+//──────────────────────────────────────────────────────────────────────────────
+if vpEnabled and isNewVPSession and not na(vpSessHigh) and vpSessHigh > vpSessLow
+    // Recompute bins from the JUST-COMPLETED session's bars before computing
+    // prev-session POC/VAH/VAL. offset 1 = previous bar (last bar of prior
+    // session); offset bar_index - vpSessStart = first bar of prior session.
+    // The current bar (offset 0) is the first bar of the NEW session and
+    // must be excluded from prior-session aggregation.
+    recomputeBinsFromRaw(1, bar_index - vpSessStart)
+    [fPocIdx, fVaL, fVaH, fTotalV] = computeProfile(vpBins, vpRows, vpValueAreaP)
+    if fTotalV > 0
+        float fBinSize = (vpSessHigh - vpSessLow) / vpRows
+        float fPOC = vpSessLow + (fPocIdx + 0.5) * fBinSize
+        float fVAH = vpSessLow + (fVaH + 1) * fBinSize
+        float fVAL = vpSessLow + fVaL * fBinSize
+
+        // Save scalar levels.
+        prevSessPOC := fPOC
+        prevSessVAH := fVAH
+        prevSessVAL := fVAL
+        prevSessStartBar := vpSessStart
+        prevSessEndBar   := bar_index - 1
+
+        // POC bin sentiment — used to enrich confluence tags (pPOC(Bull/Bear)).
+        // 60%+ bull = Bull, 40%- bull = Bear, otherwise Neutral.
+        float fPocTotal = array.get(vpBins,     fPocIdx)
+        float fPocBull  = array.get(vpBinsBull, fPocIdx)
+        if fPocTotal > 0
+            float bullRatio = fPocBull / fPocTotal
+            prevSessPOCSentiment := bullRatio >= 0.6 ? 'Bull' : bullRatio <= 0.4 ? 'Bear' : 'Neutral'
+        else
+            prevSessPOCSentiment := 'Neutral'
+
+        // Replace previous-session drawings.
+        if not na(prevPocLine)
+            line.delete(prevPocLine)
+        if not na(prevVahLine)
+            line.delete(prevVahLine)
+        if not na(prevValLine)
+            line.delete(prevValLine)
+        if not na(prevPocLabel)
+            label.delete(prevPocLabel)
+        if not na(prevVahLabel)
+            label.delete(prevVahLabel)
+        if not na(prevValLabel)
+            label.delete(prevValLabel)
+
+        if vpShowPrev
+            prevPocLine := line.new(prevSessStartBar, fPOC, prevSessEndBar, fPOC, color = vpPrevPocColor, width = vpPrevLineWidth, style = line.style_solid, extend = extend.right)
+            prevVahLine := line.new(prevSessStartBar, fVAH, prevSessEndBar, fVAH, color = vpPrevVaColor,  width = 1, style = line.style_dotted, extend = extend.right)
+            prevValLine := line.new(prevSessStartBar, fVAL, prevSessEndBar, fVAL, color = vpPrevVaColor,  width = 1, style = line.style_dotted, extend = extend.right)
+            if vpShowLabels
+                int prevLabelBar = bar_index + 1
+                prevPocLabel := label.new(prevLabelBar, fPOC, 'pPOC ' + str.tostring(fPOC, format.mintick), style = label.style_label_left, color = vpPrevPocColor, textcolor = color.white, size = size.small)
+                prevVahLabel := label.new(prevLabelBar, fVAH, 'pVAH ' + str.tostring(fVAH, format.mintick), style = label.style_label_left, color = vpPrevVaColor,  textcolor = color.white, size = size.small)
+                prevValLabel := label.new(prevLabelBar, fVAL, 'pVAL ' + str.tostring(fVAL, format.mintick), style = label.style_label_left, color = vpPrevVaColor,  textcolor = color.white, size = size.small)
+
+        // Push the finalized POC onto the naked-POC list. NOTE: we store
+        // `bar_index` (the current bar = creation bar) — not `prevSessStartBar`
+        // — so the 1-bar grace period in the touch check actually works.
+        // Using `prevSessStartBar` here is the previously-shipped bug: the
+        // grace check `bar_index > created + 1` would have been true on the
+        // very first bar of the new session (since prevSessStartBar is way
+        // back), letting an opening-bar straddle invalidate the nPOC instantly.
+        if nPocEnabled
+            line nLine = line.new(prevSessStartBar, fPOC, bar_index, fPOC, color = nPocColor, width = 1, style = nPocStyle, extend = extend.right)
+            label nLabel = nPocLabels ? label.new(bar_index + 1, fPOC, 'nPOC ' + str.tostring(fPOC, format.mintick), style = label.style_label_left, color = nPocColor, textcolor = color.white, size = size.tiny) : na
+            array.push(nakedPOCs,            fPOC)
+            array.push(nakedPOCCreationBars, bar_index)
+            array.push(nakedPOCLines,        nLine)
+            array.push(nakedPOCLabels,       nLabel)
+
+            // Prune oldest if over the max-tracked limit.
+            while array.size(nakedPOCs) > nPocMax
+                array.shift(nakedPOCs)
+                array.shift(nakedPOCCreationBars)
+                line   oldL  = array.shift(nakedPOCLines)
+                label  oldLb = array.shift(nakedPOCLabels)
+                line.delete(oldL)
+                if not na(oldLb)
+                    label.delete(oldLb)
+
+//──────────────────────────────────────────────────────────────────────────────
+// 2) Naked POC touch check — remove any whose price was touched this bar.
+//    Skip the bar of creation (grace period) so a session-end straddle doesn't
+//    instantly invalidate the just-created POC.
+//──────────────────────────────────────────────────────────────────────────────
+if vpEnabled and nPocEnabled and barstate.isconfirmed and array.size(nakedPOCs) > 0
+    int origSz = array.size(nakedPOCs)
+    for n = 0 to origSz - 1
+        int idx = origSz - 1 - n
+        if idx < array.size(nakedPOCs)
+            int created = array.get(nakedPOCCreationBars, idx)
+            // 1-bar grace as documented — skip only the creation bar itself.
+            // (Previously `> created + 1` was actually a 2-bar grace.)
+            if bar_index > created
+                float p = array.get(nakedPOCs, idx)
+                if high >= p and low <= p
+                    line  oldL  = array.get(nakedPOCLines, idx)
+                    label oldLb = array.get(nakedPOCLabels, idx)
+                    line.delete(oldL)
+                    if not na(oldLb)
+                        label.delete(oldLb)
+                    array.remove(nakedPOCs,            idx)
+                    array.remove(nakedPOCCreationBars, idx)
+                    array.remove(nakedPOCLines,        idx)
+                    array.remove(nakedPOCLabels,       idx)
+
+//──────────────────────────────────────────────────────────────────────────────
+// 3) Session reset — clears developing-profile drawings refs (orphans them as
+//    historical), resets aggregates.
+//──────────────────────────────────────────────────────────────────────────────
+if vpEnabled and (isNewVPSession or na(vpSessHigh))
+    // Histogram boxes (vol + sentiment) are orphaned — they remain visible
+    // as historical profile reference, anchored at the past session's right
+    // edge (they don't intrude on the new session's chart space).
+    //
+    // HVN/LVN lines and per-bin volume labels, however, are session-specific
+    // markers that would either visually clutter subsequent sessions or
+    // accumulate against Pine's 500-label budget. Explicitly DELETE these
+    // on session reset rather than orphan them.
+    array.clear(vpBoxes)
+    array.clear(vpSentBoxes)
+    if array.size(vpHVNLines) > 0
+        for j = 0 to array.size(vpHVNLines) - 1
+            line.delete(array.get(vpHVNLines, j))
+        array.clear(vpHVNLines)
+    if array.size(vpBinLabels) > 0
+        for j = 0 to array.size(vpBinLabels) - 1
+            label.delete(array.get(vpBinLabels, j))
+        array.clear(vpBinLabels)
+    vpPocLine   := na
+    vpVahLine   := na
+    vpValLine   := na
+    vpPocLabel  := na
+    vpVahLabel  := na
+    vpValLabel  := na
+    vpHighLabel := na
+    vpLowLabel  := na
+    // Reset session aggregates.
+    vpSessHigh  := high
+    vpSessLow   := low
+    vpSessStart := bar_index
+    array.fill(vpBins,     0.0)
+    array.fill(vpBinsBull, 0.0)
+    currDevPOC := na
+    currDevVAH := na
+    currDevVAL := na
+    hvnCount := 0
+    lvnCount := 0
+    vpSessBarCount := 1
+    lastRecompHigh := na
+    lastRecompLow  := na
+else if vpEnabled
+    vpSessHigh := math.max(vpSessHigh, high)
+    vpSessLow  := math.min(vpSessLow, low)
+    if barstate.isconfirmed
+        vpSessBarCount := vpSessBarCount + 1
+
+//──────────────────────────────────────────────────────────────────────────────
+// 4) Bin recomputation — drift-free, incremental when stable.
+//    The previous v2.0 implementation did a full `recomputeBinsFromRaw` on
+//    every confirmed bar — correct but O(N²·R) cumulatively across a session.
+//    On extreme combos (Weekly+ anchor on M1 + vpRows=80) the late-session
+//    recomputes exceeded Pine's per-bar loop budget.
+//    The fix: only do a full recompute when the session range has actually
+//    changed since the last recompute. While the range is stable, just add
+//    the current bar's volume incrementally — bins are already aligned
+//    correctly. Typical session: 5-10 recomputes (early), N-K incrementals.
+//    Worst case (range expands every bar) degrades back to O(N²·R), same as
+//    before — but typical case becomes O(N·R), matching naive incremental
+//    approach in cost while remaining drift-free.
+//──────────────────────────────────────────────────────────────────────────────
+if vpEnabled and barstate.isconfirmed and not na(vpSessHigh) and vpSessHigh > vpSessLow
+    bool rangeChanged = na(lastRecompHigh) or na(lastRecompLow) or vpSessHigh != lastRecompHigh or vpSessLow != lastRecompLow
+    if rangeChanged
+        recomputeBinsFromRaw(0, bar_index - vpSessStart)
+        lastRecompHigh := vpSessHigh
+        lastRecompLow  := vpSessLow
+    else
+        accumulateCurrentBar()
+
+//──────────────────────────────────────────────────────────────────────────────
+// 5) Redraw developing profile on the chart's last bar.
+//    Gated so we only delete-and-rebuild the histogram boxes when something
+//    actually changed: (a) initial load, (b) bar advanced (new bar's first
+//    execution), or (c) the bar just closed and bins were updated. On a fast
+//    intraday chart this drops ~99% of redundant redraws while still keeping
+//    the histogram current.
+//──────────────────────────────────────────────────────────────────────────────
+vpHasData = array.sum(vpBins) > 0
+vpShouldRedraw = barstate.islast and (na(lastVpDrawBar) or bar_index != lastVpDrawBar or barstate.isconfirmed)
+if vpShouldRedraw and vpEnabled and vpHasData and not na(vpSessHigh) and vpSessHigh > vpSessLow
+    lastVpDrawBar := bar_index
+    // ── Cleanup current developing drawings ──────────────────────────────
+    if array.size(vpBoxes) > 0
+        for j = 0 to array.size(vpBoxes) - 1
+            box.delete(array.get(vpBoxes, j))
+        array.clear(vpBoxes)
+    if array.size(vpSentBoxes) > 0
+        for j = 0 to array.size(vpSentBoxes) - 1
+            box.delete(array.get(vpSentBoxes, j))
+        array.clear(vpSentBoxes)
+    if array.size(vpHVNLines) > 0
+        for j = 0 to array.size(vpHVNLines) - 1
+            line.delete(array.get(vpHVNLines, j))
+        array.clear(vpHVNLines)
+    if array.size(vpBinLabels) > 0
+        for j = 0 to array.size(vpBinLabels) - 1
+            label.delete(array.get(vpBinLabels, j))
+        array.clear(vpBinLabels)
+    if not na(vpPocLine)
+        line.delete(vpPocLine)
+    if not na(vpVahLine)
+        line.delete(vpVahLine)
+    if not na(vpValLine)
+        line.delete(vpValLine)
+    if not na(vpPocLabel)
+        label.delete(vpPocLabel)
+    if not na(vpVahLabel)
+        label.delete(vpVahLabel)
+    if not na(vpValLabel)
+        label.delete(vpValLabel)
+    if not na(vpHighLabel)
+        label.delete(vpHighLabel)
+    if not na(vpLowLabel)
+        label.delete(vpLowLabel)
+
+    // ── Compute profile metrics ─────────────────────────────────────────
+    [dPocIdx, dVaL, dVaH, dTotalV] = computeProfile(vpBins, vpRows, vpValueAreaP)
+
+    float maxBinVol = 0.0
+    float maxAbsBBP = 0.0
+    for i = 0 to vpRows - 1
+        float v = array.get(vpBins, i)
+        if v > maxBinVol
+            maxBinVol := v
+        float bbp = math.abs(2.0 * array.get(vpBinsBull, i) - v)
+        if bbp > maxAbsBBP
+            maxAbsBBP := bbp
+
+    float binSize  = (vpSessHigh - vpSessLow) / vpRows
+    float pocPrice = vpSessLow + (dPocIdx + 0.5) * binSize
+    float vahPrice = vpSessLow + (dVaH + 1) * binSize
+    float valPrice = vpSessLow + dVaL * binSize
+
+    currDevPOC := pocPrice
+    currDevVAH := vahPrice
+    currDevVAL := valPrice
+
+    // ── Layout: single histogram OR twin (sentiment + volume) ───────────
+    bool   twinMode      = vpProfileLayout == 'Twin (Volume + Sentiment)'
+    int    halfWidth     = math.max(2, vpHistWidth / 2 - 1)
+    int    profileLeftBar  = bar_index + 1
+
+    // In Twin mode: sentiment on the LEFT (closer to chart), volume on the
+    // RIGHT (further out). In Single mode: only the volume histogram is drawn.
+    int sentLeftBar  = profileLeftBar
+    int sentRightCap = profileLeftBar + halfWidth
+    int volLeftBar   = twinMode ? sentRightCap + 2 : profileLeftBar
+    int volRightCap  = volLeftBar + (twinMode ? halfWidth : vpHistWidth)
+    int profileRightCap = volRightCap   // for the right-edge labels
+
+    int lineLeft  = vpSessStart
+    int lineRight = bar_index
+
+    // ── Reset HVN/LVN counts so the dashboard reflects current profile ─
+    hvnCount := 0
+    lvnCount := 0
+
+    // ── Per-bin loop: sentiment box + volume box + HVN/LVN + bin labels ─
+    if maxBinVol > 0
+        for i = 0 to vpRows - 1
+            float v = array.get(vpBins, i)
+            if v > 0
+                float vBull = array.get(vpBinsBull, i)
+                float vBear = v - vBull
+                float bbp   = vBull - vBear       // signed net pressure
+                float LpM   = v / maxBinVol       // ratio to POC bin
+                float DpM   = maxAbsBBP > 0 ? math.abs(bbp) / maxAbsBBP : 0.0
+
+                float binLowPrice  = vpSessLow + i * binSize
+                float binHighPrice = binLowPrice + binSize
+                float binMidPrice  = binLowPrice + binSize * 0.5
+
+                // ── Sentiment histogram bin (twin layout only) ──────────
+                // Don't force a minimum width — let near-balanced bins be
+                // visually quiet rather than rounded up to a misleading 1-bar
+                // box.
+                if twinMode and vpShowHist and DpM > 0
+                    int sentBarW = math.round(DpM * halfWidth)
+                    if sentBarW > 0
+                        color sentColor = bbp > 0 ? vpTwinSentBull : bbp < 0 ? vpTwinSentBear : vpNeutralBinColor
+                        box sb = box.new(sentLeftBar, binHighPrice, sentLeftBar + sentBarW, binLowPrice, border_color = na, bgcolor = sentColor)
+                        array.push(vpSentBoxes, sb)
+
+                // ── Volume histogram bin ────────────────────────────────
+                int volBarW = math.round(LpM * (twinMode ? halfWidth : vpHistWidth))
+                if vpShowHist and volBarW > 0
+                    color volColor = vpOutFill
+                    if twinMode
+                        volColor := vpTwinVolColor    // neutral — sentiment is shown separately
+                    else if vpSentiment
+                        volColor := bbp > 0 ? vpBullBinColor : bbp < 0 ? vpBearBinColor : vpNeutralBinColor
+                    else
+                        bool inVA = i >= dVaL and i <= dVaH
+                        volColor := inVA ? vpVaFill : vpOutFill
+                    box vb = box.new(volLeftBar, binHighPrice, volLeftBar + volBarW, binLowPrice, border_color = na, bgcolor = volColor)
+                    array.push(vpBoxes, vb)
+
+                    // ── Per-bin volume label (optional) ─────────────────
+                    if vpShowBinLabels
+                        float pctOfSess = dTotalV > 0 ? v / dTotalV * 100.0 : 0.0
+                        string binText = str.tostring(v, format.volume) + ' (' + str.tostring(pctOfSess, '#.##') + '%)'
+                        label bl = label.new(volLeftBar + volBarW, binMidPrice, binText, style = label.style_none, textcolor = chart.fg_color, size = size.tiny, textalign = text.align_left)
+                        array.push(vpBinLabels, bl)
+
+                // ── HVN / LVN markers (skip the POC bin) ────────────────
+                // Always extend.none — these are session-bound markers, not
+                // forward-reference levels. Extending them right (alongside
+                // POC/VAH/VAL) would clutter subsequent sessions.
+                if vpShowHVN and i != dPocIdx
+                    if LpM >= vpHVNThreshold
+                        hvnCount += 1
+                        line hl = line.new(lineLeft, binMidPrice, lineRight, binMidPrice, color = vpHVNColor, width = 1, style = line.style_solid, extend = extend.none)
+                        array.push(vpHVNLines, hl)
+                    else if LpM <= vpLVNThreshold
+                        lvnCount += 1
+                        line ll = line.new(lineLeft, binMidPrice, lineRight, binMidPrice, color = vpLVNColor, width = 1, style = line.style_dotted, extend = extend.none)
+                        array.push(vpHVNLines, ll)
+
+    // ── POC / VAH / VAL across-session lines ─────────────────────────────
+    if vpShowPOC
+        vpPocLine := line.new(lineLeft, pocPrice, lineRight, pocPrice, color = vpPocColor, width = 2, extend = vpExtend ? extend.right : extend.none)
+    if vpShowVA
+        vpVahLine := line.new(lineLeft, vahPrice, lineRight, vahPrice, color = vpVaColor, width = 1, style = line.style_dashed, extend = vpExtend ? extend.right : extend.none)
+        vpValLine := line.new(lineLeft, valPrice, lineRight, valPrice, color = vpVaColor, width = 1, style = line.style_dashed, extend = vpExtend ? extend.right : extend.none)
+
+    // ── Right-edge POC/VAH/VAL price labels ──────────────────────────────
+    if vpShowLabels
+        int priceLabelBar = profileRightCap + 2
+        if vpShowPOC
+            vpPocLabel := label.new(priceLabelBar, pocPrice, 'POC ' + str.tostring(pocPrice, format.mintick), style = label.style_label_left, color = vpPocColor, textcolor = color.white, size = size.small)
+        if vpShowVA
+            vpVahLabel := label.new(priceLabelBar, vahPrice, 'VAH ' + str.tostring(vahPrice, format.mintick), style = label.style_label_left, color = vpVaColor, textcolor = color.white, size = size.small)
+            vpValLabel := label.new(priceLabelBar, valPrice, 'VAL ' + str.tostring(valPrice, format.mintick), style = label.style_label_left, color = vpVaColor, textcolor = color.white, size = size.small)
+
+    // ── Profile-edge labels: Profile High / Profile Low ─────────────────
+    if vpShowEdgeLabels and vpSessHigh > 0
+        float rangePct = (vpSessHigh - vpSessLow) / vpSessLow * 100.0
+        string totalLabel = vpSource == 'Money Flow' ? 'Total Money Flow: ' : 'Total Volume: '
+        string highTip = 'Profile High — ' + str.tostring(vpSessHigh, format.mintick) + '\n' + str.tostring(rangePct, '#.##') + '% above Profile Low\n' + totalLabel + str.tostring(dTotalV, format.volume) + '\nBars: ' + str.tostring(vpSessBarCount)
+        string lowTip  = 'Profile Low — '  + str.tostring(vpSessLow,  format.mintick) + '\n' + str.tostring(rangePct, '#.##') + '% below Profile High\n' + totalLabel + str.tostring(dTotalV, format.volume) + '\nBars: ' + str.tostring(vpSessBarCount)
+        vpHighLabel := label.new(lineRight, vpSessHigh, str.tostring(vpSessHigh, format.mintick), style = label.style_label_down, color = color.new(vpPocColor, 30), textcolor = color.white, size = size.small, tooltip = highTip)
+        vpLowLabel  := label.new(lineRight, vpSessLow,  str.tostring(vpSessLow,  format.mintick), style = label.style_label_up,   color = color.new(vpPocColor, 30), textcolor = color.white, size = size.small, tooltip = lowTip)
+
+//══════════════════════════════════════════════════════════════════════════════
+// ICEBERG / ABSORPTION DETECTION
+//══════════════════════════════════════════════════════════════════════════════
+// True iceberg orders need order-book data Pine cannot access. This is the
+// standard proxy: a bar with abnormally high volume but a narrow range,
+// closing at one extreme, has effectively "absorbed" supply or demand at a
+// single price — the footprint a resting iceberg leaves on a candlestick.
+
+// Top-level (non-conditional) so warmup is correct. We use the [1]-offset
+// trailing values — i.e., SMA and ATR computed through the PREVIOUS bar — so
+// the current bar's own volume/range doesn't dilute the threshold it's being
+// compared against. (A 2× volume spike was previously raising its own SMA,
+// causing the actual ratio to fall just under iceVolMult.)
+volSMA = ta.sma(volume, 20)[1]
+atr14  = ta.atr(14)[1]
+
+// Reset session counter on the same anchor as VP.
+if isNewVPSession
+    iceCount := 0
+
+if iceEnabled and barstate.isconfirmed and not na(volSMA) and volSMA > 0 and not na(atr14) and atr14 > 0
+    float barRange = high - low
+    if barRange > 0
+        bool volSpike   = volume > iceVolMult * volSMA
+        bool narrowRange = barRange < iceRangeMult * atr14
+        bool closeHigh  = close >= high - iceCloseThreshold * barRange
+        bool closeLow   = close <= low  + iceCloseThreshold * barRange
+
+        // Mutually exclusive — at iceCloseThreshold = 0.5 a doji bar (close
+        // exactly at midpoint) would satisfy BOTH closeHigh AND closeLow.
+        // Skip both rather than arbitrarily picking Bull, since a midpoint
+        // close is genuinely ambiguous (neither side absorbed).
+        bool isBullIce = volSpike and narrowRange and closeHigh and not closeLow
+        bool isBearIce = volSpike and narrowRange and closeLow  and not closeHigh
+
+        if isBullIce or isBearIce
+            string confluence = levelsInBar(low, high, 0)
+            bool hasConf = str.length(confluence) > 0
+            if not iceRequireConf or hasConf
+                bool   isBull = isBullIce
+                color  c      = isBull ? iceBullColor : iceBearColor
+                float  yPos   = isBull ? low : high
+                string typeS  = isBull ? 'Bull' : 'Bear'
+                string txt    = iceMarkerText + (hasConf ? ' ★' : '')
+                string tip    = 'Iceberg ' + typeS + ' Absorption\n' + 'Volume: ' + str.tostring(volume / volSMA, '#.#') + 'x avg\n' + 'Range: ' + str.tostring(barRange / atr14, '#.##') + ' ATR\n' + 'Close: ' + str.tostring((close - low) / barRange * 100, '#') + '% of bar' + (hasConf ? '\nLevels: ' + confluence : '')
+                label.new(bar_index, yPos, txt, style = isBull ? label.style_label_up : label.style_label_down, color = c, textcolor = color.white, size = getLabelSize(iceMarkerSize), tooltip = tip)
+
+                iceCount    := iceCount + 1
+                lastIceBar  := bar_index
+                lastIceType := typeS
+                lastIceConf := hasConf
+
+                if iceAlertEnabled
+                    alert(typeS + 'ish Iceberg' + (hasConf ? ' | ' + confluence : ''), alert.freq_once_per_bar_close)
+
+//══════════════════════════════════════════════════════════════════════════════
+// DASHBOARD
+//══════════════════════════════════════════════════════════════════════════════
+if showDash and barstate.islast
+    if na(dashTable)
+        dashTable := table.new(getDashPosition(dashPos), 2, 20, bgcolor = color.new(color.black, 70), border_width = 1, border_color = color.new(color.gray, 60), frame_width = 1, frame_color = color.new(color.gray, 40))
+
+    color hdrBg = color.new(color.gray, 50)
+    color rowBg = color.new(color.black, 50)
+    color lblTx = color.new(color.white, 0)
+
+    // Header.
+    table.cell(dashTable, 0, 0, 'SMT+VP+Ice', text_color = color.white, text_size = dashTxtSz, bgcolor = hdrBg)
+    table.cell(dashTable, 1, 0, 'v2.1',       text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
+
+    // Current developing levels.
+    table.cell(dashTable, 0, 1, 'Curr POC', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 1, na(currDevPOC) ? '—' : str.tostring(currDevPOC, format.mintick), text_color = vpPocColor, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 2, 'Curr VAH', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 2, na(currDevVAH) ? '—' : str.tostring(currDevVAH, format.mintick), text_color = vpVaColor, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 3, 'Curr VAL', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 3, na(currDevVAL) ? '—' : str.tostring(currDevVAL, format.mintick), text_color = vpVaColor, text_size = dashTxtSz, bgcolor = rowBg)
+
+    // Previous session.
+    string prevPocCell = na(prevSessPOC) ? '—' : str.tostring(prevSessPOC, format.mintick) + (na(prevSessPOCSentiment) or prevSessPOCSentiment == 'Neutral' ? '' : ' (' + prevSessPOCSentiment + ')')
+    color  prevPocCol  = na(prevSessPOC) ? color.gray : (prevSessPOCSentiment == 'Bull' ? GREEN : prevSessPOCSentiment == 'Bear' ? RED : vpPrevPocColor)
+    table.cell(dashTable, 0, 4, 'Prev POC', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 4, prevPocCell, text_color = prevPocCol, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 5, 'Prev VAH', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 5, na(prevSessVAH) ? '—' : str.tostring(prevSessVAH, format.mintick), text_color = vpPrevVaColor,  text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 6, 'Prev VAL', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 6, na(prevSessVAL) ? '—' : str.tostring(prevSessVAL, format.mintick), text_color = vpPrevVaColor,  text_size = dashTxtSz, bgcolor = rowBg)
+
+    // Price vs prior Value Area.
+    string vaPosTxt = '—'
+    color  vaPosCol = color.gray
+    if not na(prevSessVAH) and not na(prevSessVAL)
+        if close > prevSessVAH
+            vaPosTxt := 'Above'
+            vaPosCol := GREEN
+        else if close < prevSessVAL
+            vaPosTxt := 'Below'
+            vaPosCol := RED
+        else
+            vaPosTxt := 'Inside'
+            vaPosCol := GOLD
+    table.cell(dashTable, 0, 7, 'Price vs pVA', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 7, vaPosTxt, text_color = vaPosCol, text_size = dashTxtSz, bgcolor = rowBg)
+
+    // AVWAP and σ levels (current bar — uses live projection).
+    table.cell(dashTable, 0, 8, 'AVWAP', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 8, na(avwap) ? '—' : str.tostring(avwap, format.mintick), text_color = avwapColor, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 9, '±' + str.tostring(sigma1Mult, '#.#') + 'σ', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 9, na(avwapU1) ? '—' : str.tostring(avwapL1, format.mintick) + ' / ' + str.tostring(avwapU1, format.mintick), text_color = sigma1Color, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 10, '±' + str.tostring(sigma2Mult, '#.#') + 'σ', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 10, na(avwapU2) ? '—' : str.tostring(avwapL2, format.mintick) + ' / ' + str.tostring(avwapU2, format.mintick), text_color = sigma2Color, text_size = dashTxtSz, bgcolor = rowBg)
+
+    // Naked POC count.
+    table.cell(dashTable, 0, 11, 'Naked POCs', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 11, str.tostring(array.size(nakedPOCs)), text_color = nPocColor, text_size = dashTxtSz, bgcolor = rowBg)
+
+    // Last SMT events.
+    string bullTxt = na(lastBullBar) ? '—' : lastBullSym + ' (' + str.tostring(bar_index - lastBullBar) + ' bars ago)' + (lastBullConf ? ' ★' : '')
+    string bearTxt = na(lastBearBar) ? '—' : lastBearSym + ' (' + str.tostring(bar_index - lastBearBar) + ' bars ago)' + (lastBearConf ? ' ★' : '')
+    table.cell(dashTable, 0, 12, 'Last Bull SMT', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 12, bullTxt, text_color = bullColor, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 13, 'Last Bear SMT', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 13, bearTxt, text_color = bearColor, text_size = dashTxtSz, bgcolor = rowBg)
+
+    // Iceberg / absorption stats.
+    string iceTxt = na(lastIceBar) ? '—' : lastIceType + ' (' + str.tostring(bar_index - lastIceBar) + ' bars ago)' + (lastIceConf ? ' ★' : '')
+    color  iceCol = na(lastIceBar) ? color.gray : (lastIceType == 'Bull' ? iceBullColor : iceBearColor)
+    table.cell(dashTable, 0, 14, 'Icebergs (sess)', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 14, str.tostring(iceCount), text_color = iceCount > 0 ? color.white : color.gray, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 15, 'Last Iceberg', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 15, iceTxt, text_color = iceCol, text_size = dashTxtSz, bgcolor = rowBg)
+
+    // Session sentiment summary (developing-session bull/bear split).
+    float sessTotal = array.sum(vpBins)
+    float sessBull  = array.sum(vpBinsBull)
+    float bullPct   = sessTotal > 0 ? sessBull / sessTotal * 100 : na
+    string sentTxt  = na(bullPct) ? '—' : str.tostring(bullPct, '#') + '% Bull / ' + str.tostring(100 - bullPct, '#') + '% Bear'
+    color  sentCol  = na(bullPct) ? color.gray : (bullPct >= 55 ? GREEN : bullPct <= 45 ? RED : GOLD)
+    table.cell(dashTable, 0, 16, 'Sentiment', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 16, sentTxt, text_color = sentCol, text_size = dashTxtSz, bgcolor = rowBg)
+
+    // HVN / LVN counts (developing-session). Shows '—' if HVN tracking is off.
+    string hvnTxt = vpShowHVN ? str.tostring(hvnCount) + ' / ' + str.tostring(lvnCount) : '—'
+    table.cell(dashTable, 0, 17, 'HVN / LVN', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 17, hvnTxt, text_color = vpShowHVN ? color.white : color.gray, text_size = dashTxtSz, bgcolor = rowBg)
+
+    // Footer hint.
+    table.cell(dashTable, 0, 18, 'Session',  text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 18, vpAnchorIn, text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 19, '★ = confluence', text_color = color.new(color.white, 50), text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 19, '', text_color = color.new(color.white, 50), text_size = dashTxtSz, bgcolor = rowBg)
+
+//══════════════════════════════════════════════════════════════════════════════
+// ANCHORED VWAP — PLOTS
+//══════════════════════════════════════════════════════════════════════════════
+// Break the line at session boundaries by plotting na on the first bar of
+// a new session. The AVWAP value itself is correctly reset above, but Pine's
+// plot() would otherwise connect last-bar-of-prev-session to first-bar-of-new.
+plotAvwap = avwapEnabled and not isNewVPSession ? avwap   : na
+plotU1    = avwapEnabled and showSigma1 and not isNewVPSession ? avwapU1 : na
+plotL1    = avwapEnabled and showSigma1 and not isNewVPSession ? avwapL1 : na
+plotU2    = avwapEnabled and showSigma2 and not isNewVPSession ? avwapU2 : na
+plotL2    = avwapEnabled and showSigma2 and not isNewVPSession ? avwapL2 : na
+plotU3    = avwapEnabled and showSigma3 and not isNewVPSession ? avwapU3 : na
+plotL3    = avwapEnabled and showSigma3 and not isNewVPSession ? avwapL3 : na
+
+avwapPlot = plot(plotAvwap, 'AVWAP',    color = avwapColor,  linewidth = avwapWidth)
+u1Plot    = plot(plotU1,    'AVWAP +1σ', color = sigma1Color, linewidth = 1)
+l1Plot    = plot(plotL1,    'AVWAP -1σ', color = sigma1Color, linewidth = 1)
+u2Plot    = plot(plotU2,    'AVWAP +2σ', color = sigma2Color, linewidth = 1)
+l2Plot    = plot(plotL2,    'AVWAP -2σ', color = sigma2Color, linewidth = 1)
+u3Plot    = plot(plotU3,    'AVWAP +3σ', color = sigma3Color, linewidth = 1)
+l3Plot    = plot(plotL3,    'AVWAP -3σ', color = sigma3Color, linewidth = 1)
+
+fill(u1Plot, l1Plot, color = fillBands and showSigma1 ? color.new(sigma1Color, fillOpacity) : na, title = '1σ Fill')
+fill(u2Plot, u1Plot, color = fillBands and showSigma2 and showSigma1 ? color.new(sigma2Color, fillOpacity) : na, title = 'Upper 1σ→2σ Fill')
+fill(l1Plot, l2Plot, color = fillBands and showSigma2 and showSigma1 ? color.new(sigma2Color, fillOpacity) : na, title = 'Lower 1σ→2σ Fill')
+fill(u3Plot, u2Plot, color = fillBands and showSigma3 and showSigma2 ? color.new(sigma3Color, fillOpacity) : na, title = 'Upper 2σ→3σ Fill')
+fill(l2Plot, l3Plot, color = fillBands and showSigma3 and showSigma2 ? color.new(sigma3Color, fillOpacity) : na, title = 'Lower 2σ→3σ Fill')
