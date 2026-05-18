@@ -1,4 +1,4 @@
-// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v2.5]
+// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v2.6]
 // Smart Money Technique (multi-symbol divergence) + session Volume Profile
 // with previous-session levels, naked POC tracking, confluence alerts, status
 // dashboard, session-anchored VWAP with σ bands, and iceberg/absorption
@@ -38,6 +38,18 @@
 //          of every realtime tick. Bins only update on `barstate.isconfirmed`,
 //          so the previous every-tick delete-and-rebuild of ~24 boxes
 //          produced identical output. Tracked via `lastVpDrawBar` var.
+// v2.6 — SMT confluence on historical bars actually works now:
+//        v2.5 added the currDev check to `checkConfluence` but missed the
+//        timing issue: `currDevPOC/VAH/VAL` were only set inside the redraw
+//        block (gated by `barstate.islast`), so on historical bars they
+//        stayed `na`. The new check `not na(currDevPOC) and ...` silently
+//        evaluated false for every historical SMT pivot.
+//        Fix: publish `currDevPOC/VAH/VAL` from section 4 (`barstate.is
+//        confirmed`) so they're current on every closed bar — historical
+//        and realtime. Now SMT pivots in the chart's history that sat on
+//        the developing POC at THAT bar's time will correctly show ★.
+//        (Redraw block still computes them too for its own drawing — same
+//        values, minor duplication for code clarity.)
 // v2.5 — SMT confluence gap fixed:
 //        • `checkConfluence` (used by SMT pivot evaluation) now also checks
 //          the CURRENT developing-session POC/VAH/VAL levels. Previously
@@ -246,7 +258,7 @@
 // Best paired with VP/AVWAP confluence gating for high-quality signals.
 
 //@version=6
-indicator('SMT + VP + AVWAP + Ice [v2.5]', 'SMT+VP2.5', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
+indicator('SMT + VP + AVWAP + Ice [v2.6]', 'SMT+VP2.6', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -1283,6 +1295,22 @@ if vpEnabled and barstate.isconfirmed and not na(vpSessHigh) and vpSessHigh > vp
     else
         accumulateCurrentBar()
 
+    // Publish current developing POC/VAH/VAL on EVERY confirmed bar so SMT
+    // confluence (which evaluates `currDevPOC/VAH/VAL`) sees real values on
+    // historical pivots, not just the realtime bar. Previously these were
+    // only set inside the redraw block (gated by `barstate.islast`), which
+    // meant historical SMT pivots saw `na` and silently skipped currDev
+    // confluence — visible ★ only fired on iceberg detection (which runs
+    // AFTER the redraw block) but never on SMT (which runs BEFORE).
+    // Note: redraw block also computes these for its own histogram drawing.
+    // Same values, minor duplication for clarity.
+    if array.sum(vpBins) > 0
+        [cPocIdx, cVaL, cVaH, _cTotal] = computeProfile(vpBins, vpRows, vpValueAreaP)
+        float cBinSize = (vpSessHigh - vpSessLow) / vpRows
+        currDevPOC := vpSessLow + (cPocIdx + 0.5) * cBinSize
+        currDevVAH := vpSessLow + (cVaH + 1) * cBinSize
+        currDevVAL := vpSessLow + cVaL * cBinSize
+
     // Developing POC trail — find this-bar's POC and append to the trail.
     if vpDevPocTrail
         int   barPocIdx = 0
@@ -1588,7 +1616,7 @@ if showDash and barstate.islast
 
     // Header.
     table.cell(dashTable, 0, 0, 'SMT+VP+Ice', text_color = color.white, text_size = dashTxtSz, bgcolor = hdrBg)
-    table.cell(dashTable, 1, 0, 'v2.5',       text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
+    table.cell(dashTable, 1, 0, 'v2.6',       text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
 
     // Current developing levels.
     table.cell(dashTable, 0, 1, 'Curr POC', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
