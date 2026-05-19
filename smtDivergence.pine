@@ -912,7 +912,18 @@ accumulateCurrentBar() =>
 // drift-free at finalize time, so the snapshot IS the accurate distribution).
 // Cost: O(N_sessions × vpRows²) — called only on session finalize so the
 // per-bar amortised cost is negligible.
+//
+// Pine v6 forbids modifying global scalar `var`s from inside user-defined
+// functions, so this returns a 5-tuple [rangeHigh, rangeLow, POC, VAH, VAL]
+// and the caller assigns to the globals. The composite BIN array IS mutated
+// in-place — that's allowed because array contents are reference-mutable
+// (only scalar reassignment is forbidden).
 recomputeComposite() =>
+    float retHigh = na
+    float retLow  = na
+    float retPOC  = na
+    float retVAH  = na
+    float retVAL  = na
     int nSess = matrix.rows(compositeSessionBins)
     if nSess > 0
         float cHigh = -1.0e30
@@ -920,8 +931,8 @@ recomputeComposite() =>
         for i = 0 to nSess - 1
             cHigh := math.max(cHigh, array.get(compositeSessionHighs, i))
             cLow  := math.min(cLow,  array.get(compositeSessionLows,  i))
-        compositeRangeHigh := cHigh
-        compositeRangeLow  := cLow
+        retHigh := cHigh
+        retLow  := cLow
         array.fill(compositeBins, 0.0)
         if cHigh > cLow
             float compBinSize = (cHigh - cLow) / vpRows
@@ -944,10 +955,10 @@ recomputeComposite() =>
                                     array.set(compositeBins, k, array.get(compositeBins, k) + bV * ratio)
             [cPocIdx, cVaL, cVaH, cTotalV] = computeProfile(compositeBins, vpRows, vpValueAreaP)
             if cTotalV > 0
-                compositePOC := cLow + (cPocIdx + 0.5) * compBinSize
-                compositeVAH := cLow + (cVaH + 1) * compBinSize
-                compositeVAL := cLow + cVaL * compBinSize
-    0
+                retPOC := cLow + (cPocIdx + 0.5) * compBinSize
+                retVAH := cLow + (cVaH + 1) * compBinSize
+                retVAL := cLow + cVaL * compBinSize
+    [retHigh, retLow, retPOC, retVAH, retVAL]
 
 //══════════════════════════════════════════════════════════════════════════════
 // HELPERS — confluence
@@ -1407,7 +1418,14 @@ if vpEnabled and isNewVPSession and not na(vpSessHigh) and vpSessHigh > vpSessLo
                 matrix.remove_row(compositeSessionBins, 0)
                 array.shift(compositeSessionHighs)
                 array.shift(compositeSessionLows)
-            recomputeComposite()
+            // Pine v6 forbids the function from reassigning scalar globals,
+            // so it returns a 5-tuple — we assign here at the call site.
+            [cRH, cRL, cP, cVH, cVL] = recomputeComposite()
+            compositeRangeHigh := cRH
+            compositeRangeLow  := cRL
+            compositePOC       := cP
+            compositeVAH       := cVH
+            compositeVAL       := cVL
             // Replace composite drawings.
             if not na(compositePocLine)
                 line.delete(compositePocLine)
