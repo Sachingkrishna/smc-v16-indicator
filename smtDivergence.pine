@@ -429,7 +429,7 @@ vpPrevLineWidth = input.int(2, 'Prev POC Line Width', minval = 1, maxval = 4, gr
 // (untested individuals) and prev-session levels (most recent only).
 grpVPComp           = 'Composite Volume Profile'
 vpCompositeEnabled  = input.bool(true, 'Show Composite Profile', tooltip = 'Aggregates last N completed sessions into a unified profile. Yields composite POC/VAH/VAL as HTF reference levels. Updates on every session finalize.', group = grpVPComp)
-vpCompositeSessions = input.int(5, 'Sessions to Aggregate', minval = 2, maxval = 20, tooltip = 'Number of completed sessions to include. Higher = smoother HTF reference but slower to adapt to regime change. Cost is O(N × rows²) per session-finalize — at vpRows=80 and N=20 that is 128k ops, within Pine''s loop budget but at the edge. Use defaults unless you need finer resolution.', group = grpVPComp)
+vpCompositeSessions = input.int(5, 'Sessions to Aggregate', minval = 2, maxval = 20, tooltip = 'Number of completed sessions to include. Higher = smoother HTF reference but slower to adapt to regime change. Cost is O(N × rows²) per session-finalize — at vpRows=80 and N=20 that is 128k ops, within the Pine loop budget but at the edge. Use defaults unless you need finer resolution.', group = grpVPComp)
 vpCompositePocColor = input.color(color.new(GOLD, 20), 'Composite POC Color', group = grpVPComp)
 vpCompositeVaColor  = input.color(color.new(BLUE, 20), 'Composite VAH/VAL Color', group = grpVPComp)
 vpCompositeWidth    = input.int(3, 'Composite POC Line Width', minval = 1, maxval = 5, group = grpVPComp)
