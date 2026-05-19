@@ -1,4 +1,4 @@
-// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v2.8]
+// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v2.9]
 // Smart Money Technique (multi-symbol divergence) + session Volume Profile
 // with previous-session levels, naked POC tracking, confluence alerts, status
 // dashboard, session-anchored VWAP with σ bands, and iceberg/absorption
@@ -38,6 +38,26 @@
 //          of every realtime tick. Bins only update on `barstate.isconfirmed`,
 //          so the previous every-tick delete-and-rebuild of ~24 boxes
 //          produced identical output. Tracked via `lastVpDrawBar` var.
+// v2.9 — Iceberg confluence string moved inside the conditional. v2.8's
+//        rejection of this fix was overcautious. The reasoning was: "Pine
+//        v6 warns about conditional historical-series access". True in
+//        general — but that warning applies to functions whose OWN
+//        internal state depends on cumulative history (calling ta.*,
+//        holding var arrays, etc.). `levelsInBar` is a pure read function:
+//        no var, no ta.* calls — it only reads global series via
+//        [barOffset] and builds a string. The global series Pine
+//        maintains are unaffected by `levelsInBar`'s call frequency, so
+//        calling it only on iceberg-firing bars produces identical
+//        output. The hoist was a real concern for the smtBearConf /
+//        smtBullConf pre-computes (which `checkConfluence` also reads
+//        globals from but those happen to early-return on `na(price)`
+//        so the cost is minimal anyway) — but for `iceConfluence` low/
+//        high are never na on confirmed bars, so the full body was
+//        running every bar. Now skipped on the 99%+ of bars where no
+//        iceberg fires. Worst case if Pine v6 still emits a cosmetic
+//        warning: yellow squiggle in editor; output remains correct.
+//        Credit: user pushed back on v2.8's rejection — "the warning
+//        doesn't create any incorrect value right?" Correct call.
 // v2.8 — Post-v2.7 polish (carry-forward items flagged by code review):
 //        • Header line 1 was still '[v2.6]'. v2.7 bumped the indicator()
 //          declaration and the dashboard version cell but missed the
@@ -296,7 +316,7 @@
 // Best paired with VP/AVWAP confluence gating for high-quality signals.
 
 //@version=6
-indicator('SMT + VP + AVWAP + Ice [v2.8]', 'SMT+VP2.8', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
+indicator('SMT + VP + AVWAP + Ice [v2.9]', 'SMT+VP2.9', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -1609,11 +1629,6 @@ if vpShouldRedraw and vpEnabled and vpHasData and not na(vpSessHigh) and vpSessH
 volSMA = ta.sma(volume, 20)[1]
 atr14  = ta.atr(14)[1]
 
-// Pre-compute the iceberg confluence string at top-level scope so Pine
-// doesn't warn about conditional invocation of `levelsInBar` (which
-// references avwap[] series).
-string iceConfluence = levelsInBar(low, high, 0)
-
 // Reset session counter on the same anchor as VP.
 if isNewVPSession
     iceCount := 0
@@ -1634,7 +1649,20 @@ if iceEnabled and barstate.isconfirmed and not na(volSMA) and volSMA > 0 and not
         bool isBearIce = volSpike and narrowRange and closeLow  and not closeHigh
 
         if isBullIce or isBearIce
-            string confluence = iceConfluence   // pre-computed at top-level for Pine consistency
+            // v2.9: `levelsInBar()` moved inside the iceberg conditional so
+            // the per-bar string concat work is skipped on the 99%+ of bars
+            // where no iceberg fires. Earlier versions hoisted this to
+            // top-level alongside smtBearConf/smtBullConf citing the Pine v6
+            // "may develop gaps in internal series history" warning — but
+            // that warning applies to functions whose OWN INTERNAL state
+            // depends on cumulative history (those calling ta.* or holding
+            // var arrays). `levelsInBar` is a pure read function: it only
+            // reads global series via [barOffset] and concatenates a
+            // string. The globals it reads are maintained by Pine regardless
+            // of call frequency, so calling it only on iceberg-firing bars
+            // returns identical values. v2.8 was overcautious in keeping
+            // this hoisted — fixed in v2.9.
+            string confluence = levelsInBar(low, high, 0)
             bool hasConf = str.length(confluence) > 0
             if not iceRequireConf or hasConf
                 bool   isBull = isBullIce
@@ -1666,7 +1694,7 @@ if showDash and barstate.islast
 
     // Header.
     table.cell(dashTable, 0, 0, 'SMT+VP+Ice', text_color = color.white, text_size = dashTxtSz, bgcolor = hdrBg)
-    table.cell(dashTable, 1, 0, 'v2.8',       text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
+    table.cell(dashTable, 1, 0, 'v2.9',       text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
 
     // Current developing levels.
     table.cell(dashTable, 0, 1, 'Curr POC', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
