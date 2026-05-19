@@ -1,4 +1,4 @@
-// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v2.9]
+// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v3.0]
 // Smart Money Technique (multi-symbol divergence) + session Volume Profile
 // with previous-session levels, naked POC tracking, confluence alerts, status
 // dashboard, session-anchored VWAP with σ bands, and iceberg/absorption
@@ -38,6 +38,38 @@
 //          of every realtime tick. Bins only update on `barstate.isconfirmed`,
 //          so the previous every-tick delete-and-rebuild of ~24 boxes
 //          produced identical output. Tracked via `lastVpDrawBar` var.
+// v3.0 — Composite (multi-session) Volume Profile + confluence refinements.
+//        ── Main feature: Composite VP. ──
+//        Aggregates the last N completed sessions into a single profile on
+//        a unified price grid. Yields composite POC/VAH/VAL — an HTF
+//        "where the cluster of attention is" reference, distinct from:
+//          • prev-session levels (only the most recent session)
+//          • naked POCs (individual untested POCs, no aggregation)
+//        Each completed session's vpBins array is snapshotted into a
+//        rolling matrix (max N rows). On every session finalize the matrix
+//        is re-aggregated onto a fresh unified grid spanning all tracked
+//        sessions' ranges, with overlap-ratio bin distribution to preserve
+//        accuracy across mismatched session ranges. Cost is O(N × rows²)
+//        per session-finalize (≤ 128k ops at upper limits) — well within
+//        Pine's loop budget since recompute happens once per session.
+//        Confluence: SMT pivots and icebergs at composite levels now tag
+//        as `cPOC` / `cVAH` / `cVAL`, distinct from `POC`/`VAH`/`VAL`
+//        (current) and `pPOC`/`pVAH`/`pVAL` (immediately-prior).
+//        Dashboard: three new rows (Comp POC / Comp VAH / Comp VAL)
+//        inserted after Prev VAL. Row count 21 → 24.
+//        Drawing: composite POC drawn solid thick gold (default), VAH/VAL
+//        dashed blue. Anchored at the most-recent session end with
+//        extend.right — sits alongside prev-session lines on the chart.
+//
+//        ── Confluence system refinements: ──
+//        • Confluence STRENGTH count surfaced. Was: ★ (binary). Now: ★N
+//          where N = number of tag words in the confluence string.
+//          A pivot tagged "POC pPOC(Bull) AVWAP +1.0σ" displays as ★4
+//          instead of ★. Differentiates strong-confluence pivots from
+//          single-tag ones at a glance on label + dashboard + alert.
+//        • Naked-POC iteration no longer breaks on first match. A pivot
+//          between two nPOCs (e.g., 1.33995 + 1.34005 with confTicks=10)
+//          now tags BOTH. Same fix in `levelsInBar`.
 // v2.9 — Iceberg confluence string moved inside the conditional. v2.8's
 //        rejection of this fix was overcautious. The reasoning was: "Pine
 //        v6 warns about conditional historical-series access". True in
@@ -316,7 +348,7 @@
 // Best paired with VP/AVWAP confluence gating for high-quality signals.
 
 //@version=6
-indicator('SMT + VP + AVWAP + Ice [v2.9]', 'SMT+VP2.9', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
+indicator('SMT + VP + AVWAP + Ice [v3.0]', 'SMT+VP3.0', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -387,6 +419,21 @@ vpShowPrev      = input.bool(true, 'Show Previous Session POC/VAH/VAL', group = 
 vpPrevPocColor  = input.color(color.new(GOLD, 20), 'Prev POC Color', group = grpPrev)
 vpPrevVaColor   = input.color(color.new(BLUE, 20), 'Prev VAH/VAL Color', group = grpPrev)
 vpPrevLineWidth = input.int(2, 'Prev POC Line Width', minval = 1, maxval = 4, group = grpPrev)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Inputs — Composite / Multi-session Volume Profile (v3.0)
+//──────────────────────────────────────────────────────────────────────────────
+// Composite VP aggregates the last N completed sessions into a single
+// profile on a unified price grid. Yields a "where attention clustered
+// over multiple sessions" HTF reference — complements naked POCs
+// (untested individuals) and prev-session levels (most recent only).
+grpVPComp           = 'Composite Volume Profile'
+vpCompositeEnabled  = input.bool(true, 'Show Composite Profile', tooltip = 'Aggregates last N completed sessions into a unified profile. Yields composite POC/VAH/VAL as HTF reference levels. Updates on every session finalize.', group = grpVPComp)
+vpCompositeSessions = input.int(5, 'Sessions to Aggregate', minval = 2, maxval = 20, tooltip = 'Number of completed sessions to include. Higher = smoother HTF reference but slower to adapt to regime change. Cost is O(N × rows²) per session-finalize — at vpRows=80 and N=20 that is 128k ops, within Pine''s loop budget but at the edge. Use defaults unless you need finer resolution.', group = grpVPComp)
+vpCompositePocColor = input.color(color.new(GOLD, 20), 'Composite POC Color', group = grpVPComp)
+vpCompositeVaColor  = input.color(color.new(BLUE, 20), 'Composite VAH/VAL Color', group = grpVPComp)
+vpCompositeWidth    = input.int(3, 'Composite POC Line Width', minval = 1, maxval = 5, group = grpVPComp)
+vpShowCompositeLabels = input.bool(true, 'Show Composite Labels', group = grpVPComp)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Inputs — Volume Profile Advanced (Money Flow, Sentiment, HVN/LVN)
@@ -652,16 +699,19 @@ var int    lastBullBar = na
 var string lastBullSym = ''
 var float  lastBullPrice = na
 var bool   lastBullConf = false
+var int    lastBullConfCount = 0     // v3.0: confluence tag count for ★N display
 var int    lastBearBar = na
 var string lastBearSym = ''
 var float  lastBearPrice = na
 var bool   lastBearConf = false
+var int    lastBearConfCount = 0     // v3.0
 
 // Iceberg tracking — session count + last event.
 var int    iceCount    = 0
 var int    lastIceBar  = na
 var string lastIceType = ''   // 'Bull' or 'Bear'
 var bool   lastIceConf = false
+var int    lastIceConfCount = 0      // v3.0
 
 // VP session aggregates.
 var float vpSessHigh  = na
@@ -738,6 +788,28 @@ var line   prevValLine  = na
 var label  prevPocLabel = na
 var label  prevVahLabel = na
 var label  prevValLabel = na
+
+// Composite VP — last N completed sessions aggregated into a unified
+// profile (v3.0). Each completed session's vpBins is snapshotted as a row
+// of `compositeSessionBins`; per-session high/low stored in parallel
+// arrays so the merge step can distribute bins onto the unified composite
+// grid via overlap ratios. Matrix initialized at vpRows columns so
+// `matrix.add_row` accepts the snapshotted vpBins arrays.
+var matrix<float> compositeSessionBins = matrix.new<float>(0, vpRows, 0.0)
+var array<float>  compositeSessionHighs = array.new<float>()
+var array<float>  compositeSessionLows  = array.new<float>()
+var array<float>  compositeBins         = array.new<float>(vpRows, 0.0)
+var float compositePOC       = na
+var float compositeVAH       = na
+var float compositeVAL       = na
+var float compositeRangeHigh = na
+var float compositeRangeLow  = na
+var line   compositePocLine  = na
+var line   compositeVahLine  = na
+var line   compositeValLine  = na
+var label  compositePocLabel = na
+var label  compositeVahLabel = na
+var label  compositeValLabel = na
 
 // Naked POC tracking — each entry is a session-finalized POC that hasn't been
 // re-touched yet. Parallel arrays for price, creation bar (= the bar where the
@@ -830,6 +902,54 @@ accumulateCurrentBar() =>
     0
 
 //══════════════════════════════════════════════════════════════════════════════
+// HELPERS — Composite VP (v3.0)
+//══════════════════════════════════════════════════════════════════════════════
+// Re-aggregate all stored session bins onto a unified composite price grid
+// spanning [min(all session lows), max(all session highs)]. Each session's
+// bins are redistributed onto the composite grid via overlap ratios — same
+// math as recomputeBinsFromRaw, but the source is per-session-bin snapshots
+// rather than raw bar history (each session was already recomputed
+// drift-free at finalize time, so the snapshot IS the accurate distribution).
+// Cost: O(N_sessions × vpRows²) — called only on session finalize so the
+// per-bar amortised cost is negligible.
+recomputeComposite() =>
+    int nSess = matrix.rows(compositeSessionBins)
+    if nSess > 0
+        float cHigh = -1.0e30
+        float cLow  =  1.0e30
+        for i = 0 to nSess - 1
+            cHigh := math.max(cHigh, array.get(compositeSessionHighs, i))
+            cLow  := math.min(cLow,  array.get(compositeSessionLows,  i))
+        compositeRangeHigh := cHigh
+        compositeRangeLow  := cLow
+        array.fill(compositeBins, 0.0)
+        if cHigh > cLow
+            float compBinSize = (cHigh - cLow) / vpRows
+            for s = 0 to nSess - 1
+                float sHigh = array.get(compositeSessionHighs, s)
+                float sLow  = array.get(compositeSessionLows,  s)
+                if sHigh > sLow
+                    float sBinSize = (sHigh - sLow) / vpRows
+                    for j = 0 to vpRows - 1
+                        float bV = matrix.get(compositeSessionBins, s, j)
+                        if bV > 0
+                            float bLowP  = sLow + j * sBinSize
+                            float bHighP = bLowP + sBinSize
+                            for k = 0 to vpRows - 1
+                                float cLowP  = cLow + k * compBinSize
+                                float cHighP = cLowP + compBinSize
+                                float overlap = math.max(0.0, math.min(bHighP, cHighP) - math.max(bLowP, cLowP))
+                                if overlap > 0
+                                    float ratio = overlap / sBinSize
+                                    array.set(compositeBins, k, array.get(compositeBins, k) + bV * ratio)
+            [cPocIdx, cVaL, cVaH, cTotalV] = computeProfile(compositeBins, vpRows, vpValueAreaP)
+            if cTotalV > 0
+                compositePOC := cLow + (cPocIdx + 0.5) * compBinSize
+                compositeVAH := cLow + (cVaH + 1) * compBinSize
+                compositeVAL := cLow + cVaL * compBinSize
+    0
+
+//══════════════════════════════════════════════════════════════════════════════
 // HELPERS — confluence
 //══════════════════════════════════════════════════════════════════════════════
 // Returns a confluence description string, empty if none. Checks the pivot
@@ -877,13 +997,32 @@ checkConfluence(float price, float tickDist, int barOffset) =>
         // "pVAH InVA" tag pairs on boundary-hugging prices.
         if not atPVAH and not atPVAL and not na(prevSessVAH) and not na(prevSessVAL) and price > prevSessVAL + td and price < prevSessVAH - td
             out := out + 'InVA '
+        // Composite (multi-session aggregate) levels — added in v3.0.
+        // [barOffset] indexed for the same reason as currDev — the SMT
+        // block reads these at the top of the bar before any v3.0
+        // session-finalize update. In practice composite only updates on
+        // session boundaries, so the indexed and non-indexed reads return
+        // the same value EXCEPT for pivots that fired in a prior session
+        // (where indexing correctly returns that earlier session's
+        // composite snapshot).
+        float pivComPOC = compositePOC[barOffset]
+        float pivComVAH = compositeVAH[barOffset]
+        float pivComVAL = compositeVAL[barOffset]
+        if not na(pivComPOC) and math.abs(price - pivComPOC) <= td
+            out := out + 'cPOC '
+        if not na(pivComVAH) and math.abs(price - pivComVAH) <= td
+            out := out + 'cVAH '
+        if not na(pivComVAL) and math.abs(price - pivComVAL) <= td
+            out := out + 'cVAL '
+        // Naked POCs — v3.0: removed `break` so a pivot near multiple
+        // nPOCs (e.g., 1.33995 and 1.34005 with confTicks=10) tags BOTH
+        // instead of silently dropping the second match.
         int sz = array.size(nakedPOCs)
         if sz > 0
             for i = 0 to sz - 1
                 float p = array.get(nakedPOCs, i)
                 if math.abs(price - p) <= td
                     out := out + 'nPOC@' + str.tostring(p, format.mintick) + ' '
-                    break
         // AVWAP + σ bands at the pivot bar. Require pivSigma > 0 to avoid
         // false-positive confluence on session-boundary bars, where the
         // AVWAP has only 1 bar of accumulation and equals hlc3 of that bar
@@ -938,13 +1077,24 @@ levelsInBar(float barLow, float barHigh, int barOffset) =>
             out := out + 'pVAH '
         if not na(prevSessVAL) and prevSessVAL >= barLow and prevSessVAL <= barHigh
             out := out + 'pVAL '
+        // Composite (multi-session aggregate) levels — added in v3.0.
+        float barComPOC = compositePOC[barOffset]
+        float barComVAH = compositeVAH[barOffset]
+        float barComVAL = compositeVAL[barOffset]
+        if not na(barComPOC) and barComPOC >= barLow and barComPOC <= barHigh
+            out := out + 'cPOC '
+        if not na(barComVAH) and barComVAH >= barLow and barComVAH <= barHigh
+            out := out + 'cVAH '
+        if not na(barComVAL) and barComVAL >= barLow and barComVAL <= barHigh
+            out := out + 'cVAL '
+        // Naked POCs — v3.0: removed `break` so a bar straddling multiple
+        // nPOCs tags all of them, not just the first.
         int sz = array.size(nakedPOCs)
         if sz > 0
             for i = 0 to sz - 1
                 float p = array.get(nakedPOCs, i)
                 if p >= barLow and p <= barHigh
                     out := out + 'nPOC@' + str.tostring(p, format.mintick) + ' '
-                    break
         if avwapEnabled
             float pivAvwap = avwap[barOffset]
             float pivSigma = avwapSigma[barOffset]
@@ -983,16 +1133,26 @@ levelsInBar(float barLow, float barHigh, int barOffset) =>
 // all diverging symbols. Prevents visual stacking when multiple comparison
 // symbols diverge against the same chart pivot (each was drawing its own
 // line/label at identical coordinates, so only the last one was visible).
-// The confluence flag adds a ★ to the visible label and a confluence-levels
-// breakdown to the tooltip.
+// The confluence flag adds a ★N marker (where N = number of tags) to the
+// visible label and a confluence-levels breakdown to the tooltip.
+
+// v3.0: count of space-separated confluence tags in the string. Used to
+// surface confluence STRENGTH at a glance — "POC pPOC(Bull) AVWAP +1.0σ"
+// returns 4 → label shows ★4 instead of just ★. Distinguishes strong
+// (multi-tag) pivots from single-tag ones in the label, tooltip,
+// dashboard, and alert message.
+countConfluenceTags(string s) =>
+    str.length(s) == 0 ? 0 : array.size(str.split(s, ' '))
+
 drawDivergence(bool isBull, int prevBar, float prevChart, float currChart, string symList, bool hasConf, string confluenceStr, color col) =>
     int curBar = bar_index - pivotLen
     line.new(prevBar, prevChart, curBar, currChart, color = col, width = lineWidth, style = lineStyle)
     if showLabel
         float midPrice = (prevChart + currChart) / 2.0
         int   midBar   = math.round((prevBar + curBar) / 2.0)
-        string starMark = hasConf ? ' ★' : ''
-        string tip = 'Chart: ' + str.tostring(prevChart, format.mintick) + ' → ' + str.tostring(currChart, format.mintick) + '\nDiverging vs: ' + symList + (hasConf ? '\n★ Confluence: ' + confluenceStr : '')
+        int    confCount = hasConf ? countConfluenceTags(confluenceStr) : 0
+        string starMark  = hasConf ? ' ★' + str.tostring(confCount) : ''
+        string tip = 'Chart: ' + str.tostring(prevChart, format.mintick) + ' → ' + str.tostring(currChart, format.mintick) + '\nDiverging vs: ' + symList + (hasConf ? '\n★ Confluence (' + str.tostring(confCount) + '): ' + confluenceStr : '')
         label.new(midBar, midPrice, (isBull ? 'Bull SMT' : 'Bear SMT') + starMark + '\n' + symList, style = isBull ? label.style_label_up : label.style_label_down, color = col, textcolor = color.white, size = lblSize, tooltip = tip)
 
 // Pre-compute confluence strings for the pivot prices at top-level scope.
@@ -1057,13 +1217,14 @@ if not na(phVal)
             // ONE combined line + label for the pivot (was previously drawn
             // once per diverging symbol, causing visual overlap).
             drawDivergence(false, prevPHBar, prevPHChart, phVal, divergedSyms, hasConf, conf, bearColor)
-            lastBearBar   := pivotBar
-            lastBearSym   := divergedSyms
-            lastBearPrice := phVal
-            lastBearConf  := hasConf
+            lastBearBar       := pivotBar
+            lastBearSym       := divergedSyms
+            lastBearPrice     := phVal
+            lastBearConf      := hasConf
+            lastBearConfCount := hasConf ? countConfluenceTags(conf) : 0
             if alertBear
                 string base = 'Bearish SMT vs ' + divergedSyms
-                string msg  = hasConf ? base + ' | Confluence: ' + conf : base
+                string msg  = hasConf ? base + ' | ★' + str.tostring(lastBearConfCount) + ' Confluence: ' + conf : base
                 alert(msg, alert.freq_once_per_bar_close)
 
     prevPHChart := phVal
@@ -1123,13 +1284,14 @@ if not na(plVal)
             bool   hasConf = str.length(conf) > 0
             // ONE combined line + label for the pivot.
             drawDivergence(true, prevPLBar, prevPLChart, plVal, divergedSyms, hasConf, conf, bullColor)
-            lastBullBar   := pivotBar
-            lastBullSym   := divergedSyms
-            lastBullPrice := plVal
-            lastBullConf  := hasConf
+            lastBullBar       := pivotBar
+            lastBullSym       := divergedSyms
+            lastBullPrice     := plVal
+            lastBullConf      := hasConf
+            lastBullConfCount := hasConf ? countConfluenceTags(conf) : 0
             if alertBull
                 string base = 'Bullish SMT vs ' + divergedSyms
-                string msg  = hasConf ? base + ' | Confluence: ' + conf : base
+                string msg  = hasConf ? base + ' | ★' + str.tostring(lastBullConfCount) + ' Confluence: ' + conf : base
                 alert(msg, alert.freq_once_per_bar_close)
 
     prevPLChart := plVal
@@ -1229,6 +1391,51 @@ if vpEnabled and isNewVPSession and not na(vpSessHigh) and vpSessHigh > vpSessLo
                 line.delete(oldL)
                 if not na(oldLb)
                     label.delete(oldLb)
+
+        // Composite VP — snapshot the just-finalized session's bins into
+        // the rolling N-session matrix, then re-aggregate. vpBins still
+        // holds the prior session's final volume distribution (the
+        // recomputeBinsFromRaw at the top of this block produced it; the
+        // section-3 reset that clears vpBins hasn't run yet). v3.0 feature.
+        if vpCompositeEnabled
+            array<float> sessBinsCopy = array.copy(vpBins)
+            matrix.add_row(compositeSessionBins, matrix.rows(compositeSessionBins), sessBinsCopy)
+            array.push(compositeSessionHighs, vpSessHigh)
+            array.push(compositeSessionLows,  vpSessLow)
+            // Trim oldest if over the rolling-window cap.
+            while matrix.rows(compositeSessionBins) > vpCompositeSessions
+                matrix.remove_row(compositeSessionBins, 0)
+                array.shift(compositeSessionHighs)
+                array.shift(compositeSessionLows)
+            recomputeComposite()
+            // Replace composite drawings.
+            if not na(compositePocLine)
+                line.delete(compositePocLine)
+            if not na(compositeVahLine)
+                line.delete(compositeVahLine)
+            if not na(compositeValLine)
+                line.delete(compositeValLine)
+            if not na(compositePocLabel)
+                label.delete(compositePocLabel)
+            if not na(compositeVahLabel)
+                label.delete(compositeVahLabel)
+            if not na(compositeValLabel)
+                label.delete(compositeValLabel)
+            if not na(compositePOC)
+                compositePocLine := line.new(prevSessEndBar, compositePOC, bar_index, compositePOC, color = vpCompositePocColor, width = vpCompositeWidth, style = line.style_solid, extend = extend.right)
+            if not na(compositeVAH)
+                compositeVahLine := line.new(prevSessEndBar, compositeVAH, bar_index, compositeVAH, color = vpCompositeVaColor, width = 1, style = line.style_dashed, extend = extend.right)
+            if not na(compositeVAL)
+                compositeValLine := line.new(prevSessEndBar, compositeVAL, bar_index, compositeVAL, color = vpCompositeVaColor, width = 1, style = line.style_dashed, extend = extend.right)
+            if vpShowCompositeLabels
+                int cLabelBar = bar_index + 4   // offset so labels don't overlap pPOC/nPOC labels at bar_index+1
+                int nSess = matrix.rows(compositeSessionBins)
+                if not na(compositePOC)
+                    compositePocLabel := label.new(cLabelBar, compositePOC, 'cPOC ' + str.tostring(compositePOC, format.mintick) + ' (' + str.tostring(nSess) + ')', style = label.style_label_left, color = vpCompositePocColor, textcolor = color.white, size = size.small)
+                if not na(compositeVAH)
+                    compositeVahLabel := label.new(cLabelBar, compositeVAH, 'cVAH ' + str.tostring(compositeVAH, format.mintick), style = label.style_label_left, color = vpCompositeVaColor, textcolor = color.white, size = size.small)
+                if not na(compositeVAL)
+                    compositeValLabel := label.new(cLabelBar, compositeVAL, 'cVAL ' + str.tostring(compositeVAL, format.mintick), style = label.style_label_left, color = vpCompositeVaColor, textcolor = color.white, size = size.small)
 
 //──────────────────────────────────────────────────────────────────────────────
 // 2) Naked POC touch check — remove any whose price was touched this bar.
@@ -1663,30 +1870,33 @@ if iceEnabled and barstate.isconfirmed and not na(volSMA) and volSMA > 0 and not
             // returns identical values. v2.8 was overcautious in keeping
             // this hoisted — fixed in v2.9.
             string confluence = levelsInBar(low, high, 0)
-            bool hasConf = str.length(confluence) > 0
+            bool hasConf  = str.length(confluence) > 0
+            int  confCount = hasConf ? countConfluenceTags(confluence) : 0
             if not iceRequireConf or hasConf
                 bool   isBull = isBullIce
                 color  c      = isBull ? iceBullColor : iceBearColor
                 float  yPos   = isBull ? low : high
                 string typeS  = isBull ? 'Bull' : 'Bear'
-                string txt    = iceMarkerText + (hasConf ? ' ★' : '')
-                string tip    = 'Iceberg ' + typeS + ' Absorption\n' + 'Volume: ' + str.tostring(volume / volSMA, '#.#') + 'x avg\n' + 'Range: ' + str.tostring(barRange / atr14, '#.##') + ' ATR\n' + 'Close: ' + str.tostring((close - low) / barRange * 100, '#') + '% of bar' + (hasConf ? '\nLevels: ' + confluence : '')
+                // v3.0: ★N strength count on the iceberg label instead of plain ★.
+                string txt    = iceMarkerText + (hasConf ? ' ★' + str.tostring(confCount) : '')
+                string tip    = 'Iceberg ' + typeS + ' Absorption\n' + 'Volume: ' + str.tostring(volume / volSMA, '#.#') + 'x avg\n' + 'Range: ' + str.tostring(barRange / atr14, '#.##') + ' ATR\n' + 'Close: ' + str.tostring((close - low) / barRange * 100, '#') + '% of bar' + (hasConf ? '\n★ Confluence (' + str.tostring(confCount) + '): ' + confluence : '')
                 label.new(bar_index, yPos, txt, style = isBull ? label.style_label_up : label.style_label_down, color = c, textcolor = color.white, size = getLabelSize(iceMarkerSize), tooltip = tip)
 
-                iceCount    := iceCount + 1
-                lastIceBar  := bar_index
-                lastIceType := typeS
-                lastIceConf := hasConf
+                iceCount         := iceCount + 1
+                lastIceBar       := bar_index
+                lastIceType      := typeS
+                lastIceConf      := hasConf
+                lastIceConfCount := confCount
 
                 if iceAlertEnabled
-                    alert(typeS + 'ish Iceberg' + (hasConf ? ' | ' + confluence : ''), alert.freq_once_per_bar_close)
+                    alert(typeS + 'ish Iceberg' + (hasConf ? ' | ★' + str.tostring(confCount) + ' ' + confluence : ''), alert.freq_once_per_bar_close)
 
 //══════════════════════════════════════════════════════════════════════════════
 // DASHBOARD
 //══════════════════════════════════════════════════════════════════════════════
 if showDash and barstate.islast
     if na(dashTable)
-        dashTable := table.new(getDashPosition(dashPos), 2, 21, bgcolor = color.new(color.black, 70), border_width = 1, border_color = color.new(color.gray, 60), frame_width = 1, frame_color = color.new(color.gray, 40))
+        dashTable := table.new(getDashPosition(dashPos), 2, 24, bgcolor = color.new(color.black, 70), border_width = 1, border_color = color.new(color.gray, 60), frame_width = 1, frame_color = color.new(color.gray, 40))
 
     color hdrBg = color.new(color.gray, 50)
     color rowBg = color.new(color.black, 50)
@@ -1694,7 +1904,7 @@ if showDash and barstate.islast
 
     // Header.
     table.cell(dashTable, 0, 0, 'SMT+VP+Ice', text_color = color.white, text_size = dashTxtSz, bgcolor = hdrBg)
-    table.cell(dashTable, 1, 0, 'v2.9',       text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
+    table.cell(dashTable, 1, 0, 'v3.0',       text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
 
     // Current developing levels.
     table.cell(dashTable, 0, 1, 'Curr POC', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
@@ -1714,6 +1924,23 @@ if showDash and barstate.islast
     table.cell(dashTable, 0, 6, 'Prev VAL', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
     table.cell(dashTable, 1, 6, na(prevSessVAL) ? '—' : str.tostring(prevSessVAL, format.mintick), text_color = vpPrevVaColor,  text_size = dashTxtSz, bgcolor = rowBg)
 
+    // Composite (multi-session aggregate) levels — v3.0. Suffixed with the
+    // session count (e.g., '1.34000 [5]') so the user can see how many
+    // sessions the aggregate is built from. Shows '—' until at least one
+    // session has been finalized after script load.
+    int compSessCount = matrix.rows(compositeSessionBins)
+    string compPocCell = na(compositePOC) ? '—' : str.tostring(compositePOC, format.mintick) + ' [' + str.tostring(compSessCount) + ']'
+    string compVahCell = na(compositeVAH) ? '—' : str.tostring(compositeVAH, format.mintick)
+    string compValCell = na(compositeVAL) ? '—' : str.tostring(compositeVAL, format.mintick)
+    color  compPocCol  = na(compositePOC) ? color.gray : vpCompositePocColor
+    color  compVaCol   = na(compositeVAH) ? color.gray : vpCompositeVaColor
+    table.cell(dashTable, 0, 7, 'Comp POC', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 7, compPocCell, text_color = compPocCol, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 8, 'Comp VAH', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 8, compVahCell, text_color = compVaCol, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 9, 'Comp VAL', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 9, compValCell, text_color = compVaCol, text_size = dashTxtSz, bgcolor = rowBg)
+
     // Price vs prior Value Area.
     string vaPosTxt = '—'
     color  vaPosCol = color.gray
@@ -1727,42 +1954,42 @@ if showDash and barstate.islast
         else
             vaPosTxt := 'Inside'
             vaPosCol := GOLD
-    table.cell(dashTable, 0, 7, 'Price vs pVA', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
-    table.cell(dashTable, 1, 7, vaPosTxt, text_color = vaPosCol, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 10, 'Price vs pVA', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 10, vaPosTxt, text_color = vaPosCol, text_size = dashTxtSz, bgcolor = rowBg)
 
     // AVWAP and σ levels (current bar — uses live projection).
-    table.cell(dashTable, 0, 8, 'AVWAP', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
-    table.cell(dashTable, 1, 8, na(avwap) ? '—' : str.tostring(avwap, format.mintick), text_color = avwapColor, text_size = dashTxtSz, bgcolor = rowBg)
-    table.cell(dashTable, 0, 9, '±' + str.tostring(sigma1Mult, '#.#') + 'σ', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
-    table.cell(dashTable, 1, 9, na(avwapU1) ? '—' : str.tostring(avwapL1, format.mintick) + ' / ' + str.tostring(avwapU1, format.mintick), text_color = sigma1Color, text_size = dashTxtSz, bgcolor = rowBg)
-    table.cell(dashTable, 0, 10, '±' + str.tostring(sigma2Mult, '#.#') + 'σ', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
-    table.cell(dashTable, 1, 10, na(avwapU2) ? '—' : str.tostring(avwapL2, format.mintick) + ' / ' + str.tostring(avwapU2, format.mintick), text_color = sigma2Color, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 11, 'AVWAP', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 11, na(avwap) ? '—' : str.tostring(avwap, format.mintick), text_color = avwapColor, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 12, '±' + str.tostring(sigma1Mult, '#.#') + 'σ', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 12, na(avwapU1) ? '—' : str.tostring(avwapL1, format.mintick) + ' / ' + str.tostring(avwapU1, format.mintick), text_color = sigma1Color, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 13, '±' + str.tostring(sigma2Mult, '#.#') + 'σ', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 13, na(avwapU2) ? '—' : str.tostring(avwapL2, format.mintick) + ' / ' + str.tostring(avwapU2, format.mintick), text_color = sigma2Color, text_size = dashTxtSz, bgcolor = rowBg)
     // ±3σ row added in v2.8. Shows '—' when σ3 toggle is off, matching
     // how other disabled features render in the dashboard.
     string sig3Val = showSigma3 and not na(avwapU3) ? str.tostring(avwapL3, format.mintick) + ' / ' + str.tostring(avwapU3, format.mintick) : '—'
     color  sig3Col = showSigma3 ? sigma3Color : color.gray
-    table.cell(dashTable, 0, 11, '±' + str.tostring(sigma3Mult, '#.#') + 'σ', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
-    table.cell(dashTable, 1, 11, sig3Val, text_color = sig3Col, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 14, '±' + str.tostring(sigma3Mult, '#.#') + 'σ', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 14, sig3Val, text_color = sig3Col, text_size = dashTxtSz, bgcolor = rowBg)
 
     // Naked POC count.
-    table.cell(dashTable, 0, 12, 'Naked POCs', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
-    table.cell(dashTable, 1, 12, str.tostring(array.size(nakedPOCs)), text_color = nPocColor, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 15, 'Naked POCs', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 15, str.tostring(array.size(nakedPOCs)), text_color = nPocColor, text_size = dashTxtSz, bgcolor = rowBg)
 
-    // Last SMT events.
-    string bullTxt = na(lastBullBar) ? '—' : lastBullSym + ' (' + str.tostring(bar_index - lastBullBar) + ' bars ago)' + (lastBullConf ? ' ★' : '')
-    string bearTxt = na(lastBearBar) ? '—' : lastBearSym + ' (' + str.tostring(bar_index - lastBearBar) + ' bars ago)' + (lastBearConf ? ' ★' : '')
-    table.cell(dashTable, 0, 13, 'Last Bull SMT', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
-    table.cell(dashTable, 1, 13, bullTxt, text_color = bullColor, text_size = dashTxtSz, bgcolor = rowBg)
-    table.cell(dashTable, 0, 14, 'Last Bear SMT', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
-    table.cell(dashTable, 1, 14, bearTxt, text_color = bearColor, text_size = dashTxtSz, bgcolor = rowBg)
+    // Last SMT events. v3.0: ★N strength-count suffix when confluence fires.
+    string bullTxt = na(lastBullBar) ? '—' : lastBullSym + ' (' + str.tostring(bar_index - lastBullBar) + ' bars ago)' + (lastBullConf ? ' ★' + str.tostring(lastBullConfCount) : '')
+    string bearTxt = na(lastBearBar) ? '—' : lastBearSym + ' (' + str.tostring(bar_index - lastBearBar) + ' bars ago)' + (lastBearConf ? ' ★' + str.tostring(lastBearConfCount) : '')
+    table.cell(dashTable, 0, 16, 'Last Bull SMT', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 16, bullTxt, text_color = bullColor, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 17, 'Last Bear SMT', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 17, bearTxt, text_color = bearColor, text_size = dashTxtSz, bgcolor = rowBg)
 
     // Iceberg / absorption stats.
-    string iceTxt = na(lastIceBar) ? '—' : lastIceType + ' (' + str.tostring(bar_index - lastIceBar) + ' bars ago)' + (lastIceConf ? ' ★' : '')
+    string iceTxt = na(lastIceBar) ? '—' : lastIceType + ' (' + str.tostring(bar_index - lastIceBar) + ' bars ago)' + (lastIceConf ? ' ★' + str.tostring(lastIceConfCount) : '')
     color  iceCol = na(lastIceBar) ? color.gray : (lastIceType == 'Bull' ? iceBullColor : iceBearColor)
-    table.cell(dashTable, 0, 15, 'Icebergs (sess)', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
-    table.cell(dashTable, 1, 15, str.tostring(iceCount), text_color = iceCount > 0 ? color.white : color.gray, text_size = dashTxtSz, bgcolor = rowBg)
-    table.cell(dashTable, 0, 16, 'Last Iceberg', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
-    table.cell(dashTable, 1, 16, iceTxt, text_color = iceCol, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 18, 'Icebergs (sess)', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 18, str.tostring(iceCount), text_color = iceCount > 0 ? color.white : color.gray, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 19, 'Last Iceberg', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 19, iceTxt, text_color = iceCol, text_size = dashTxtSz, bgcolor = rowBg)
 
     // Session sentiment summary (developing-session bull/bear split).
     float sessTotal = array.sum(vpBins)
@@ -1770,19 +1997,19 @@ if showDash and barstate.islast
     float bullPct   = sessTotal > 0 ? sessBull / sessTotal * 100 : na
     string sentTxt  = na(bullPct) ? '—' : str.tostring(bullPct, '#') + '% Bull / ' + str.tostring(100 - bullPct, '#') + '% Bear'
     color  sentCol  = na(bullPct) ? color.gray : (bullPct >= 55 ? GREEN : bullPct <= 45 ? RED : GOLD)
-    table.cell(dashTable, 0, 17, 'Sentiment', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
-    table.cell(dashTable, 1, 17, sentTxt, text_color = sentCol, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 20, 'Sentiment', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 20, sentTxt, text_color = sentCol, text_size = dashTxtSz, bgcolor = rowBg)
 
     // HVN / LVN counts (developing-session). Shows '—' if HVN tracking is off.
     string hvnTxt = vpShowHVN ? str.tostring(hvnCount) + ' / ' + str.tostring(lvnCount) : '—'
-    table.cell(dashTable, 0, 18, 'HVN / LVN', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
-    table.cell(dashTable, 1, 18, hvnTxt, text_color = vpShowHVN ? color.white : color.gray, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 21, 'HVN / LVN', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 21, hvnTxt, text_color = vpShowHVN ? color.white : color.gray, text_size = dashTxtSz, bgcolor = rowBg)
 
     // Footer hint.
-    table.cell(dashTable, 0, 19, 'Session',  text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = rowBg)
-    table.cell(dashTable, 1, 19, vpAnchorIn, text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = rowBg)
-    table.cell(dashTable, 0, 20, '★ = confluence', text_color = color.new(color.white, 50), text_size = dashTxtSz, bgcolor = rowBg)
-    table.cell(dashTable, 1, 20, '', text_color = color.new(color.white, 50), text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 22, 'Session',  text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 22, vpAnchorIn, text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 23, '★N = N confluences', text_color = color.new(color.white, 50), text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 23, '', text_color = color.new(color.white, 50), text_size = dashTxtSz, bgcolor = rowBg)
 
 //══════════════════════════════════════════════════════════════════════════════
 // ANCHORED VWAP — PLOTS
