@@ -38,6 +38,25 @@
 //          of every realtime tick. Bins only update on `barstate.isconfirmed`,
 //          so the previous every-tick delete-and-rebuild of ~24 boxes
 //          produced identical output. Tracked via `lastVpDrawBar` var.
+// v2.7 — Historical-bar SMT confluence on currDev levels — actually works
+//        this time. v2.6 PUBLISHED `currDevPOC/VAH/VAL` from section 4 on
+//        every confirmed bar (correct), but missed that `checkConfluence`
+//        was reading those vars without historical indexing. The SMT block
+//        evaluates at the TOP of each bar, BEFORE section 4 publishes the
+//        new currDev values — so at confirmation bar B, `currDevPOC` (no
+//        index) returns end-of-bar-(B-1)'s value. The actual pivot fired
+//        at bar B-pivotLen. The `pivotLen-1` bars of POC drift between
+//        those two sample points silently masked legitimate confluence.
+//        Fix: `checkConfluence` now reads `currDevPOC[barOffset]` /
+//        `currDevVAH[barOffset]` / `currDevVAL[barOffset]` — the
+//        developing levels as of the actual pivot bar. AVWAP/σ already
+//        used `[barOffset]` indexing, this just extends the same pattern.
+//        `levelsInBar` updated identically for symmetry (iceberg passes
+//        barOffset=0, so [0]==no-index — zero behaviour change for the
+//        iceberg call site, but the function is now consistent).
+//        Visible impact: SMT pivots that printed near the developing POC/
+//        VAH/VAL at the time of the pivot now get the ★ marker on both
+//        the chart label and the dashboard's "Last Bull/Bear SMT" row.
 // v2.6 — SMT confluence on historical bars actually works now:
 //        v2.5 added the currDev check to `checkConfluence` but missed the
 //        timing issue: `currDevPOC/VAH/VAL` were only set inside the redraw
@@ -258,7 +277,7 @@
 // Best paired with VP/AVWAP confluence gating for high-quality signals.
 
 //@version=6
-indicator('SMT + VP + AVWAP + Ice [v2.6]', 'SMT+VP2.6', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
+indicator('SMT + VP + AVWAP + Ice [v2.7]', 'SMT+VP2.7', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -783,18 +802,26 @@ checkConfluence(float price, float tickDist, int barOffset) =>
         out
     else
         float td = tickDist * syminfo.mintick
-        // Current developing levels — added in v2.5. Was previously only in
-        // `levelsInBar` (iceberg confluence). That's why SMT pivots sitting
-        // on the developing POC/VAH/VAL weren't getting ★ even though
-        // icebergs at the same level would. Note: `currDevPOC/VAH/VAL` are
-        // only updated inside the redraw block on `barstate.islast`, so on
-        // historical bars these are stale (last realtime value or na).
-        // Acceptable trade-off for accurate live-bar SMT confluence.
-        if not na(currDevPOC) and math.abs(price - currDevPOC) <= td
+        // Current developing levels at the PIVOT BAR (barOffset bars back).
+        // v2.7: must use [barOffset] indexing. The SMT block evaluates at
+        // the top of each bar — BEFORE VP section 4 publishes the new
+        // `currDevPOC/VAH/VAL`. So at confirmation bar B reading
+        // `currDevPOC` (no index) returns end-of-bar-(B-1)'s value, but
+        // the pivot itself is at bar B-pivotLen. The `pivotLen-1` bars of
+        // drift between those two POC samples silently masked legitimate
+        // currDev confluence on historical pivots.
+        // v2.6 published these values correctly; the bug was that SMT was
+        // reading the wrong bar's snapshot. `currDevPOC[barOffset]` gives
+        // the developing POC as of the pivot bar — which is what
+        // "★ confluence at this pivot" actually means.
+        float pivDevPOC = currDevPOC[barOffset]
+        float pivDevVAH = currDevVAH[barOffset]
+        float pivDevVAL = currDevVAL[barOffset]
+        if not na(pivDevPOC) and math.abs(price - pivDevPOC) <= td
             out := out + 'POC '
-        if not na(currDevVAH) and math.abs(price - currDevVAH) <= td
+        if not na(pivDevVAH) and math.abs(price - pivDevVAH) <= td
             out := out + 'VAH '
-        if not na(currDevVAL) and math.abs(price - currDevVAL) <= td
+        if not na(pivDevVAL) and math.abs(price - pivDevVAL) <= td
             out := out + 'VAL '
         // Previous session levels.
         bool atPVAH = not na(prevSessVAH) and math.abs(price - prevSessVAH) <= td
@@ -851,14 +878,18 @@ checkConfluence(float price, float tickDist, int barOffset) =>
 levelsInBar(float barLow, float barHigh, int barOffset) =>
     string out = ''
     if barHigh >= barLow
-        // Developing-session levels — high-quality intra-session reference.
-        // (Only set during the redraw block on barstate.islast, so meaningful
-        // primarily in realtime; historical icebergs won't capture this.)
-        if not na(currDevPOC) and currDevPOC >= barLow and currDevPOC <= barHigh
+        // Developing-session levels at the bar being checked. v2.7: explicit
+        // [barOffset] indexing for symmetry with checkConfluence. Iceberg
+        // calls with barOffset=0 so currDevPOC[0]==currDevPOC (no behaviour
+        // change); the indexed form is robust to any future nonzero caller.
+        float barDevPOC = currDevPOC[barOffset]
+        float barDevVAH = currDevVAH[barOffset]
+        float barDevVAL = currDevVAL[barOffset]
+        if not na(barDevPOC) and barDevPOC >= barLow and barDevPOC <= barHigh
             out := out + 'POC '
-        if not na(currDevVAH) and currDevVAH >= barLow and currDevVAH <= barHigh
+        if not na(barDevVAH) and barDevVAH >= barLow and barDevVAH <= barHigh
             out := out + 'VAH '
-        if not na(currDevVAL) and currDevVAL >= barLow and currDevVAL <= barHigh
+        if not na(barDevVAL) and barDevVAL >= barLow and barDevVAL <= barHigh
             out := out + 'VAL '
         // Previous-session levels.
         if not na(prevSessPOC) and prevSessPOC >= barLow and prevSessPOC <= barHigh
@@ -1616,7 +1647,7 @@ if showDash and barstate.islast
 
     // Header.
     table.cell(dashTable, 0, 0, 'SMT+VP+Ice', text_color = color.white, text_size = dashTxtSz, bgcolor = hdrBg)
-    table.cell(dashTable, 1, 0, 'v2.6',       text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
+    table.cell(dashTable, 1, 0, 'v2.7',       text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
 
     // Current developing levels.
     table.cell(dashTable, 0, 1, 'Curr POC', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
