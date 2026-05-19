@@ -1,4 +1,4 @@
-// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v2.6]
+// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v2.8]
 // Smart Money Technique (multi-symbol divergence) + session Volume Profile
 // with previous-session levels, naked POC tracking, confluence alerts, status
 // dashboard, session-anchored VWAP with σ bands, and iceberg/absorption
@@ -38,6 +38,25 @@
 //          of every realtime tick. Bins only update on `barstate.isconfirmed`,
 //          so the previous every-tick delete-and-rebuild of ~24 boxes
 //          produced identical output. Tracked via `lastVpDrawBar` var.
+// v2.8 — Post-v2.7 polish (carry-forward items flagged by code review):
+//        • Header line 1 was still '[v2.6]'. v2.7 bumped the indicator()
+//          declaration and the dashboard version cell but missed the
+//          file-header comment — pure cosmetic, now in sync.
+//        • Dashboard now includes a ±3σ row (between ±2σ and Naked POCs).
+//          Previously when `showSigma3` was enabled the σ3 bands plotted
+//          on-chart but the dashboard only listed σ1 and σ2 — incomplete.
+//          Row count bumped 20→21; rows 11 onward all shifted +1.
+//        Deliberately NOT changed: the iceConfluence top-level
+//        pre-compute (`string iceConfluence = levelsInBar(low, high, 0)`).
+//        Review suggested moving it inside `if isBullIce or isBearIce`
+//        to skip the per-bar string work. Rejected — `levelsInBar`
+//        reads `avwap[barOffset]`, `avwapSigma[barOffset]`, and (post
+//        v2.7) `currDevPOC[barOffset]` etc. Calling it conditionally
+//        re-introduces the very Pine v6 "may develop gaps in its
+//        internal series history" warning the v1.5 hoist was designed
+//        to avoid. The smtBearConf / smtBullConf pre-computes use the
+//        identical pattern for the same reason. Per-bar string concat
+//        cost is microscopic; Pine consistency wins.
 // v2.7 — Historical-bar SMT confluence on currDev levels — actually works
 //        this time. v2.6 PUBLISHED `currDevPOC/VAH/VAL` from section 4 on
 //        every confirmed bar (correct), but missed that `checkConfluence`
@@ -277,7 +296,7 @@
 // Best paired with VP/AVWAP confluence gating for high-quality signals.
 
 //@version=6
-indicator('SMT + VP + AVWAP + Ice [v2.7]', 'SMT+VP2.7', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
+indicator('SMT + VP + AVWAP + Ice [v2.8]', 'SMT+VP2.8', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -1639,7 +1658,7 @@ if iceEnabled and barstate.isconfirmed and not na(volSMA) and volSMA > 0 and not
 //══════════════════════════════════════════════════════════════════════════════
 if showDash and barstate.islast
     if na(dashTable)
-        dashTable := table.new(getDashPosition(dashPos), 2, 20, bgcolor = color.new(color.black, 70), border_width = 1, border_color = color.new(color.gray, 60), frame_width = 1, frame_color = color.new(color.gray, 40))
+        dashTable := table.new(getDashPosition(dashPos), 2, 21, bgcolor = color.new(color.black, 70), border_width = 1, border_color = color.new(color.gray, 60), frame_width = 1, frame_color = color.new(color.gray, 40))
 
     color hdrBg = color.new(color.gray, 50)
     color rowBg = color.new(color.black, 50)
@@ -1647,7 +1666,7 @@ if showDash and barstate.islast
 
     // Header.
     table.cell(dashTable, 0, 0, 'SMT+VP+Ice', text_color = color.white, text_size = dashTxtSz, bgcolor = hdrBg)
-    table.cell(dashTable, 1, 0, 'v2.7',       text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
+    table.cell(dashTable, 1, 0, 'v2.8',       text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
 
     // Current developing levels.
     table.cell(dashTable, 0, 1, 'Curr POC', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
@@ -1690,26 +1709,32 @@ if showDash and barstate.islast
     table.cell(dashTable, 1, 9, na(avwapU1) ? '—' : str.tostring(avwapL1, format.mintick) + ' / ' + str.tostring(avwapU1, format.mintick), text_color = sigma1Color, text_size = dashTxtSz, bgcolor = rowBg)
     table.cell(dashTable, 0, 10, '±' + str.tostring(sigma2Mult, '#.#') + 'σ', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
     table.cell(dashTable, 1, 10, na(avwapU2) ? '—' : str.tostring(avwapL2, format.mintick) + ' / ' + str.tostring(avwapU2, format.mintick), text_color = sigma2Color, text_size = dashTxtSz, bgcolor = rowBg)
+    // ±3σ row added in v2.8. Shows '—' when σ3 toggle is off, matching
+    // how other disabled features render in the dashboard.
+    string sig3Val = showSigma3 and not na(avwapU3) ? str.tostring(avwapL3, format.mintick) + ' / ' + str.tostring(avwapU3, format.mintick) : '—'
+    color  sig3Col = showSigma3 ? sigma3Color : color.gray
+    table.cell(dashTable, 0, 11, '±' + str.tostring(sigma3Mult, '#.#') + 'σ', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 11, sig3Val, text_color = sig3Col, text_size = dashTxtSz, bgcolor = rowBg)
 
     // Naked POC count.
-    table.cell(dashTable, 0, 11, 'Naked POCs', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
-    table.cell(dashTable, 1, 11, str.tostring(array.size(nakedPOCs)), text_color = nPocColor, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 12, 'Naked POCs', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 12, str.tostring(array.size(nakedPOCs)), text_color = nPocColor, text_size = dashTxtSz, bgcolor = rowBg)
 
     // Last SMT events.
     string bullTxt = na(lastBullBar) ? '—' : lastBullSym + ' (' + str.tostring(bar_index - lastBullBar) + ' bars ago)' + (lastBullConf ? ' ★' : '')
     string bearTxt = na(lastBearBar) ? '—' : lastBearSym + ' (' + str.tostring(bar_index - lastBearBar) + ' bars ago)' + (lastBearConf ? ' ★' : '')
-    table.cell(dashTable, 0, 12, 'Last Bull SMT', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
-    table.cell(dashTable, 1, 12, bullTxt, text_color = bullColor, text_size = dashTxtSz, bgcolor = rowBg)
-    table.cell(dashTable, 0, 13, 'Last Bear SMT', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
-    table.cell(dashTable, 1, 13, bearTxt, text_color = bearColor, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 13, 'Last Bull SMT', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 13, bullTxt, text_color = bullColor, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 14, 'Last Bear SMT', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 14, bearTxt, text_color = bearColor, text_size = dashTxtSz, bgcolor = rowBg)
 
     // Iceberg / absorption stats.
     string iceTxt = na(lastIceBar) ? '—' : lastIceType + ' (' + str.tostring(bar_index - lastIceBar) + ' bars ago)' + (lastIceConf ? ' ★' : '')
     color  iceCol = na(lastIceBar) ? color.gray : (lastIceType == 'Bull' ? iceBullColor : iceBearColor)
-    table.cell(dashTable, 0, 14, 'Icebergs (sess)', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
-    table.cell(dashTable, 1, 14, str.tostring(iceCount), text_color = iceCount > 0 ? color.white : color.gray, text_size = dashTxtSz, bgcolor = rowBg)
-    table.cell(dashTable, 0, 15, 'Last Iceberg', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
-    table.cell(dashTable, 1, 15, iceTxt, text_color = iceCol, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 15, 'Icebergs (sess)', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 15, str.tostring(iceCount), text_color = iceCount > 0 ? color.white : color.gray, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 16, 'Last Iceberg', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 16, iceTxt, text_color = iceCol, text_size = dashTxtSz, bgcolor = rowBg)
 
     // Session sentiment summary (developing-session bull/bear split).
     float sessTotal = array.sum(vpBins)
@@ -1717,19 +1742,19 @@ if showDash and barstate.islast
     float bullPct   = sessTotal > 0 ? sessBull / sessTotal * 100 : na
     string sentTxt  = na(bullPct) ? '—' : str.tostring(bullPct, '#') + '% Bull / ' + str.tostring(100 - bullPct, '#') + '% Bear'
     color  sentCol  = na(bullPct) ? color.gray : (bullPct >= 55 ? GREEN : bullPct <= 45 ? RED : GOLD)
-    table.cell(dashTable, 0, 16, 'Sentiment', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
-    table.cell(dashTable, 1, 16, sentTxt, text_color = sentCol, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 17, 'Sentiment', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 17, sentTxt, text_color = sentCol, text_size = dashTxtSz, bgcolor = rowBg)
 
     // HVN / LVN counts (developing-session). Shows '—' if HVN tracking is off.
     string hvnTxt = vpShowHVN ? str.tostring(hvnCount) + ' / ' + str.tostring(lvnCount) : '—'
-    table.cell(dashTable, 0, 17, 'HVN / LVN', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
-    table.cell(dashTable, 1, 17, hvnTxt, text_color = vpShowHVN ? color.white : color.gray, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 18, 'HVN / LVN', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 18, hvnTxt, text_color = vpShowHVN ? color.white : color.gray, text_size = dashTxtSz, bgcolor = rowBg)
 
     // Footer hint.
-    table.cell(dashTable, 0, 18, 'Session',  text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = rowBg)
-    table.cell(dashTable, 1, 18, vpAnchorIn, text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = rowBg)
-    table.cell(dashTable, 0, 19, '★ = confluence', text_color = color.new(color.white, 50), text_size = dashTxtSz, bgcolor = rowBg)
-    table.cell(dashTable, 1, 19, '', text_color = color.new(color.white, 50), text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 19, 'Session',  text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 19, vpAnchorIn, text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 0, 20, '★ = confluence', text_color = color.new(color.white, 50), text_size = dashTxtSz, bgcolor = rowBg)
+    table.cell(dashTable, 1, 20, '', text_color = color.new(color.white, 50), text_size = dashTxtSz, bgcolor = rowBg)
 
 //══════════════════════════════════════════════════════════════════════════════
 // ANCHORED VWAP — PLOTS
