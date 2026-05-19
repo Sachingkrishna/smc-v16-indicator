@@ -1,4 +1,4 @@
-// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v3.0]
+// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v3.1]
 // Smart Money Technique (multi-symbol divergence) + session Volume Profile
 // with previous-session levels, naked POC tracking, confluence alerts, status
 // dashboard, session-anchored VWAP with σ bands, and iceberg/absorption
@@ -38,6 +38,42 @@
 //          of every realtime tick. Bins only update on `barstate.isconfirmed`,
 //          so the previous every-tick delete-and-rebuild of ~24 boxes
 //          produced identical output. Tracked via `lastVpDrawBar` var.
+// v3.1 — Two real fixes from the v3.0 review (rest of the review pushed back):
+//        • Composite line left anchor. v3.0 drew composite POC/VAH/VAL
+//          from `prevSessEndBar` (= bar_index - 1) — a 1-bar stub that
+//          `extend.right` then carried forward. Visually inconsistent
+//          with the prev-session lines (which span their full session).
+//          Fix: track each contributing session's start bar in a new
+//          `compositeSessionStartBars` array (parallel to highs/lows),
+//          trim in lock-step, and anchor the composite line at the
+//          OLDEST tracked session's start. Composite lines now visibly
+//          span every session that contributed to the aggregate, then
+//          extend right — same anchor pattern as prev-session lines.
+//        • cPOC/cVAH/cVAL double-firing with pPOC/pVAH/pVAL during
+//          composite warmup. When only one session is in the composite
+//          (first finalize after script load), composite == prev
+//          session by construction — firing both tags counted the
+//          same level twice and inflated the ★N strength count.
+//          Fix: gate the c-tags on `compositeSessionCount >= 2`. New
+//          `var int compositeSessionCount` is series-tracked (updated
+//          at each finalize), so `[barOffset]` indexing returns the
+//          historical count at the pivot bar — symmetric with how
+//          `compositePOC[barOffset]` etc. already work.
+//        Items deliberately NOT changed (review claims rejected after
+//        analysis):
+//          - "computeProfile empty-bin infinite walk" — terminates in
+//            ≤ rows iterations; bound is `(vaL > 0 or vaH < rows - 1)`.
+//          - "matrix.get O(N·R²)" — actually called inside the j-loop,
+//            not the k-loop. Total = N·R = 1600 worst case. Non-issue.
+//          - "compositePOC[barOffset] cross-boundary semantics" — the
+//            current behavior is correct (evaluate pivot against the
+//            composite as it stood at the pivot bar's time).
+//          - "Dashboard position-change not recreating table" — Pine
+//            restarts the script on input change; `var table` resets
+//            to `na`, triggering recreation with the new position.
+//          - "countConfluenceTags double-space inflation" — current
+//            code can't produce double-spaces; defensive fix not
+//            currently needed.
 // v3.0 — Composite (multi-session) Volume Profile + confluence refinements.
 //        ── Main feature: Composite VP. ──
 //        Aggregates the last N completed sessions into a single profile on
@@ -348,7 +384,7 @@
 // Best paired with VP/AVWAP confluence gating for high-quality signals.
 
 //@version=6
-indicator('SMT + VP + AVWAP + Ice [v3.0]', 'SMT+VP3.0', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
+indicator('SMT + VP + AVWAP + Ice [v3.1]', 'SMT+VP3.1', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -791,14 +827,22 @@ var label  prevValLabel = na
 
 // Composite VP — last N completed sessions aggregated into a unified
 // profile (v3.0). Each completed session's vpBins is snapshotted as a row
-// of `compositeSessionBins`; per-session high/low stored in parallel
-// arrays so the merge step can distribute bins onto the unified composite
-// grid via overlap ratios. Matrix initialized at vpRows columns so
-// `matrix.add_row` accepts the snapshotted vpBins arrays.
+// of `compositeSessionBins`; per-session high/low/start-bar stored in
+// parallel arrays so the merge step can distribute bins onto the unified
+// composite grid via overlap ratios, and the chart line can anchor at
+// the OLDEST contributing session's start (v3.1 fix — was anchoring at
+// prevSessEndBar = 1 bar before current, producing a tiny stub before
+// extend.right kicked in).
+// `compositeSessionCount` is the historical series of the row count —
+// used by checkConfluence/levelsInBar to gate cPOC/cVAH/cVAL tags so they
+// don't double-fire alongside pPOC/pVAH/pVAL during the N<2 warmup
+// period when composite IS the prev session (v3.1 fix).
 var matrix<float> compositeSessionBins = matrix.new<float>(0, vpRows, 0.0)
-var array<float>  compositeSessionHighs = array.new<float>()
-var array<float>  compositeSessionLows  = array.new<float>()
-var array<float>  compositeBins         = array.new<float>(vpRows, 0.0)
+var array<float>  compositeSessionHighs     = array.new<float>()
+var array<float>  compositeSessionLows      = array.new<float>()
+var array<int>    compositeSessionStartBars = array.new<int>()
+var array<float>  compositeBins             = array.new<float>(vpRows, 0.0)
+var int   compositeSessionCount = 0
 var float compositePOC       = na
 var float compositeVAH       = na
 var float compositeVAL       = na
@@ -1016,14 +1060,21 @@ checkConfluence(float price, float tickDist, int barOffset) =>
         // the same value EXCEPT for pivots that fired in a prior session
         // (where indexing correctly returns that earlier session's
         // composite snapshot).
-        float pivComPOC = compositePOC[barOffset]
-        float pivComVAH = compositeVAH[barOffset]
-        float pivComVAL = compositeVAL[barOffset]
-        if not na(pivComPOC) and math.abs(price - pivComPOC) <= td
+        // v3.1: gate on `compositeSessionCount[barOffset] >= 2`. With a
+        // single session in the composite, cPOC == pPOC by construction
+        // — firing both tags double-counts the same level and inflates
+        // the ★N strength count. Requiring >= 2 sessions ensures the
+        // composite is meaningfully different from the immediate-prev
+        // session reference.
+        float pivComPOC   = compositePOC[barOffset]
+        float pivComVAH   = compositeVAH[barOffset]
+        float pivComVAL   = compositeVAL[barOffset]
+        int   pivCompSess = compositeSessionCount[barOffset]
+        if not na(pivComPOC) and pivCompSess >= 2 and math.abs(price - pivComPOC) <= td
             out := out + 'cPOC '
-        if not na(pivComVAH) and math.abs(price - pivComVAH) <= td
+        if not na(pivComVAH) and pivCompSess >= 2 and math.abs(price - pivComVAH) <= td
             out := out + 'cVAH '
-        if not na(pivComVAL) and math.abs(price - pivComVAL) <= td
+        if not na(pivComVAL) and pivCompSess >= 2 and math.abs(price - pivComVAL) <= td
             out := out + 'cVAL '
         // Naked POCs — v3.0: removed `break` so a pivot near multiple
         // nPOCs (e.g., 1.33995 and 1.34005 with confTicks=10) tags BOTH
@@ -1089,14 +1140,18 @@ levelsInBar(float barLow, float barHigh, int barOffset) =>
         if not na(prevSessVAL) and prevSessVAL >= barLow and prevSessVAL <= barHigh
             out := out + 'pVAL '
         // Composite (multi-session aggregate) levels — added in v3.0.
-        float barComPOC = compositePOC[barOffset]
-        float barComVAH = compositeVAH[barOffset]
-        float barComVAL = compositeVAL[barOffset]
-        if not na(barComPOC) and barComPOC >= barLow and barComPOC <= barHigh
+        // v3.1: same min-2-sessions gate as checkConfluence (see comment
+        // there) — composite IS prev-session when N=1, so cPOC+pPOC
+        // would double-fire.
+        float barComPOC   = compositePOC[barOffset]
+        float barComVAH   = compositeVAH[barOffset]
+        float barComVAL   = compositeVAL[barOffset]
+        int   barCompSess = compositeSessionCount[barOffset]
+        if not na(barComPOC) and barCompSess >= 2 and barComPOC >= barLow and barComPOC <= barHigh
             out := out + 'cPOC '
-        if not na(barComVAH) and barComVAH >= barLow and barComVAH <= barHigh
+        if not na(barComVAH) and barCompSess >= 2 and barComVAH >= barLow and barComVAH <= barHigh
             out := out + 'cVAH '
-        if not na(barComVAL) and barComVAL >= barLow and barComVAL <= barHigh
+        if not na(barComVAL) and barCompSess >= 2 and barComVAL >= barLow and barComVAL <= barHigh
             out := out + 'cVAL '
         // Naked POCs — v3.0: removed `break` so a bar straddling multiple
         // nPOCs tags all of them, not just the first.
@@ -1411,21 +1466,25 @@ if vpEnabled and isNewVPSession and not na(vpSessHigh) and vpSessHigh > vpSessLo
         if vpCompositeEnabled
             array<float> sessBinsCopy = array.copy(vpBins)
             matrix.add_row(compositeSessionBins, matrix.rows(compositeSessionBins), sessBinsCopy)
-            array.push(compositeSessionHighs, vpSessHigh)
-            array.push(compositeSessionLows,  vpSessLow)
-            // Trim oldest if over the rolling-window cap.
+            array.push(compositeSessionHighs,     vpSessHigh)
+            array.push(compositeSessionLows,      vpSessLow)
+            array.push(compositeSessionStartBars, vpSessStart)
+            // Trim oldest if over the rolling-window cap. Keep all four
+            // arrays in lock-step.
             while matrix.rows(compositeSessionBins) > vpCompositeSessions
                 matrix.remove_row(compositeSessionBins, 0)
                 array.shift(compositeSessionHighs)
                 array.shift(compositeSessionLows)
+                array.shift(compositeSessionStartBars)
             // Pine v6 forbids the function from reassigning scalar globals,
             // so it returns a 5-tuple — we assign here at the call site.
             [cRH, cRL, cP, cVH, cVL] = recomputeComposite()
-            compositeRangeHigh := cRH
-            compositeRangeLow  := cRL
-            compositePOC       := cP
-            compositeVAH       := cVH
-            compositeVAL       := cVL
+            compositeRangeHigh     := cRH
+            compositeRangeLow      := cRL
+            compositePOC           := cP
+            compositeVAH           := cVH
+            compositeVAL           := cVL
+            compositeSessionCount  := matrix.rows(compositeSessionBins)
             // Replace composite drawings.
             if not na(compositePocLine)
                 line.delete(compositePocLine)
@@ -1439,17 +1498,22 @@ if vpEnabled and isNewVPSession and not na(vpSessHigh) and vpSessHigh > vpSessLo
                 label.delete(compositeVahLabel)
             if not na(compositeValLabel)
                 label.delete(compositeValLabel)
+            // v3.1 fix: anchor the composite line at the OLDEST tracked
+            // session's start, not at prevSessEndBar. Visually consistent
+            // with prev-session lines (which span their session). The
+            // line now visibly spans every session that contributed to
+            // the composite, then extends right.
+            int compLineLeft = array.size(compositeSessionStartBars) > 0 ? array.get(compositeSessionStartBars, 0) : prevSessStartBar
             if not na(compositePOC)
-                compositePocLine := line.new(prevSessEndBar, compositePOC, bar_index, compositePOC, color = vpCompositePocColor, width = vpCompositeWidth, style = line.style_solid, extend = extend.right)
+                compositePocLine := line.new(compLineLeft, compositePOC, bar_index, compositePOC, color = vpCompositePocColor, width = vpCompositeWidth, style = line.style_solid, extend = extend.right)
             if not na(compositeVAH)
-                compositeVahLine := line.new(prevSessEndBar, compositeVAH, bar_index, compositeVAH, color = vpCompositeVaColor, width = 1, style = line.style_dashed, extend = extend.right)
+                compositeVahLine := line.new(compLineLeft, compositeVAH, bar_index, compositeVAH, color = vpCompositeVaColor, width = 1, style = line.style_dashed, extend = extend.right)
             if not na(compositeVAL)
-                compositeValLine := line.new(prevSessEndBar, compositeVAL, bar_index, compositeVAL, color = vpCompositeVaColor, width = 1, style = line.style_dashed, extend = extend.right)
+                compositeValLine := line.new(compLineLeft, compositeVAL, bar_index, compositeVAL, color = vpCompositeVaColor, width = 1, style = line.style_dashed, extend = extend.right)
             if vpShowCompositeLabels
                 int cLabelBar = bar_index + 4   // offset so labels don't overlap pPOC/nPOC labels at bar_index+1
-                int nSess = matrix.rows(compositeSessionBins)
                 if not na(compositePOC)
-                    compositePocLabel := label.new(cLabelBar, compositePOC, 'cPOC ' + str.tostring(compositePOC, format.mintick) + ' (' + str.tostring(nSess) + ')', style = label.style_label_left, color = vpCompositePocColor, textcolor = color.white, size = size.small)
+                    compositePocLabel := label.new(cLabelBar, compositePOC, 'cPOC ' + str.tostring(compositePOC, format.mintick) + ' (' + str.tostring(compositeSessionCount) + ')', style = label.style_label_left, color = vpCompositePocColor, textcolor = color.white, size = size.small)
                 if not na(compositeVAH)
                     compositeVahLabel := label.new(cLabelBar, compositeVAH, 'cVAH ' + str.tostring(compositeVAH, format.mintick), style = label.style_label_left, color = vpCompositeVaColor, textcolor = color.white, size = size.small)
                 if not na(compositeVAL)
@@ -1922,7 +1986,7 @@ if showDash and barstate.islast
 
     // Header.
     table.cell(dashTable, 0, 0, 'SMT+VP+Ice', text_color = color.white, text_size = dashTxtSz, bgcolor = hdrBg)
-    table.cell(dashTable, 1, 0, 'v3.0',       text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
+    table.cell(dashTable, 1, 0, 'v3.1',       text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
 
     // Current developing levels.
     table.cell(dashTable, 0, 1, 'Curr POC', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
