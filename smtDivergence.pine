@@ -1,4 +1,4 @@
-// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v3.2]
+// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v3.3]
 // Smart Money Technique (multi-symbol divergence) + session Volume Profile
 // with previous-session levels, naked POC tracking, confluence alerts, status
 // dashboard, session-anchored VWAP with σ bands, and iceberg/absorption
@@ -38,6 +38,31 @@
 //          of every realtime tick. Bins only update on `barstate.isconfirmed`,
 //          so the previous every-tick delete-and-rebuild of ~24 boxes
 //          produced identical output. Tracked via `lastVpDrawBar` var.
+// v3.3 — Split pivot length into independent Left / Right bar counts to
+//        cut SMT divergence signal lag.
+//        Problem: SMT used `ta.pivothigh(src, pivotLen, pivotLen)` — the
+//        same value for both the left (significance) and right
+//        (confirmation) sides. A pivot can't be confirmed until `right`
+//        bars have closed without exceeding it — so pivotLen=5 meant
+//        every SMT divergence printed 5 bars LATE. But the left side
+//        adds no lag at all (those bars are already history when the
+//        pivot bar prints) — only the right side does.
+//        Fix: `pivotLen` → `pivotLeftLen` (default 5) + `pivotRightLen`
+//        (default 3). Left keeps swing-significance strict; Right is
+//        lowered to confirm faster. SMT signals now print 3 bars after
+//        the pivot instead of 5 — a 40% lag cut — with the left-side
+//        quality filter fully intact. Tradeoff: a smaller Right admits
+//        more false pivots (a swing confirmed too early can still be
+//        exceeded later); 2-3 is the sweet spot, 1 is too noisy.
+//        All offset sites repointed from `pivotLen` to `pivotRightLen`:
+//        the pivot bar is `pivotRightLen` bars back at confirmation, so
+//        cmp-symbol sampling (`s1High[pivotRightLen]` etc.), the
+//        confluence `barOffset`, `drawDivergence`'s `curBar`, and the
+//        pivot-marker `plotshape` offsets all use pivotRightLen.
+//        MIGRATION NOTE: the input rename resets saved pivot settings to
+//        defaults (Left=5, Right=3). Users who ran pivotLen=N should set
+//        Left=N and pick a Right (try 3, or N for identical old
+//        behaviour). Symmetric Left==Right reproduces pre-v3.3 exactly.
 // v3.2 — Revert v2.9: hoist `levelsInBar` call back to top-level.
 //        v2.9 moved the iceberg `levelsInBar(low, high, 0)` call inside
 //        the `if isBullIce or isBearIce` conditional on the reasoning
@@ -405,7 +430,7 @@
 // Best paired with VP/AVWAP confluence gating for high-quality signals.
 
 //@version=6
-indicator('SMT + VP + AVWAP + Ice [v3.2]', 'SMT+VP3.2', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
+indicator('SMT + VP + AVWAP + Ice [v3.3]', 'SMT+VP3.3', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -421,7 +446,18 @@ AMBER = #FF9800
 // Inputs — SMT
 //──────────────────────────────────────────────────────────────────────────────
 grpPivot = 'SMT — Pivot Detection'
-pivotLen     = input.int(5, 'Pivot Length', minval = 1, maxval = 50, tooltip = 'Bars on each side required to confirm a swing pivot.', group = grpPivot)
+// v3.3: pivot length split into independent Left and Right bar counts.
+// LEFT  = how many bars BEFORE the swing it must exceed. A swing-quality
+//         filter — higher = stricter. Adds ZERO signal lag (those bars are
+//         already history when the pivot bar prints).
+// RIGHT = how many bars AFTER the swing must fail to exceed it before the
+//         pivot is confirmed. THIS is the entire SMT signal lag — a
+//         divergence prints `pivotRightLen` bars after the actual pivot.
+//         Lower = faster signal but more false pivots (a "swing" confirmed
+//         too early can still be exceeded a few bars later). 2-3 is the
+//         usual sweet spot; 1 is too noisy.
+pivotLeftLen  = input.int(5, 'Pivot Left Bars',  minval = 1, maxval = 50, tooltip = 'Bars BEFORE a swing that it must exceed to count as a pivot. Swing-significance filter — higher is stricter. Costs NO signal delay (these bars are already history when the pivot prints).', group = grpPivot)
+pivotRightLen = input.int(3, 'Pivot Right Bars', minval = 1, maxval = 50, tooltip = 'Bars AFTER a swing that must fail to exceed it before the pivot confirms. THIS is the SMT signal lag — a divergence prints this many bars after the pivot. Lower = faster but more false pivots. 2-3 is the usual sweet spot; 1 is too noisy.', group = grpPivot)
 pivotSrcMode = input.string('Wick', 'Pivot Source', options = ['Wick', 'Body'], tooltip = 'Wick uses high/low; Body uses max/min of open/close.', group = grpPivot)
 showPivotMarkers = input.bool(false, 'Show Pivot Markers', group = grpPivot)
 
@@ -671,8 +707,9 @@ computeProfile(array<float> bins, int rows, float vaTargetRatio) =>
 [s2High, s2Low] = request.security(sym2, timeframe.period, [pivotSrcHigh, pivotSrcLow], lookahead = barmerge.lookahead_off)
 [s3High, s3Low] = request.security(sym3, timeframe.period, [pivotSrcHigh, pivotSrcLow], lookahead = barmerge.lookahead_off)
 
-phVal = ta.pivothigh(pivotSrcHigh, pivotLen, pivotLen)
-plVal = ta.pivotlow (pivotSrcLow,  pivotLen, pivotLen)
+// v3.3: asymmetric L/R — pivotRightLen controls confirmation lag.
+phVal = ta.pivothigh(pivotSrcHigh, pivotLeftLen, pivotRightLen)
+plVal = ta.pivotlow (pivotSrcLow,  pivotLeftLen, pivotRightLen)
 
 //══════════════════════════════════════════════════════════════════════════════
 // ANCHORED VWAP + σ BANDS
@@ -1042,9 +1079,10 @@ checkConfluence(float price, float tickDist, int barOffset) =>
         // the top of each bar — BEFORE VP section 4 publishes the new
         // `currDevPOC/VAH/VAL`. So at confirmation bar B reading
         // `currDevPOC` (no index) returns end-of-bar-(B-1)'s value, but
-        // the pivot itself is at bar B-pivotLen. The `pivotLen-1` bars of
-        // drift between those two POC samples silently masked legitimate
-        // currDev confluence on historical pivots.
+        // the pivot itself is at bar B-pivotRightLen (callers pass
+        // pivotRightLen as barOffset since v3.3). The drift between those
+        // two POC samples silently masked legitimate currDev confluence
+        // on historical pivots.
         // v2.6 published these values correctly; the bug was that SMT was
         // reading the wrong bar's snapshot. `currDevPOC[barOffset]` gives
         // the developing POC as of the pivot bar — which is what
@@ -1232,7 +1270,7 @@ countConfluenceTags(string s) =>
     str.length(s) == 0 ? 0 : array.size(str.split(s, ' '))
 
 drawDivergence(bool isBull, int prevBar, float prevChart, float currChart, string symList, bool hasConf, string confluenceStr, color col) =>
-    int curBar = bar_index - pivotLen
+    int curBar = bar_index - pivotRightLen   // v3.3: pivot is pivotRightLen bars back at confirmation
     line.new(prevBar, prevChart, curBar, currChart, color = col, width = lineWidth, style = lineStyle)
     if showLabel
         float midPrice = (prevChart + currChart) / 2.0
@@ -1248,8 +1286,8 @@ drawDivergence(bool isBull, int prevBar, float prevChart, float currChart, strin
 // the function may develop gaps in its internal series history. Calling
 // them every bar with phVal / plVal (which are `na` on non-pivot bars)
 // is harmless because the function early-returns an empty string on na.
-string smtBearConf = checkConfluence(phVal, confTicks, pivotLen)
-string smtBullConf = checkConfluence(plVal, confTicks, pivotLen)
+string smtBearConf = checkConfluence(phVal, confTicks, pivotRightLen)
+string smtBullConf = checkConfluence(plVal, confTicks, pivotRightLen)
 
 // ─── Bearish SMT (confirmed pivot HIGH) ─────────────────────────────────────
 // Per-pivot dedup: collect every symbol that diverges, then update dashboard
@@ -1261,10 +1299,10 @@ string smtBullConf = checkConfluence(plVal, confTicks, pivotLen)
 // cmp's LOW (not HIGH) at the chart's pivot-high bar so we compare the
 // "matching" cmp pivot value across consecutive chart pivots.
 if not na(phVal)
-    int pivotBar = bar_index - pivotLen
-    float s1At = sym1Corr == 'Inverse' ? s1Low[pivotLen]  : s1High[pivotLen]
-    float s2At = sym2Corr == 'Inverse' ? s2Low[pivotLen]  : s2High[pivotLen]
-    float s3At = sym3Corr == 'Inverse' ? s3Low[pivotLen]  : s3High[pivotLen]
+    int pivotBar = bar_index - pivotRightLen
+    float s1At = sym1Corr == 'Inverse' ? s1Low[pivotRightLen]  : s1High[pivotRightLen]
+    float s2At = sym2Corr == 'Inverse' ? s2Low[pivotRightLen]  : s2High[pivotRightLen]
+    float s3At = sym3Corr == 'Inverse' ? s3Low[pivotRightLen]  : s3High[pivotRightLen]
 
     if not na(prevPHChart)
         bool chartHH = phVal > prevPHChart
@@ -1329,10 +1367,10 @@ if not na(phVal)
 // chart price is troughing, so a TRUE inverse cmp should be at a pivot HIGH.
 // We sample cmp's HIGH (not LOW) at the chart's pivot-low bar.
 if not na(plVal)
-    int pivotBar = bar_index - pivotLen
-    float s1At = sym1Corr == 'Inverse' ? s1High[pivotLen] : s1Low[pivotLen]
-    float s2At = sym2Corr == 'Inverse' ? s2High[pivotLen] : s2Low[pivotLen]
-    float s3At = sym3Corr == 'Inverse' ? s3High[pivotLen] : s3Low[pivotLen]
+    int pivotBar = bar_index - pivotRightLen
+    float s1At = sym1Corr == 'Inverse' ? s1High[pivotRightLen] : s1Low[pivotRightLen]
+    float s2At = sym2Corr == 'Inverse' ? s2High[pivotRightLen] : s2Low[pivotRightLen]
+    float s3At = sym3Corr == 'Inverse' ? s3High[pivotRightLen] : s3Low[pivotRightLen]
 
     if not na(prevPLChart)
         bool chartLL = plVal < prevPLChart
@@ -1387,8 +1425,8 @@ if not na(plVal)
     prevPLS3    := s3At
     prevPLBar   := pivotBar
 
-plotshape(showPivotMarkers and not na(phVal), title = 'Pivot High', style = shape.triangledown, location = location.abovebar, color = color.new(GRAY, 0), size = size.tiny, offset = -pivotLen)
-plotshape(showPivotMarkers and not na(plVal), title = 'Pivot Low',  style = shape.triangleup,   location = location.belowbar, color = color.new(GRAY, 0), size = size.tiny, offset = -pivotLen)
+plotshape(showPivotMarkers and not na(phVal), title = 'Pivot High', style = shape.triangledown, location = location.abovebar, color = color.new(GRAY, 0), size = size.tiny, offset = -pivotRightLen)
+plotshape(showPivotMarkers and not na(plVal), title = 'Pivot Low',  style = shape.triangleup,   location = location.belowbar, color = color.new(GRAY, 0), size = size.tiny, offset = -pivotRightLen)
 
 //══════════════════════════════════════════════════════════════════════════════
 // VOLUME PROFILE — uses session boundary detection from the helpers section.
@@ -2009,7 +2047,7 @@ if showDash and barstate.islast
 
     // Header.
     table.cell(dashTable, 0, 0, 'SMT+VP+Ice', text_color = color.white, text_size = dashTxtSz, bgcolor = hdrBg)
-    table.cell(dashTable, 1, 0, 'v3.2',       text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
+    table.cell(dashTable, 1, 0, 'v3.3',       text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
 
     // Current developing levels.
     table.cell(dashTable, 0, 1, 'Curr POC', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
