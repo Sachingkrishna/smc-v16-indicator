@@ -1,4 +1,4 @@
-// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v3.4]
+// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v3.5]
 // Smart Money Technique (multi-symbol divergence) + session Volume Profile
 // with previous-session levels, naked POC tracking, confluence alerts, status
 // dashboard, session-anchored VWAP with σ bands, and iceberg/absorption
@@ -38,6 +38,63 @@
 //          of every realtime tick. Bins only update on `barstate.isconfirmed`,
 //          so the previous every-tick delete-and-rebuild of ~24 boxes
 //          produced identical output. Tracked via `lastVpDrawBar` var.
+// v3.5 — Three real fixes from a large combined review (~23 items; the
+//        other ~20 were verified non-bugs and rejected — see notes).
+//        Fix 1 — recomputeBinsFromRaw runtime-crash guard. It accessed
+//        `high[offset]` back to session start; on a Daily anchor with
+//        a <=15s chart, or a Weekly/Monthly anchor on any intraday
+//        timeframe, a session exceeds 5000 bars — `high[offset]` past
+//        max_bars_back throws a runtime error. Now clamps the lookback
+//        to 4999. On those extreme configs the profile covers only the
+//        most-recent 5000 bars (degraded, documented) instead of crashing.
+//        Fix 2 — doji / neutral-bar bearish bias in VP sentiment. The
+//        bin classifier was a bool: `barBull = close > open`. An exact
+//        doji (close==open) is `false` → its whole volume was dumped
+//        into the bear side; same for a mid-range close under Buying
+//        Pressure. Now a 3-state fraction: bull→1.0, bear→0.0,
+//        neutral→0.5 (splits 50/50). Consistent with the v2.1
+//        doji-neutral fix already applied to iceberg classification.
+//        Affects vpBins/vpBinsBull, prev-POC sentiment tags, and the
+//        dashboard Bull%/Bear% row.
+//        Fix 3 — recomputeComposite merge optimised O(N·R²) → O(N·R).
+//        The session-bin → composite-grid merge scanned all vpRows
+//        composite bins for every source bin. A source bin only
+//        overlaps a contiguous 1-3 bin run — now computed directly via
+//        floor-division (±1 pad + clamp for FP safety; the overlap>0
+//        test filters slack). Worst case drops ~128k → ~3k ops per
+//        session-finalize. Not a crash risk before, just wasteful.
+//        REJECTED review claims (verified non-bugs): AVWAP "double-count"
+//        (the confirmed/live blocks are mutually exclusive on
+//        barstate.isconfirmed); "zero-range session" (the finalize block
+//        is guarded by vpSessHigh>vpSessLow AND fTotalV>0); "gapped-feed
+//        bar range" (bar_index is contiguous over existing bars — no gap
+//        inflation); "nPOC zero grace" (`> created` protects exactly the
+//        creation bar = first bar of new session, which IS the 1-bar
+//        grace); "SMT inverse compares mismatched metrics" (comparing the
+//        cmp's low at consecutive chart-HIGH pivots is correct SMT); "VA
+//        tie bias" (exact float ties are rare; tie-breaking is a defensible
+//        choice); "InVA dead zone" (reviewer's arithmetic is wrong —
+//        price at VAL+1.0 with td=2.5 IS within td); "SMT state updated
+//        unconditionally" (consecutive-pivot comparison is the definition
+//        of SMT); "realtime histogram stale" (intentional — VP is a
+//        bar-close construct, gated since v1.5); "POC-trail polyline
+//        per-tick churn" (vpShouldRedraw gate already prevents per-tick
+//        redraw); "first historical session uninitialised" (section 3's
+//        `na(vpSessHigh)` clause initialises bar 0); "orphan size arrays
+//        desync" (vol and sent orphan pairs are independent, each
+//        internally consistent); "AVWAP NaN from na hlc3" (chart-symbol
+//        OHLC is never na — bars exist iff they have prices; the real na
+//        risk, volume, is already nz()-guarded); "drawings leak on input
+//        toggle" (Pine restarts the script on input change, clearing all
+//        drawings); request.security for disabled symbols (Pine forbids
+//        conditional request.security — not fixable, 3 of 40-call budget).
+//        NOTED, not fixed — historical VP histograms: section 5 (redraw)
+//        is gated by barstate.islast, so on a fresh load only the
+//        developing session shows a histogram; completed sessions are
+//        retained going forward as realtime sessions finish. Drawing all
+//        historical sessions would blow the 500-box budget regardless
+//        (one session = up to 80 boxes). A proper fix is a feature-scale
+//        redraw redesign, out of scope for a bug-fix release.
 // v3.4 — Two real fixes from a review (one review claim rejected).
 //        Fix 1 — prev-session confluence indexed by [barOffset].
 //        `checkConfluence` indexed currDev (v2.7) and composite (v3.0)
@@ -461,7 +518,7 @@
 // Best paired with VP/AVWAP confluence gating for high-quality signals.
 
 //@version=6
-indicator('SMT + VP + AVWAP + Ice [v3.4]', 'SMT+VP3.4', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
+indicator('SMT + VP + AVWAP + Ice [v3.5]', 'SMT+VP3.5', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -553,7 +610,7 @@ vpPrevLineWidth = input.int(2, 'Prev POC Line Width', minval = 1, maxval = 4, gr
 // (untested individuals) and prev-session levels (most recent only).
 grpVPComp           = 'Composite Volume Profile'
 vpCompositeEnabled  = input.bool(true, 'Show Composite Profile', tooltip = 'Aggregates last N completed sessions into a unified profile. Yields composite POC/VAH/VAL as HTF reference levels. Updates on every session finalize.', group = grpVPComp)
-vpCompositeSessions = input.int(5, 'Sessions to Aggregate', minval = 2, maxval = 20, tooltip = 'Number of completed sessions to include. Higher = smoother HTF reference but slower to adapt to regime change. Cost is O(N × rows²) per session-finalize — at vpRows=80 and N=20 that is 128k ops, within the Pine loop budget but at the edge. Use defaults unless you need finer resolution.', group = grpVPComp)
+vpCompositeSessions = input.int(5, 'Sessions to Aggregate', minval = 2, maxval = 20, tooltip = 'Number of completed sessions to include. Higher = smoother HTF reference but slower to adapt to regime change. Recompute is O(N × rows) per session-finalize (v3.5 optimised the merge from O(N × rows²)) — cheap even at the maximum N=20, vpRows=80.', group = grpVPComp)
 vpCompositePocColor = input.color(color.new(GOLD, 20), 'Composite POC Color', group = grpVPComp)
 vpCompositeVaColor  = input.color(color.new(BLUE, 20), 'Composite VAH/VAL Color', group = grpVPComp)
 vpCompositeWidth    = input.int(3, 'Composite POC Line Width', minval = 1, maxval = 5, group = grpVPComp)
@@ -983,11 +1040,18 @@ dashTxtSz  = getLabelSize(dashSize)
 recomputeBinsFromRaw(int startOffset, int endOffset) =>
     array.fill(vpBins,     0.0)
     array.fill(vpBinsBull, 0.0)
-    if endOffset >= startOffset and not na(vpSessHigh) and not na(vpSessLow) and vpSessHigh > vpSessLow
+    // v3.5: clamp to max_bars_back. A session can exceed 5000 bars on
+    // a Daily anchor with <=15s charts, or a Weekly/Monthly anchor on
+    // any intraday timeframe — `high[offset]` past max_bars_back (5000)
+    // throws a runtime error and crashes the indicator. Clamping caps
+    // the profile at the most-recent 5000 bars of the session: degraded
+    // coverage on those extreme configs, but no crash.
+    int safeEnd = math.min(endOffset, 4999)
+    if safeEnd >= startOffset and not na(vpSessHigh) and not na(vpSessLow) and vpSessHigh > vpSessLow
         float binSize  = (vpSessHigh - vpSessLow) / vpRows
         bool  moneyFlow = vpSource == 'Money Flow'
         if binSize > 0
-            for offset = startOffset to endOffset
+            for offset = startOffset to safeEnd
                 float bH = high[offset]
                 float bL = low[offset]
                 float bC = close[offset]
@@ -995,7 +1059,13 @@ recomputeBinsFromRaw(int startOffset, int endOffset) =>
                 float bV = nz(volume[offset])
                 float bRange = bH - bL
                 if bRange > 0 and bV > 0
-                    bool barBull = vpSentimentMethod == 'Bar Polarity' ? bC > bO : (bC - bL) > (bH - bC)
+                    // v3.5: 3-state bull fraction. A neutral bar — a doji
+                    // (close==open) under Bar Polarity, or a close exactly
+                    // at mid-range under Buying Pressure — contributes HALF
+                    // its weight to bull, so it splits 50/50 bull/bear
+                    // instead of being silently dumped entirely into bear.
+                    // Matches the v2.1 doji-neutral treatment for icebergs.
+                    float bullFrac = vpSentimentMethod == 'Bar Polarity' ? (bC > bO ? 1.0 : bC < bO ? 0.0 : 0.5) : ((bC - bL) > (bH - bC) ? 1.0 : (bC - bL) < (bH - bC) ? 0.0 : 0.5)
                     for i = 0 to vpRows - 1
                         float binLow  = vpSessLow + i * binSize
                         float binHigh = binLow + binSize
@@ -1004,9 +1074,8 @@ recomputeBinsFromRaw(int startOffset, int endOffset) =>
                             float ratio       = overlap / bRange
                             float binMidPrice = binLow + binSize * 0.5
                             float weight      = moneyFlow ? bV * ratio * binMidPrice : bV * ratio
-                            array.set(vpBins, i, array.get(vpBins, i) + weight)
-                            if barBull
-                                array.set(vpBinsBull, i, array.get(vpBinsBull, i) + weight)
+                            array.set(vpBins,     i, array.get(vpBins,     i) + weight)
+                            array.set(vpBinsBull, i, array.get(vpBinsBull, i) + weight * bullFrac)
     0
 
 // Incremental: add ONLY the current bar's volume into the existing bin array
@@ -1019,7 +1088,8 @@ accumulateCurrentBar() =>
         float barRange = high - low
         float vol      = nz(volume)
         if barRange > 0 and binSize > 0 and vol > 0
-            bool barBull   = vpSentimentMethod == 'Bar Polarity' ? close > open : (close - low) > (high - close)
+            // v3.5: 3-state bull fraction — see recomputeBinsFromRaw.
+            float bullFrac = vpSentimentMethod == 'Bar Polarity' ? (close > open ? 1.0 : close < open ? 0.0 : 0.5) : ((close - low) > (high - close) ? 1.0 : (close - low) < (high - close) ? 0.0 : 0.5)
             bool moneyFlow = vpSource == 'Money Flow'
             for i = 0 to vpRows - 1
                 float binLow  = vpSessLow + i * binSize
@@ -1029,9 +1099,8 @@ accumulateCurrentBar() =>
                     float ratio       = overlap / barRange
                     float binMidPrice = binLow + binSize * 0.5
                     float weight      = moneyFlow ? vol * ratio * binMidPrice : vol * ratio
-                    array.set(vpBins, i, array.get(vpBins, i) + weight)
-                    if barBull
-                        array.set(vpBinsBull, i, array.get(vpBinsBull, i) + weight)
+                    array.set(vpBins,     i, array.get(vpBins,     i) + weight)
+                    array.set(vpBinsBull, i, array.get(vpBinsBull, i) + weight * bullFrac)
     0
 
 //══════════════════════════════════════════════════════════════════════════════
@@ -1043,8 +1112,9 @@ accumulateCurrentBar() =>
 // math as recomputeBinsFromRaw, but the source is per-session-bin snapshots
 // rather than raw bar history (each session was already recomputed
 // drift-free at finalize time, so the snapshot IS the accurate distribution).
-// Cost: O(N_sessions × vpRows²) — called only on session finalize so the
-// per-bar amortised cost is negligible.
+// Cost: O(N_sessions × vpRows) since v3.5 (each source bin maps directly
+// to its ~1-3 overlapping composite bins instead of scanning all vpRows).
+// Called only on session finalize, so per-bar amortised cost is negligible.
 //
 // Pine v6 forbids modifying global scalar `var`s from inside user-defined
 // functions, so this returns a 5-tuple [rangeHigh, rangeLow, POC, VAH, VAL]
@@ -1079,7 +1149,16 @@ recomputeComposite() =>
                         if bV > 0
                             float bLowP  = sLow + j * sBinSize
                             float bHighP = bLowP + sBinSize
-                            for k = 0 to vpRows - 1
+                            // v3.5: a source bin overlaps only a contiguous
+                            // run of composite bins — compute that index
+                            // range directly instead of scanning all vpRows.
+                            // Drops the merge from O(N·R²) to O(N·R) (each
+                            // source bin now touches ~1-3 composite bins, +2
+                            // padding). Pad ±1 and clamp for floating-point
+                            // safety; the `overlap > 0` test filters slack.
+                            int kStart = math.max(0,         int(math.floor((bLowP  - cLow) / compBinSize)) - 1)
+                            int kEnd   = math.min(vpRows - 1, int(math.floor((bHighP - cLow) / compBinSize)) + 1)
+                            for k = kStart to kEnd
                                 float cLowP  = cLow + k * compBinSize
                                 float cHighP = cLowP + compBinSize
                                 float overlap = math.max(0.0, math.min(bHighP, cHighP) - math.max(bLowP, cLowP))
@@ -2121,7 +2200,7 @@ if showDash and barstate.islast
 
     // Header.
     table.cell(dashTable, 0, 0, 'SMT+VP+Ice', text_color = color.white, text_size = dashTxtSz, bgcolor = hdrBg)
-    table.cell(dashTable, 1, 0, 'v3.4',       text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
+    table.cell(dashTable, 1, 0, 'v3.5',       text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
 
     // Current developing levels.
     table.cell(dashTable, 0, 1, 'Curr POC', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
