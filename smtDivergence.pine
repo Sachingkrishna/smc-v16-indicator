@@ -1,4 +1,4 @@
-// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v3.3]
+// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v3.4]
 // Smart Money Technique (multi-symbol divergence) + session Volume Profile
 // with previous-session levels, naked POC tracking, confluence alerts, status
 // dashboard, session-anchored VWAP with σ bands, and iceberg/absorption
@@ -38,6 +38,37 @@
 //          of every realtime tick. Bins only update on `barstate.isconfirmed`,
 //          so the previous every-tick delete-and-rebuild of ~24 boxes
 //          produced identical output. Tracked via `lastVpDrawBar` var.
+// v3.4 — Two real fixes from a review (one review claim rejected).
+//        Fix 1 — prev-session confluence indexed by [barOffset].
+//        `checkConfluence` indexed currDev (v2.7) and composite (v3.0)
+//        levels by [barOffset] to read them as of the pivot bar, but
+//        the prev-session POC/VAH/VAL/sentiment were still read as
+//        CURRENT values. A pivot in the last `pivotRightLen` bars of a
+//        session confirms AFTER the session boundary — by which point
+//        `prevSessPOC` has already advanced to the just-finalized
+//        session. So a near-boundary pivot was tagged against the wrong
+//        "previous" session. Now `prevSessPOC[barOffset]` etc. — the
+//        prev-session levels as they stood at the pivot bar. `levelsInBar`
+//        updated identically (iceberg passes barOffset=0 so no behaviour
+//        change there, just symmetry).
+//        Fix 2 — developing POC/VAH/VAL lines no longer orphaned at
+//        session reset. Section 3 was setting `vpPocLine/VahLine/ValLine`
+//        and the five VP labels to `na` WITHOUT deleting the underlying
+//        objects. With extend.right the orphaned developing-POC line
+//        stayed on-chart and overlapped the prevPocLine that section 1
+//        draws for the SAME session's finalized POC — visual duplication,
+//        plus one stale line/label set leaked per session, slowly eating
+//        the 500 line/label budget. HVN lines / heatmap boxes / bin
+//        labels right above were already deleted properly — the
+//        POC/VAH/VAL lines were just the missed case. Now deleted before
+//        the refs are nulled.
+//        Rejected claim — "SMT samples cmp highs/lows at the chart pivot
+//        bar instead of detecting confirmed pivots on the cmp symbols."
+//        That is not a bug, it is the STANDARD definition of SMT
+//        divergence: correlated assets are compared AT the chart's swing
+//        point. Sampling cmp.high/low at the chart pivot bar is exactly
+//        right. Detecting independent pivots per symbol and matching them
+//        temporally is a different (and noisier) technique, not SMT.
 // v3.3 — Split pivot length into independent Left / Right bar counts to
 //        cut SMT divergence signal lag.
 //        Problem: SMT used `ta.pivothigh(src, pivotLen, pivotLen)` — the
@@ -430,7 +461,7 @@
 // Best paired with VP/AVWAP confluence gating for high-quality signals.
 
 //@version=6
-indicator('SMT + VP + AVWAP + Ice [v3.3]', 'SMT+VP3.3', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
+indicator('SMT + VP + AVWAP + Ice [v3.4]', 'SMT+VP3.4', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -1096,11 +1127,22 @@ checkConfluence(float price, float tickDist, int barOffset) =>
             out := out + 'VAH '
         if not na(pivDevVAL) and math.abs(price - pivDevVAL) <= td
             out := out + 'VAL '
-        // Previous session levels.
-        bool atPVAH = not na(prevSessVAH) and math.abs(price - prevSessVAH) <= td
-        bool atPVAL = not na(prevSessVAL) and math.abs(price - prevSessVAL) <= td
-        if not na(prevSessPOC) and math.abs(price - prevSessPOC) <= td
-            string sentSuffix = na(prevSessPOCSentiment) or prevSessPOCSentiment == 'Neutral' ? '' : '(' + prevSessPOCSentiment + ')'
+        // Previous session levels — v3.4: now [barOffset] indexed, matching
+        // currDev and composite. A pivot in the last `pivotRightLen` bars
+        // of a session is confirmed AFTER the session boundary, by which
+        // point `prevSessPOC` (no index) has already advanced to the
+        // just-finalized session. Indexing reads the prev-session levels
+        // as they stood AT the pivot bar — so a near-boundary pivot is
+        // evaluated against the session that was genuinely "previous" at
+        // its time, not the one finalized a few bars later.
+        float  pivPrevPOC  = prevSessPOC[barOffset]
+        float  pivPrevVAH  = prevSessVAH[barOffset]
+        float  pivPrevVAL  = prevSessVAL[barOffset]
+        string pivPrevSent = prevSessPOCSentiment[barOffset]
+        bool atPVAH = not na(pivPrevVAH) and math.abs(price - pivPrevVAH) <= td
+        bool atPVAL = not na(pivPrevVAL) and math.abs(price - pivPrevVAL) <= td
+        if not na(pivPrevPOC) and math.abs(price - pivPrevPOC) <= td
+            string sentSuffix = na(pivPrevSent) or pivPrevSent == 'Neutral' ? '' : '(' + pivPrevSent + ')'
             out := out + 'pPOC' + sentSuffix + ' '
         if atPVAH
             out := out + 'pVAH '
@@ -1109,7 +1151,7 @@ checkConfluence(float price, float tickDist, int barOffset) =>
         // InVA fires only when CLEARLY inside the value area (strictly past
         // both edges by more than the tick tolerance). Prevents redundant
         // "pVAH InVA" tag pairs on boundary-hugging prices.
-        if not atPVAH and not atPVAL and not na(prevSessVAH) and not na(prevSessVAL) and price > prevSessVAL + td and price < prevSessVAH - td
+        if not atPVAH and not atPVAL and not na(pivPrevVAH) and not na(pivPrevVAL) and price > pivPrevVAL + td and price < pivPrevVAH - td
             out := out + 'InVA '
         // Composite (multi-session aggregate) levels — added in v3.0.
         // [barOffset] indexed for the same reason as currDev — the SMT
@@ -1190,13 +1232,20 @@ levelsInBar(float barLow, float barHigh, int barOffset) =>
             out := out + 'VAH '
         if not na(barDevVAL) and barDevVAL >= barLow and barDevVAL <= barHigh
             out := out + 'VAL '
-        // Previous-session levels.
-        if not na(prevSessPOC) and prevSessPOC >= barLow and prevSessPOC <= barHigh
-            string sentSuffix = na(prevSessPOCSentiment) or prevSessPOCSentiment == 'Neutral' ? '' : '(' + prevSessPOCSentiment + ')'
+        // Previous-session levels — v3.4: [barOffset] indexed for symmetry
+        // with checkConfluence. Iceberg calls with barOffset=0 so this is
+        // currently equivalent to the un-indexed read (no behaviour change),
+        // but the indexed form is correct for any future nonzero caller.
+        float  barPrevPOC  = prevSessPOC[barOffset]
+        float  barPrevVAH  = prevSessVAH[barOffset]
+        float  barPrevVAL  = prevSessVAL[barOffset]
+        string barPrevSent = prevSessPOCSentiment[barOffset]
+        if not na(barPrevPOC) and barPrevPOC >= barLow and barPrevPOC <= barHigh
+            string sentSuffix = na(barPrevSent) or barPrevSent == 'Neutral' ? '' : '(' + barPrevSent + ')'
             out := out + 'pPOC' + sentSuffix + ' '
-        if not na(prevSessVAH) and prevSessVAH >= barLow and prevSessVAH <= barHigh
+        if not na(barPrevVAH) and barPrevVAH >= barLow and barPrevVAH <= barHigh
             out := out + 'pVAH '
-        if not na(prevSessVAL) and prevSessVAL >= barLow and prevSessVAL <= barHigh
+        if not na(barPrevVAL) and barPrevVAL >= barLow and barPrevVAL <= barHigh
             out := out + 'pVAL '
         // Composite (multi-session aggregate) levels — added in v3.0.
         // v3.1: same min-2-sessions gate as checkConfluence (see comment
@@ -1662,6 +1711,31 @@ if vpEnabled and (isNewVPSession or na(vpSessHigh))
     if not na(pocTrailPolyline)
         polyline.delete(pocTrailPolyline)
         pocTrailPolyline := na
+    // v3.4 fix: DELETE the developing POC/VAH/VAL lines + labels before
+    // nulling the refs. Previously they were only set to `na`, orphaning
+    // the line objects on the chart. With extend.right the orphaned
+    // developing-POC line stayed visible and overlapped the prevPocLine
+    // that section 1 draws for the SAME session's finalized POC — visual
+    // duplication, and one stale line/label set leaked per session,
+    // slowly eating the 500 line/label budget. HVN lines, heatmap boxes,
+    // and bin labels just above were already deleted properly; the
+    // POC/VAH/VAL lines were the inconsistency.
+    if not na(vpPocLine)
+        line.delete(vpPocLine)
+    if not na(vpVahLine)
+        line.delete(vpVahLine)
+    if not na(vpValLine)
+        line.delete(vpValLine)
+    if not na(vpPocLabel)
+        label.delete(vpPocLabel)
+    if not na(vpVahLabel)
+        label.delete(vpVahLabel)
+    if not na(vpValLabel)
+        label.delete(vpValLabel)
+    if not na(vpHighLabel)
+        label.delete(vpHighLabel)
+    if not na(vpLowLabel)
+        label.delete(vpLowLabel)
     vpPocLine   := na
     vpVahLine   := na
     vpValLine   := na
@@ -2047,7 +2121,7 @@ if showDash and barstate.islast
 
     // Header.
     table.cell(dashTable, 0, 0, 'SMT+VP+Ice', text_color = color.white, text_size = dashTxtSz, bgcolor = hdrBg)
-    table.cell(dashTable, 1, 0, 'v3.3',       text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
+    table.cell(dashTable, 1, 0, 'v3.4',       text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
 
     // Current developing levels.
     table.cell(dashTable, 0, 1, 'Curr POC', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
