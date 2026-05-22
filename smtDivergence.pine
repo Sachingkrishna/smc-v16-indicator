@@ -1,4 +1,4 @@
-// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v3.5]
+// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v3.6]
 // Smart Money Technique (multi-symbol divergence) + session Volume Profile
 // with previous-session levels, naked POC tracking, confluence alerts, status
 // dashboard, session-anchored VWAP with σ bands, and iceberg/absorption
@@ -38,6 +38,38 @@
 //          of every realtime tick. Bins only update on `barstate.isconfirmed`,
 //          so the previous every-tick delete-and-rebuild of ~24 boxes
 //          produced identical output. Tracked via `lastVpDrawBar` var.
+// v3.6 — Fix runtime error RE10026 on 1-minute charts.
+//        Reported: "Error on bar 5738: Bar index value of the `x1`
+//        argument (0) in `line.new()` is too far from the current bar
+//        index." Pine refuses an xloc.bar_index drawing coordinate that
+//        sits more than ~max_bars_back bars before the current bar.
+//        Several drawings anchor their LEFT edge at a session-start bar:
+//          • prev-session POC/VAH/VAL lines + naked-POC line
+//            → anchored at prevSessStartBar (can be 0 — the first
+//              session starts at bar_index 0)
+//          • composite POC/VAH/VAL lines → anchored at the OLDEST of up
+//            to 5 tracked sessions' start bars
+//          • developing POC/VAH/VAL lines, HVN/LVN lines, heatmap +
+//            HVN-zone boxes → anchored at vpSessStart
+//          • SMT divergence line → anchored at the previous pivot bar
+//        On higher timeframes a session holds few bars so the anchor
+//        stays close and the error never appears. On a 1-minute chart a
+//        single session is ~1440 bars and the composite span is
+//        ~5×1440 — easily past the limit, so 1-min charts crash.
+//        Fix: new `safeLeftBar()` helper clamps any left x-coordinate to
+//        `max(b, bar_index - 4900)`. Applied at the `lineLeft` and
+//        `compLineLeft` definitions (covers all the redraw-block and
+//        composite drawings in one place each) and at the prev-session /
+//        naked-POC / SMT-divergence line sites. Every affected drawing
+//        either uses extend.right or is a horizontal level reference, so
+//        clamping the left anchor only shortens the drawn segment — the
+//        price level shown is unchanged. No visible difference on
+//        higher timeframes (the clamp never binds there).
+//        Known remaining edge (not fixed): the Developing POC Trail
+//        polyline builds chart.point.from_index points across the whole
+//        session; on a Weekly/Monthly anchor + intraday chart its
+//        oldest point could also exceed the limit. It is opt-in
+//        (default off) and safe on Daily anchor, so deferred.
 // v3.5 — Three real fixes from a large combined review (~23 items; the
 //        other ~20 were verified non-bugs and rejected — see notes).
 //        Fix 1 — recomputeBinsFromRaw runtime-crash guard. It accessed
@@ -518,7 +550,7 @@
 // Best paired with VP/AVWAP confluence gating for high-quality signals.
 
 //@version=6
-indicator('SMT + VP + AVWAP + Ice [v3.5]', 'SMT+VP3.5', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
+indicator('SMT + VP + AVWAP + Ice [v3.6]', 'SMT+VP3.6', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -751,6 +783,18 @@ getDashPosition(string s) =>
 shortName(string s) =>
     int colonIdx = str.pos(s, ':')
     na(colonIdx) ? s : str.substring(s, colonIdx + 1)
+
+// v3.6: clamp a bar-index x-coordinate for line/box drawing. Pine throws
+// runtime error RE10026 ("bar index ... is too far from the current bar
+// index") when an xloc.bar_index drawing coordinate sits more than
+// ~max_bars_back bars before the current bar. On a 1-minute chart a VP
+// session, the composite multi-session span, or an unusually long first
+// session can exceed that window — the error never appears on higher
+// timeframes because their sessions hold far fewer bars.
+// Every drawing this is applied to either uses extend.right or is a
+// horizontal level reference, so clamping the LEFT anchor only shortens
+// the drawn segment slightly — the price level it represents is unchanged.
+safeLeftBar(int b) => na(b) ? bar_index : math.max(b, bar_index - 4900)
 
 pivotSrcHigh = pivotSrcMode == 'Body' ? math.max(open, close) : high
 pivotSrcLow  = pivotSrcMode == 'Body' ? math.min(open, close) : low
@@ -1399,7 +1443,11 @@ countConfluenceTags(string s) =>
 
 drawDivergence(bool isBull, int prevBar, float prevChart, float currChart, string symList, bool hasConf, string confluenceStr, color col) =>
     int curBar = bar_index - pivotRightLen   // v3.3: pivot is pivotRightLen bars back at confirmation
-    line.new(prevBar, prevChart, curBar, currChart, color = col, width = lineWidth, style = lineStyle)
+    // v3.6: safeLeftBar clamp on the previous-pivot endpoint — guards
+    // RE10026 if two consecutive SMT pivots are an extreme distance apart
+    // (rare on intraday, but possible). Clamping only shifts the line's
+    // left end; the label still carries the full divergence detail.
+    line.new(safeLeftBar(prevBar), prevChart, curBar, currChart, color = col, width = lineWidth, style = lineStyle)
     if showLabel
         float midPrice = (prevChart + currChart) / 2.0
         int   midBar   = math.round((prevBar + curBar) / 2.0)
@@ -1611,9 +1659,12 @@ if vpEnabled and isNewVPSession and not na(vpSessHigh) and vpSessHigh > vpSessLo
             label.delete(prevValLabel)
 
         if vpShowPrev
-            prevPocLine := line.new(prevSessStartBar, fPOC, prevSessEndBar, fPOC, color = vpPrevPocColor, width = vpPrevLineWidth, style = line.style_solid, extend = extend.right)
-            prevVahLine := line.new(prevSessStartBar, fVAH, prevSessEndBar, fVAH, color = vpPrevVaColor,  width = 1, style = line.style_dotted, extend = extend.right)
-            prevValLine := line.new(prevSessStartBar, fVAL, prevSessEndBar, fVAL, color = vpPrevVaColor,  width = 1, style = line.style_dotted, extend = extend.right)
+            // v3.6: safeLeftBar clamp — prevSessStartBar can be 0 (first
+            // session) which on a 1-min chart is >max_bars_back away → RE10026.
+            int prevLineLeft = safeLeftBar(prevSessStartBar)
+            prevPocLine := line.new(prevLineLeft, fPOC, prevSessEndBar, fPOC, color = vpPrevPocColor, width = vpPrevLineWidth, style = line.style_solid, extend = extend.right)
+            prevVahLine := line.new(prevLineLeft, fVAH, prevSessEndBar, fVAH, color = vpPrevVaColor,  width = 1, style = line.style_dotted, extend = extend.right)
+            prevValLine := line.new(prevLineLeft, fVAL, prevSessEndBar, fVAL, color = vpPrevVaColor,  width = 1, style = line.style_dotted, extend = extend.right)
             if vpShowLabels
                 int prevLabelBar = bar_index + 1
                 prevPocLabel := label.new(prevLabelBar, fPOC, 'pPOC ' + str.tostring(fPOC, format.mintick), style = label.style_label_left, color = vpPrevPocColor, textcolor = color.white, size = size.small)
@@ -1628,7 +1679,7 @@ if vpEnabled and isNewVPSession and not na(vpSessHigh) and vpSessHigh > vpSessLo
         // very first bar of the new session (since prevSessStartBar is way
         // back), letting an opening-bar straddle invalidate the nPOC instantly.
         if nPocEnabled
-            line nLine = line.new(prevSessStartBar, fPOC, bar_index, fPOC, color = nPocColor, width = 1, style = nPocStyle, extend = extend.right)
+            line nLine = line.new(safeLeftBar(prevSessStartBar), fPOC, bar_index, fPOC, color = nPocColor, width = 1, style = nPocStyle, extend = extend.right)
             label nLabel = nPocLabels ? label.new(bar_index + 1, fPOC, 'nPOC ' + str.tostring(fPOC, format.mintick), style = label.style_label_left, color = nPocColor, textcolor = color.white, size = size.tiny) : na
             array.push(nakedPOCs,            fPOC)
             array.push(nakedPOCCreationBars, bar_index)
@@ -1690,7 +1741,7 @@ if vpEnabled and isNewVPSession and not na(vpSessHigh) and vpSessHigh > vpSessLo
             // with prev-session lines (which span their session). The
             // line now visibly spans every session that contributed to
             // the composite, then extends right.
-            int compLineLeft = array.size(compositeSessionStartBars) > 0 ? array.get(compositeSessionStartBars, 0) : prevSessStartBar
+            int compLineLeft = safeLeftBar(array.size(compositeSessionStartBars) > 0 ? array.get(compositeSessionStartBars, 0) : prevSessStartBar)
             if not na(compositePOC)
                 compositePocLine := line.new(compLineLeft, compositePOC, bar_index, compositePOC, color = vpCompositePocColor, width = vpCompositeWidth, style = line.style_solid, extend = extend.right)
             if not na(compositeVAH)
@@ -1988,7 +2039,7 @@ if vpShouldRedraw and vpEnabled and vpHasData and not na(vpSessHigh) and vpSessH
     int volRightCap  = volLeftBar + (twinMode ? halfWidth : vpHistWidth)
     int profileRightCap = volRightCap   // for the right-edge labels
 
-    int lineLeft  = vpSessStart
+    int lineLeft  = safeLeftBar(vpSessStart)   // v3.6: clamp — RE10026 guard on 1-min charts
     int lineRight = bar_index
 
     // ── Reset HVN/LVN counts so the dashboard reflects current profile ─
@@ -2200,7 +2251,7 @@ if showDash and barstate.islast
 
     // Header.
     table.cell(dashTable, 0, 0, 'SMT+VP+Ice', text_color = color.white, text_size = dashTxtSz, bgcolor = hdrBg)
-    table.cell(dashTable, 1, 0, 'v3.5',       text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
+    table.cell(dashTable, 1, 0, 'v3.6',       text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
 
     // Current developing levels.
     table.cell(dashTable, 0, 1, 'Curr POC', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
