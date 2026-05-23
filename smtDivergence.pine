@@ -1,4 +1,4 @@
-// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v3.7]
+// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v3.8]
 // Smart Money Technique (multi-symbol divergence) + session Volume Profile
 // with previous-session levels, naked POC tracking, confluence alerts, status
 // dashboard, session-anchored VWAP with σ bands, and iceberg/absorption
@@ -38,6 +38,42 @@
 //          of every realtime tick. Bins only update on `barstate.isconfirmed`,
 //          so the previous every-tick delete-and-rebuild of ~24 boxes
 //          produced identical output. Tracked via `lastVpDrawBar` var.
+// v3.8 — Confluence distance is now ATR-based by default (instrument-
+//        agnostic, volatility-adaptive). The legacy tick-based mode
+//        stays available as an opt-in.
+//        Why: `confTicks × syminfo.mintick` is a fixed-pip-equivalent
+//        threshold — it works on EURUSD where 10 ticks ≈ 1 pip, but
+//        breaks silently elsewhere:
+//          • BTCUSD at $50k, mintick 0.01 → 10 ticks = $0.10 →
+//            essentially never fires, the ★ feature is invisible.
+//          • Penny stocks → 10 ticks = 5% of price → fires constantly,
+//            noisy.
+//          • Even on the same pair, quiet-Asia vs London-Open needs
+//            different tolerances — a fixed tick count can't track
+//            volatility regime.
+//        ATR scales with the instrument (it IS in that asset's price
+//        units) and with the regime (volatile day → wider tolerance,
+//        quiet day → tighter). A single multiplier (k = 0.1 = 10% of
+//        a typical bar) works across every instrument — that's the
+//        reproducibility a quant cares about.
+//        New input `Distance Mode = ATR` (default) or `Ticks`.
+//          ATR mode: tolerance = confAtrMult × ATR(14)[barOffset]
+//            (ATR is [barOffset]-indexed, matching the v2.7/v3.0/v3.4
+//            "evaluate at the pivot bar" pattern for currDev / composite
+//            / prev-session reads).
+//          Ticks mode: tolerance = confTicks × syminfo.mintick
+//            (= pre-v3.8 behaviour, available as an opt-in fallback).
+//        On GBPUSD-style spot forex defaults map to ~the same scale as
+//        the old 10-tick default, so existing behaviour is preserved —
+//        the difference shows up when you load the indicator on BTC,
+//        ES, AAPL, or anything outside FX, where ATR mode finally makes
+//        the ★ marker fire at a meaningful rate.
+//        Refactor: `checkConfluence(price, tickDist, barOffset)` →
+//        `checkConfluence(price, barOffset)` — the function now reads
+//        the proximity globals directly. Two call sites updated.
+//        ATR-na guard: on the first 14 bars of the chart `confAtr` is
+//        na; fall back to the tick-based tolerance for those bars so
+//        early SMT pivots still get evaluated.
 // v3.7 — Two valid items from a 5-claim review (three rejected).
 //        Fix 1 — Direct-index bin merge in recomputeBinsFromRaw and
 //        accumulateCurrentBar. Same optimisation v3.5 applied to the
@@ -586,7 +622,7 @@
 // Best paired with VP/AVWAP confluence gating for high-quality signals.
 
 //@version=6
-indicator('SMT + VP + AVWAP + Ice [v3.7]', 'SMT+VP3.7', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
+indicator('SMT + VP + AVWAP + Ice [v3.8]', 'SMT+VP3.8', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -765,7 +801,17 @@ fillOpacity  = input.int(92, 'Fill Opacity (lower = darker)', minval = 60, maxva
 //──────────────────────────────────────────────────────────────────────────────
 grpConf = 'Confluence'
 confEnabled = input.bool(true, 'Detect Confluence at SMT', group = grpConf)
-confTicks   = input.int(10, 'Distance (ticks)', minval = 1, maxval = 200, tooltip = 'SMT pivots within this many ticks of a VP/AVWAP level count as confluence.', group = grpConf)
+// v3.8: proximity tolerance — ATR-based (default) or legacy ticks.
+//   ATR mode: tolerance = `confAtrMult × ATR(14)` — scales with the
+//     instrument AND with the current volatility regime. One default
+//     (0.1 = 10% of a typical bar) works across every instrument.
+//   Ticks mode: tolerance = `confTicks × syminfo.mintick` — legacy
+//     fixed proximity. Needs per-instrument retuning (10 ticks = 1 pip
+//     on FX but only $0.10 on BTC at $50k — the feature effectively
+//     never fires there).
+confDistMode = input.string('ATR', 'Distance Mode', options = ['ATR', 'Ticks'], tooltip = 'ATR: tolerance = confAtrMult × ATR(14). Scales with instrument and volatility regime — one setting works everywhere. Recommended.\nTicks: tolerance = confTicks × mintick. Fixed proximity in raw ticks. Needs retuning per instrument; legacy v3.7 behaviour.', group = grpConf)
+confAtrMult  = input.float(0.1, 'Distance (× ATR14)', minval = 0.01, maxval = 2.0, step = 0.05, tooltip = '★ confluence fires when a pivot is within this fraction of a 14-bar ATR of a tracked level. 0.1 = 10% of a typical bar range = sensible default across instruments. Lower = stricter (only pivots LANDING on a level); higher = looser (pivots merely NEAR a level).', group = grpConf)
+confTicks    = input.int(10, 'Distance (ticks, legacy)', minval = 1, maxval = 200, tooltip = 'Only used when Distance Mode = Ticks. SMT pivots within this many ticks of a tracked level count as confluence. Needs retuning per instrument — e.g., 50+ for crypto with mintick=0.01, 3-5 for penny stocks.', group = grpConf)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Inputs — Iceberg / Absorption
@@ -838,6 +884,13 @@ pivotSrcLow  = pivotSrcMode == 'Body' ? math.min(open, close) : low
 // Session boundary detection — used by both Volume Profile and Anchored VWAP.
 vpAnchorTF = vpAnchorIn == 'Daily' ? 'D' : vpAnchorIn == 'Weekly' ? 'W' : 'M'
 isNewVPSession = ta.change(time(vpAnchorTF)) != 0
+
+// v3.8: ATR series for ATR-based confluence distance. Defined at top
+// level (not inside checkConfluence) so Pine maintains a consistent
+// historical series — `confAtr[barOffset]` reads ATR as of the pivot
+// bar, matching the [barOffset]-indexed semantics used elsewhere for
+// currDev / composite / prev-session level reads.
+confAtr = ta.atr(14)
 
 // Profile computation — returns POC bin index, value-area bin indices, total volume.
 computeProfile(array<float> bins, int rows, float vaTargetRatio) =>
@@ -1270,12 +1323,20 @@ recomputeComposite() =>
 // Returns a confluence description string, empty if none. Checks the pivot
 // price against previous-session levels, active naked POCs, and the AVWAP/σ
 // bands at the pivot bar (offset back by `barOffset`).
-checkConfluence(float price, float tickDist, int barOffset) =>
+checkConfluence(float price, int barOffset) =>
     string out = ''
     if not confEnabled or na(price)
         out
     else
-        float td = tickDist * syminfo.mintick
+        // v3.8: proximity tolerance computed from the user-selected mode.
+        // ATR mode = `confAtrMult * ATR-at-pivot-bar` → scales with the
+        //   instrument and current volatility regime.
+        // Ticks mode = `confTicks * mintick` → fixed-tick legacy mode.
+        // For ATR mode, atr is indexed [barOffset] so the tolerance
+        // reflects volatility AT the pivot bar (consistent with the
+        // currDev/composite/prevSess [barOffset] indexing pattern).
+        float pivAtr = confAtr[barOffset]
+        float td = confDistMode == 'ATR' ? (na(pivAtr) ? confTicks * syminfo.mintick : confAtrMult * pivAtr) : confTicks * syminfo.mintick
         // Current developing levels at the PIVOT BAR (barOffset bars back).
         // v2.7: must use [barOffset] indexing. The SMT block evaluates at
         // the top of each bar — BEFORE VP section 4 publishes the new
@@ -1510,8 +1571,8 @@ drawDivergence(bool isBull, int prevBar, float prevChart, float currChart, strin
 // the function may develop gaps in its internal series history. Calling
 // them every bar with phVal / plVal (which are `na` on non-pivot bars)
 // is harmless because the function early-returns an empty string on na.
-string smtBearConf = checkConfluence(phVal, confTicks, pivotRightLen)
-string smtBullConf = checkConfluence(plVal, confTicks, pivotRightLen)
+string smtBearConf = checkConfluence(phVal, pivotRightLen)
+string smtBullConf = checkConfluence(plVal, pivotRightLen)
 
 // ─── Bearish SMT (confirmed pivot HIGH) ─────────────────────────────────────
 // Per-pivot dedup: collect every symbol that diverges, then update dashboard
@@ -2306,7 +2367,7 @@ if showDash and barstate.islast
 
     // Header.
     table.cell(dashTable, 0, 0, 'SMT+VP+Ice', text_color = color.white, text_size = dashTxtSz, bgcolor = hdrBg)
-    table.cell(dashTable, 1, 0, 'v3.7',       text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
+    table.cell(dashTable, 1, 0, 'v3.8',       text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
 
     // Current developing levels.
     table.cell(dashTable, 0, 1, 'Curr POC', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
