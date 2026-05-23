@@ -1,4 +1,4 @@
-// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v3.6]
+// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v3.7]
 // Smart Money Technique (multi-symbol divergence) + session Volume Profile
 // with previous-session levels, naked POC tracking, confluence alerts, status
 // dashboard, session-anchored VWAP with σ bands, and iceberg/absorption
@@ -38,6 +38,42 @@
 //          of every realtime tick. Bins only update on `barstate.isconfirmed`,
 //          so the previous every-tick delete-and-rebuild of ~24 boxes
 //          produced identical output. Tracked via `lastVpDrawBar` var.
+// v3.7 — Two valid items from a 5-claim review (three rejected).
+//        Fix 1 — Direct-index bin merge in recomputeBinsFromRaw and
+//        accumulateCurrentBar. Same optimisation v3.5 applied to the
+//        composite merge: a bar's range only overlaps a contiguous run
+//        of bins, computable directly via floor-division, not a full
+//        scan of all vpRows. Drops the inner per-bar work from
+//        O(vpRows) (up to 80 ops) to O(few) (typically 1-3 + 2 pad).
+//        ±1 padding + clamp + overlap>0 test handle FP edges. Behaviour
+//        unchanged; consistent now with the composite. Not a bug, the
+//        review's "major bottleneck" framing was inflated (per-bar cost
+//        was within Pine's budget) — but the optimisation is clean and
+//        consistent with the composite version, so worth applying.
+//        Fix 2 — Iceberg close-position threshold floored at 1 tick.
+//        `closeHigh = close >= high - iceCloseThreshold * barRange`
+//        falls below 1 tick of tolerance when barRange is extremely
+//        compressed (e.g., on a near-1-tick bar). The check then
+//        rejects everything except `close == high` exactly, missing
+//        valid absorption signals where close was 1 tick off the
+//        extreme. Tolerance is now `math.max(threshold * barRange,
+//        syminfo.mintick)` — never tighter than 1 tick. Edge case,
+//        but free to fix.
+//        Rejected (verified non-bugs):
+//          • "Confluence scale non-portable" — confTicks * mintick is
+//            per-instrument by design; user adjusts (50 for BTC, 3 for
+//            penny stocks). Knob, not bug.
+//          • "Mismatched trading-session distortion" — comparing SPY
+//            (regular hours) to ES1! (24h) inherently can't surface
+//            ES-overnight pivots because SPY has no bars then. To see
+//            overnight SMT, chart ES directly. This is how cross-session
+//            SMT works in any implementation, not a bug to fix.
+//          • "Naked POC fragility / single-tick wick deletion" — that
+//            IS the classical Market Profile rule (touch = filled).
+//            Adding body-close mitigation would be a feature addition,
+//            not a bug fix. Available in the user's other indicator
+//            (smcV16) for Order Blocks because OBs and POCs are
+//            different concepts with different conventions.
 // v3.6 — Fix runtime error RE10026 on 1-minute charts.
 //        Reported: "Error on bar 5738: Bar index value of the `x1`
 //        argument (0) in `line.new()` is too far from the current bar
@@ -550,7 +586,7 @@
 // Best paired with VP/AVWAP confluence gating for high-quality signals.
 
 //@version=6
-indicator('SMT + VP + AVWAP + Ice [v3.6]', 'SMT+VP3.6', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
+indicator('SMT + VP + AVWAP + Ice [v3.7]', 'SMT+VP3.7', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -1110,7 +1146,16 @@ recomputeBinsFromRaw(int startOffset, int endOffset) =>
                     // instead of being silently dumped entirely into bear.
                     // Matches the v2.1 doji-neutral treatment for icebergs.
                     float bullFrac = vpSentimentMethod == 'Bar Polarity' ? (bC > bO ? 1.0 : bC < bO ? 0.0 : 0.5) : ((bC - bL) > (bH - bC) ? 1.0 : (bC - bL) < (bH - bC) ? 0.0 : 0.5)
-                    for i = 0 to vpRows - 1
+                    // v3.7: same direct-index optimisation v3.5 applied to
+                    // the composite merge. A bar's range overlaps only a
+                    // contiguous run of bins — compute that range directly
+                    // via floor-division instead of scanning all vpRows.
+                    // ±1 pad + clamp for FP safety; the overlap>0 test
+                    // filters slack. Drops inner cost from O(vpRows) to
+                    // O(few) per bar. Behaviour unchanged.
+                    int iStart = math.max(0,         int(math.floor((bL - vpSessLow) / binSize)) - 1)
+                    int iEnd   = math.min(vpRows - 1, int(math.floor((bH - vpSessLow) / binSize)) + 1)
+                    for i = iStart to iEnd
                         float binLow  = vpSessLow + i * binSize
                         float binHigh = binLow + binSize
                         float overlap = math.max(0.0, math.min(bH, binHigh) - math.max(bL, binLow))
@@ -1135,7 +1180,10 @@ accumulateCurrentBar() =>
             // v3.5: 3-state bull fraction — see recomputeBinsFromRaw.
             float bullFrac = vpSentimentMethod == 'Bar Polarity' ? (close > open ? 1.0 : close < open ? 0.0 : 0.5) : ((close - low) > (high - close) ? 1.0 : (close - low) < (high - close) ? 0.0 : 0.5)
             bool moneyFlow = vpSource == 'Money Flow'
-            for i = 0 to vpRows - 1
+            // v3.7: direct-index optimisation — see recomputeBinsFromRaw.
+            int iStart = math.max(0,         int(math.floor((low  - vpSessLow) / binSize)) - 1)
+            int iEnd   = math.min(vpRows - 1, int(math.floor((high - vpSessLow) / binSize)) + 1)
+            for i = iStart to iEnd
                 float binLow  = vpSessLow + i * binSize
                 float binHigh = binLow + binSize
                 float overlap = math.max(0.0, math.min(high, binHigh) - math.max(low, binLow))
@@ -2205,8 +2253,15 @@ if iceEnabled and barstate.isconfirmed and not na(volSMA) and volSMA > 0 and not
     if barRange > 0
         bool volSpike   = volume > iceVolMult * volSMA
         bool narrowRange = barRange < iceRangeMult * atr14
-        bool closeHigh  = close >= high - iceCloseThreshold * barRange
-        bool closeLow   = close <= low  + iceCloseThreshold * barRange
+        // v3.7: floor the close-position tolerance at 1 tick. On a very
+        // narrow bar where 0.33 * barRange < syminfo.mintick, the raw
+        // threshold rounds tighter than 1 tick — only close == high (or
+        // low) exactly would pass, rejecting valid absorption signals
+        // where close is 1 tick off the extreme. The floor keeps the
+        // tolerance at least 1 tick wide regardless of bar compression.
+        float closeThreshAbs = math.max(iceCloseThreshold * barRange, syminfo.mintick)
+        bool closeHigh  = close >= high - closeThreshAbs
+        bool closeLow   = close <= low  + closeThreshAbs
 
         // Mutually exclusive — at iceCloseThreshold = 0.5 a doji bar (close
         // exactly at midpoint) would satisfy BOTH closeHigh AND closeLow.
@@ -2251,7 +2306,7 @@ if showDash and barstate.islast
 
     // Header.
     table.cell(dashTable, 0, 0, 'SMT+VP+Ice', text_color = color.white, text_size = dashTxtSz, bgcolor = hdrBg)
-    table.cell(dashTable, 1, 0, 'v3.6',       text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
+    table.cell(dashTable, 1, 0, 'v3.7',       text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
 
     // Current developing levels.
     table.cell(dashTable, 0, 1, 'Curr POC', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
