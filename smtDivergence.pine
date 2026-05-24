@@ -1,4 +1,4 @@
-// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v3.8]
+// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v3.9]
 // Smart Money Technique (multi-symbol divergence) + session Volume Profile
 // with previous-session levels, naked POC tracking, confluence alerts, status
 // dashboard, session-anchored VWAP with σ bands, and iceberg/absorption
@@ -38,6 +38,41 @@
 //          of every realtime tick. Bins only update on `barstate.isconfirmed`,
 //          so the previous every-tick delete-and-rebuild of ~24 boxes
 //          produced identical output. Tracked via `lastVpDrawBar` var.
+// v3.9 — Three real fixes from a 4-claim review (one rejected).
+//        Fix 1 — Hardened cmp-symbol request.security calls.
+//        `ignore_invalid_symbol = true` added to all 3 cmp fetches.
+//        Previously a typo'd / delisted / no-permission cmp symbol
+//        crashed the whole indicator at compile or runtime. Now it
+//        returns na, and the existing `not na(s1At)` guards in the
+//        SMT block correctly skip that cmp.
+//        Fix 2 — `gaps = barmerge.gaps_on` on cmp fetches.
+//        Pine's default `gaps_off` forward-fills the cmp value across
+//        bars where the cmp has no data — so a 24h chart vs futures
+//        (weekend / maintenance / holiday gap) compared the chart's
+//        weekend pivots against a STALE Friday-close cmp price, fabri-
+//        cating phantom SMT divergences out of pure data artifacts.
+//        With gaps_on the cmp returns na during gaps and the existing
+//        na guards skip those pivots properly — fewer signals, no
+//        false positives. Cross-session symbol pairs (24h chart vs
+//        regular-hours cmp, or vice versa) benefit most.
+//        Fix 3 — Developing POC trail polyline pruning.
+//        Closes the v3.6-flagged deferred edge: pocTrailPoints pushes
+//        a chart.point.from_index every confirmed bar of the session;
+//        on a Weekly/Monthly anchor + intraday chart the session
+//        exceeds 5000 bars, so the polyline's oldest point exceeds
+//        Pine's xloc.bar_index range and triggers RE10026 (same root
+//        cause as the v3.6 line.new clamps). Now caps the array at
+//        4900 points (oldest pruned FIFO). Session reset already
+//        clears the array, so this only binds on extreme configs.
+//        Rejected (managed by existing inputs):
+//          • "Box budget can exceed max_boxes_count = 500 with
+//            vpRows=80 + Twin + heatmap + HVN zones + orphans".
+//            Real arithmetic, but already user-controlled via
+//            `vpMaxOrphanSessions` — its tooltip explicitly warns:
+//            "protect against the 500-box budget when Twin/Heatmap/
+//            HVN-Zones are all enabled." Pine v6 can't dynamically
+//            cap one input's maxval based on other inputs' values;
+//            the tradeoff is the user's call, documented.
 // v3.8 — Confluence distance is now ATR-based by default (instrument-
 //        agnostic, volatility-adaptive). The legacy tick-based mode
 //        stays available as an opt-in.
@@ -622,7 +657,7 @@
 // Best paired with VP/AVWAP confluence gating for high-quality signals.
 
 //@version=6
-indicator('SMT + VP + AVWAP + Ice [v3.8]', 'SMT+VP3.8', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
+indicator('SMT + VP + AVWAP + Ice [v3.9]', 'SMT+VP3.9', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -924,9 +959,20 @@ computeProfile(array<float> bins, int rows, float vaTargetRatio) =>
 //══════════════════════════════════════════════════════════════════════════════
 // COMPARISON SYMBOL DATA + PIVOTS (must run on every bar before SMT block)
 //══════════════════════════════════════════════════════════════════════════════
-[s1High, s1Low] = request.security(sym1, timeframe.period, [pivotSrcHigh, pivotSrcLow], lookahead = barmerge.lookahead_off)
-[s2High, s2Low] = request.security(sym2, timeframe.period, [pivotSrcHigh, pivotSrcLow], lookahead = barmerge.lookahead_off)
-[s3High, s3Low] = request.security(sym3, timeframe.period, [pivotSrcHigh, pivotSrcLow], lookahead = barmerge.lookahead_off)
+// v3.9: hardened cmp-symbol fetches.
+//   - ignore_invalid_symbol = true: a typo'd / delisted / no-permission
+//     symbol returns na instead of erroring out the whole indicator.
+//     Downstream `not na(s1At)` guards already skip the cmp on na.
+//   - gaps = barmerge.gaps_on: when the cmp has no bar at the chart's
+//     time (24h chart vs futures' weekend gap, US holidays, etc.) the
+//     value is na instead of forward-filled from the last cmp close.
+//     Pine's default gaps_off was creating phantom SMT divergences on
+//     gap bars where the chart printed a pivot against a STALE cmp
+//     price. With gaps_on the existing na guards skip those pivots
+//     properly — fewer SMT signals but no data-artifact false positives.
+[s1High, s1Low] = request.security(sym1, timeframe.period, [pivotSrcHigh, pivotSrcLow], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_on, ignore_invalid_symbol = true)
+[s2High, s2Low] = request.security(sym2, timeframe.period, [pivotSrcHigh, pivotSrcLow], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_on, ignore_invalid_symbol = true)
+[s3High, s3Low] = request.security(sym3, timeframe.period, [pivotSrcHigh, pivotSrcLow], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_on, ignore_invalid_symbol = true)
 
 // v3.3: asymmetric L/R — pivotRightLen controls confirmation lag.
 phVal = ta.pivothigh(pivotSrcHigh, pivotLeftLen, pivotRightLen)
@@ -2055,6 +2101,16 @@ if vpEnabled and barstate.isconfirmed and not na(vpSessHigh) and vpSessHigh > vp
             float barBinSize = (vpSessHigh - vpSessLow) / vpRows
             float barPocPrice = vpSessLow + (barPocIdx + 0.5) * barBinSize
             array.push(pocTrailPoints, chart.point.from_index(bar_index, barPocPrice))
+            // v3.9: prune so the oldest point stays within Pine's bar_index
+            // drawing range. polyline.new with xloc.bar_index has the same
+            // ~max_bars_back limit as line.new (RE10026). On Daily anchor
+            // + intraday chart the session is short enough that this never
+            // binds (session reset clears the array). On Weekly/Monthly
+            // anchor + 1-min the session itself exceeds 5000 bars; without
+            // pruning, the polyline would crash. Closes the edge case the
+            // v3.6 changelog flagged as deferred.
+            while array.size(pocTrailPoints) > 4900
+                array.shift(pocTrailPoints)
 
 //──────────────────────────────────────────────────────────────────────────────
 // 5) Redraw developing profile on the chart's last bar.
@@ -2367,7 +2423,7 @@ if showDash and barstate.islast
 
     // Header.
     table.cell(dashTable, 0, 0, 'SMT+VP+Ice', text_color = color.white, text_size = dashTxtSz, bgcolor = hdrBg)
-    table.cell(dashTable, 1, 0, 'v3.8',       text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
+    table.cell(dashTable, 1, 0, 'v3.9',       text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
 
     // Current developing levels.
     table.cell(dashTable, 0, 1, 'Curr POC', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
