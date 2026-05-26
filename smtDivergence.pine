@@ -1,4 +1,4 @@
-// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v3.9]
+// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v3.10]
 // Smart Money Technique (multi-symbol divergence) + session Volume Profile
 // with previous-session levels, naked POC tracking, confluence alerts, status
 // dashboard, session-anchored VWAP with σ bands, and iceberg/absorption
@@ -38,6 +38,66 @@
 //          of every realtime tick. Bins only update on `barstate.isconfirmed`,
 //          so the previous every-tick delete-and-rebuild of ~24 boxes
 //          produced identical output. Tracked via `lastVpDrawBar` var.
+// v3.10 — Four real fixes from a 9-claim review (five rejected with
+//        reasoning — see end of this block).
+//        Fix 1 — Per-symbol prevPH / prevPL update on cmp-na bars.
+//        v3.9's gaps_on + ignore_invalid_symbol exposed this: a cmp
+//        symbol with a gap or invalid lookup returns na, and the old
+//        unconditional `prevPHS1 := s1At` overwrote the snapshot with
+//        na. The NEXT pivot's `not na(prevPHS1)` guard then failed too,
+//        costing two consecutive divergence opportunities per cmp gap.
+//        Now per-symbol: only update prevPH*/prevPL* when the cmp value
+//        is non-na. prevPHChart/prevPHBar still update unconditionally
+//        (the chart's own pivot data is always non-na).
+//        Fix 2 — Cmp local-extreme window for SMT comparison.
+//        Tightly correlated cmp symbols (ES/NQ/YM, EUR/GBP, BTC/ETH)
+//        often pivot 1-2 bars offset from the chart's pivot. Sampling
+//        cmp at the EXACT chart-pivot bar then catches cmp 1-2 bars
+//        past its own peak → fabricates phantom "lower high" reads →
+//        false divergences. New input `smtCmpWindow` (default 1) takes
+//        cmp's local high (bear setups) or low (bull setups) over a
+//        ±N-bar band centred on the chart's pivot bar. 0 disables
+//        (legacy same-bar behaviour). Implemented via top-level
+//        `ta.highest`/`ta.lowest` series — Pine v6 consistency-warning-
+//        safe.
+//        Fix 3 — Iceberg inter-bar cooldown.
+//        During sustained absorption 5-10 consecutive bars can each
+//        qualify (same SMA-20 baseline, same setup) — not statistically
+//        independent events. Each currently fires a label + alert,
+//        spamming the chart and the 500-label budget. New input
+//        `iceCooldownBars` (default 5) suppresses re-fires within N
+//        bars of the last iceberg. 0 disables (legacy). State vars
+//        `lastIceBar` / `lastIceType` already existed; just gated.
+//        Fix 4 — HVN > LVN runtime guard.
+//        A user could set both thresholds to 0.4, causing the
+//        else-if in section 5 to silently drop LVN classification (HVN
+//        wins the tie). Now `runtime.error` at script load with a
+//        clear message pointing to the setting group.
+//        Rejected claims (verified non-bugs):
+//          - Revert prev-session [barOffset] indexing: v3.4 is correct
+//            (quant: evaluate pivot vs levels at pivot bar's time);
+//            reverting would create the OPPOSITE inconsistency with
+//            currDev and composite indexing. UX tension acknowledged
+//            but indexing is right.
+//          - AVWAP first-bar-of-session invisible: 1-bar VWAP equals
+//            hlc3 of that bar, not yet a meaningful weighted average.
+//            Hiding it is defensible; plotting it would need 2 plots
+//            (cost) to break the cross-session line cleanly. Cosmetic.
+//          - Composite raw-bar redistribution vs overlap-ratio merge:
+//            raw redistribution would exceed max_bars_back on a
+//            multi-session composite at Daily anchor + intraday.
+//            Current overlap-ratio is the pragmatic ceiling, accepted
+//            as "acceptable for HTF reference" by reviewer.
+//          - Session-anchored ATR for iceberg: would create a new
+//            problem (no iceberg detection for the first 14 bars of
+//            each session). Current rolling ATR converges within ~14
+//            bars; gap-distortion window is bounded.
+//          - Change default sentiment method to Buying Pressure:
+//            silently shifts behaviour for every existing user. Default
+//            stability matters; option is exposed for users who want it.
+//          - Runtime warning for VP truncation: documented in v3.5
+//            tooltips + changelog. Adding chart UI surface for a niche
+//            edge case is clutter.
 // v3.9 — Three real fixes from a 4-claim review (one rejected).
 //        Fix 1 — Hardened cmp-symbol request.security calls.
 //        `ignore_invalid_symbol = true` added to all 3 cmp fetches.
@@ -657,7 +717,7 @@
 // Best paired with VP/AVWAP confluence gating for high-quality signals.
 
 //@version=6
-indicator('SMT + VP + AVWAP + Ice [v3.9]', 'SMT+VP3.9', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
+indicator('SMT + VP + AVWAP + Ice [v3.10]', 'SMT+VP3.10', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -685,6 +745,15 @@ grpPivot = 'SMT — Pivot Detection'
 //         usual sweet spot; 1 is too noisy.
 pivotLeftLen  = input.int(5, 'Pivot Left Bars',  minval = 1, maxval = 50, tooltip = 'Bars BEFORE a swing that it must exceed to count as a pivot. Swing-significance filter — higher is stricter. Costs NO signal delay (these bars are already history when the pivot prints).', group = grpPivot)
 pivotRightLen = input.int(3, 'Pivot Right Bars', minval = 1, maxval = 50, tooltip = 'Bars AFTER a swing that must fail to exceed it before the pivot confirms. THIS is the SMT signal lag — a divergence prints this many bars after the pivot. Lower = faster but more false pivots. 2-3 is the usual sweet spot; 1 is too noisy.', group = grpPivot)
+// v3.10: cmp-symbol local-extreme window for SMT comparison.
+// Tightly correlated cmp symbols (ES/NQ/YM, EURUSD/GBPUSD) can pivot
+// 1-2 bars offset from the chart's pivot. Sampling cmp at the EXACT
+// chart-pivot bar then catches cmp 1-2 bars past its own extreme
+// (post-peak), producing phantom "lower high" / "higher low" reads
+// → false divergences. This window takes cmp's local high/low over
+// ±N bars around the chart's pivot bar instead of the same-bar value.
+// 0 = same-bar (legacy, pre-v3.10). 1 = ±1 bar (3-bar window).
+smtCmpWindow  = input.int(1, 'Cmp Local-Extreme Window (± bars)', minval = 0, maxval = 5, tooltip = 'Bars on each side of the chart pivot bar over which to take the cmp symbol local high (for bear setups) or low (for bull setups). Handles 1-2 bar pivot offsets between tightly correlated symbols (ES/NQ, EUR/GBP), cutting false divergences. 0 disables (legacy same-bar sampling).', group = grpPivot)
 pivotSrcMode = input.string('Wick', 'Pivot Source', options = ['Wick', 'Body'], tooltip = 'Wick uses high/low; Body uses max/min of open/close.', group = grpPivot)
 showPivotMarkers = input.bool(false, 'Show Pivot Markers', group = grpPivot)
 
@@ -768,8 +837,15 @@ vpNeutralBinColor = input.color(color.new(GRAY, 70), 'Neutral Bin Color', group 
 
 grpHVN = 'HVN / LVN Classification'
 vpShowHVN      = input.bool(false, 'Mark HVN / LVN Levels', tooltip = 'High Volume Nodes (HVN) = consolidation/value zones — price tends to dwell. Low Volume Nodes (LVN) = thin zones — price tends to traverse quickly, good no-mans-land for stop placement.', group = grpHVN)
-vpHVNThreshold = input.float(0.7, 'HVN Threshold (% of POC)', minval = 0.3, maxval = 0.95, step = 0.05, tooltip = 'Bin counts as HVN if its volume is at least this fraction of the POC bin. 0.7 = 70%.', group = grpHVN)
-vpLVNThreshold = input.float(0.2, 'LVN Threshold (% of POC)', minval = 0.05, maxval = 0.4, step = 0.05, tooltip = 'Bin counts as LVN if its volume is between 0 and this fraction of the POC bin. 0.2 = 20%.', group = grpHVN)
+vpHVNThreshold = input.float(0.7, 'HVN Threshold (% of POC)', minval = 0.3, maxval = 0.95, step = 0.05, tooltip = 'Bin counts as HVN if its volume is at least this fraction of the POC bin. 0.7 = 70%. Must be > LVN threshold.', group = grpHVN)
+vpLVNThreshold = input.float(0.2, 'LVN Threshold (% of POC)', minval = 0.05, maxval = 0.4, step = 0.05, tooltip = 'Bin counts as LVN if its volume is between 0 and this fraction of the POC bin. 0.2 = 20%. Must be < HVN threshold.', group = grpHVN)
+// v3.10: enforce HVN > LVN at input time. Without this guard a user
+// could set both to 0.4 and a bin meeting both conditions would silently
+// be classified HVN only (the else-if in section 5 picks HVN first),
+// dropping LVN classification entirely. runtime.error stops the
+// indicator with a clear message at compile load.
+if vpHVNThreshold <= vpLVNThreshold
+    runtime.error('HVN Threshold (' + str.tostring(vpHVNThreshold) + ') must be greater than LVN Threshold (' + str.tostring(vpLVNThreshold) + '). Settings -> HVN / LVN Classification.')
 vpHVNColor     = input.color(color.new(GOLD, 50), 'HVN Line Color', group = grpHVN)
 vpLVNColor     = input.color(color.new(GRAY, 60), 'LVN Line Color', group = grpHVN)
 
@@ -857,6 +933,12 @@ iceVolMult        = input.float(2.0, 'Volume Multiplier (× SMA20)', minval = 1.
 iceRangeMult      = input.float(0.5, 'Max Range (× ATR14)', minval = 0.1, maxval = 2.0, step = 0.05, tooltip = 'Bar range must be LESS than this multiple of ATR(14). Narrow range = absorption.', group = grpIce)
 iceCloseThreshold = input.float(0.33, 'Close Position Threshold', minval = 0.1, maxval = 0.5, step = 0.05, tooltip = 'Close must be in top/bottom N of bar range. 0.33 = top/bottom third.', group = grpIce)
 iceRequireConf    = input.bool(true, 'Require VP/AVWAP Confluence', tooltip = 'Only fire icebergs whose bar range straddles a tracked level.', group = grpIce)
+// v3.10: cooldown between iceberg fires. During sustained absorption
+// 5-10 consecutive bars can each qualify (same-side, same-SMA-20 baseline).
+// They are not statistically independent events — treating each as a fresh
+// signal spams labels/alerts and burns the 500-label budget. Cooldown
+// suppresses re-fires within N bars of the last iceberg.
+iceCooldownBars   = input.int(5, 'Cooldown (bars)', minval = 0, maxval = 50, tooltip = 'Minimum bars between iceberg signals. During a long absorption phase a series of bars can all qualify (same SMA-20 baseline, same setup) — treating each as a fresh signal spams labels and alerts. 5 is a sensible default; 0 disables.', group = grpIce)
 iceAlertEnabled   = input.bool(true, 'Alert on Iceberg', group = grpIce)
 iceBullColor      = input.color(GREEN, 'Bullish Iceberg', group = grpIce)
 iceBearColor      = input.color(RED,   'Bearish Iceberg', group = grpIce)
@@ -973,6 +1055,21 @@ computeProfile(array<float> bins, int rows, float vaTargetRatio) =>
 [s1High, s1Low] = request.security(sym1, timeframe.period, [pivotSrcHigh, pivotSrcLow], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_on, ignore_invalid_symbol = true)
 [s2High, s2Low] = request.security(sym2, timeframe.period, [pivotSrcHigh, pivotSrcLow], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_on, ignore_invalid_symbol = true)
 [s3High, s3Low] = request.security(sym3, timeframe.period, [pivotSrcHigh, pivotSrcLow], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_on, ignore_invalid_symbol = true)
+
+// v3.10: cmp local-extreme series — rolling max/min over a window
+// centred on the chart's pivot bar. ta.highest/lowest at top level so
+// Pine maintains the series consistently (avoids the conditional-call
+// warning that hoisted smtBearConf/iceConfluence). The lookback length
+// is `2 * smtCmpWindow + 1` (default 3 bars). Sampled inside the SMT
+// blocks via `[pivotRightLen - smtCmpWindow]` to align the window with
+// the chart's pivot bar.
+smtCmpWinLen = 2 * smtCmpWindow + 1
+s1HighMax = ta.highest(s1High, smtCmpWinLen)
+s1LowMin  = ta.lowest (s1Low,  smtCmpWinLen)
+s2HighMax = ta.highest(s2High, smtCmpWinLen)
+s2LowMin  = ta.lowest (s2Low,  smtCmpWinLen)
+s3HighMax = ta.highest(s3High, smtCmpWinLen)
+s3LowMin  = ta.lowest (s3Low,  smtCmpWinLen)
 
 // v3.3: asymmetric L/R — pivotRightLen controls confirmation lag.
 phVal = ta.pivothigh(pivotSrcHigh, pivotLeftLen, pivotRightLen)
@@ -1631,9 +1728,16 @@ string smtBullConf = checkConfluence(plVal, pivotRightLen)
 // "matching" cmp pivot value across consecutive chart pivots.
 if not na(phVal)
     int pivotBar = bar_index - pivotRightLen
-    float s1At = sym1Corr == 'Inverse' ? s1Low[pivotRightLen]  : s1High[pivotRightLen]
-    float s2At = sym2Corr == 'Inverse' ? s2Low[pivotRightLen]  : s2High[pivotRightLen]
-    float s3At = sym3Corr == 'Inverse' ? s3Low[pivotRightLen]  : s3High[pivotRightLen]
+    // v3.10: sample cmp's LOCAL EXTREME in a ±smtCmpWindow band around
+    // the chart's pivot bar (instead of the same-bar value). For positive-
+    // correlated cmp at a chart pivot HIGH we want cmp's local high in
+    // the window; for inverse cmp at a chart pivot HIGH we want cmp's
+    // local low (since inverse should be pivoting low). With window=0
+    // this reduces to the legacy same-bar read.
+    int cmpOff = pivotRightLen - smtCmpWindow
+    float s1At = sym1Corr == 'Inverse' ? s1LowMin[cmpOff]  : s1HighMax[cmpOff]
+    float s2At = sym2Corr == 'Inverse' ? s2LowMin[cmpOff]  : s2HighMax[cmpOff]
+    float s3At = sym3Corr == 'Inverse' ? s3LowMin[cmpOff]  : s3HighMax[cmpOff]
 
     if not na(prevPHChart)
         bool chartHH = phVal > prevPHChart
@@ -1683,11 +1787,21 @@ if not na(phVal)
                 string msg  = hasConf ? base + ' | ★' + str.tostring(lastBearConfCount) + ' Confluence: ' + conf : base
                 alert(msg, alert.freq_once_per_bar_close)
 
+    // v3.10: per-symbol prevPH update — only overwrite for cmp symbols
+    // whose s*At is NON-na. With v3.9's gaps_on + ignore_invalid_symbol,
+    // s*At can legitimately be na at a chart pivot (cmp had a gap or
+    // invalid symbol). Before this gate, `prevPHS1 := na` then made the
+    // NEXT pivot's `not na(prevPHS1)` guard fail too — so one cmp-gap
+    // poisoned TWO consecutive divergence opportunities. Now the prev
+    // snapshot keeps its last good value across cmp-gap pivots.
     prevPHChart := phVal
-    prevPHS1    := s1At
-    prevPHS2    := s2At
-    prevPHS3    := s3At
     prevPHBar   := pivotBar
+    if not na(s1At)
+        prevPHS1 := s1At
+    if not na(s2At)
+        prevPHS2 := s2At
+    if not na(s3At)
+        prevPHS3 := s3At
 
 // ─── Bullish SMT (confirmed pivot LOW) ──────────────────────────────────────
 // NOTE: structurally symmetric with the bearish block above. Any logic
@@ -1699,9 +1813,11 @@ if not na(phVal)
 // We sample cmp's HIGH (not LOW) at the chart's pivot-low bar.
 if not na(plVal)
     int pivotBar = bar_index - pivotRightLen
-    float s1At = sym1Corr == 'Inverse' ? s1High[pivotRightLen] : s1Low[pivotRightLen]
-    float s2At = sym2Corr == 'Inverse' ? s2High[pivotRightLen] : s2Low[pivotRightLen]
-    float s3At = sym3Corr == 'Inverse' ? s3High[pivotRightLen] : s3Low[pivotRightLen]
+    // v3.10: cmp local-extreme window — see bear block.
+    int cmpOff = pivotRightLen - smtCmpWindow
+    float s1At = sym1Corr == 'Inverse' ? s1HighMax[cmpOff] : s1LowMin[cmpOff]
+    float s2At = sym2Corr == 'Inverse' ? s2HighMax[cmpOff] : s2LowMin[cmpOff]
+    float s3At = sym3Corr == 'Inverse' ? s3HighMax[cmpOff] : s3LowMin[cmpOff]
 
     if not na(prevPLChart)
         bool chartLL = plVal < prevPLChart
@@ -1750,11 +1866,16 @@ if not na(plVal)
                 string msg  = hasConf ? base + ' | ★' + str.tostring(lastBullConfCount) + ' Confluence: ' + conf : base
                 alert(msg, alert.freq_once_per_bar_close)
 
+    // v3.10: per-symbol prevPL update — only overwrite for cmp symbols
+    // whose s*At is NON-na (see bear block).
     prevPLChart := plVal
-    prevPLS1    := s1At
-    prevPLS2    := s2At
-    prevPLS3    := s3At
     prevPLBar   := pivotBar
+    if not na(s1At)
+        prevPLS1 := s1At
+    if not na(s2At)
+        prevPLS2 := s2At
+    if not na(s3At)
+        prevPLS3 := s3At
 
 plotshape(showPivotMarkers and not na(phVal), title = 'Pivot High', style = shape.triangledown, location = location.abovebar, color = color.new(GRAY, 0), size = size.tiny, offset = -pivotRightLen)
 plotshape(showPivotMarkers and not na(plVal), title = 'Pivot Low',  style = shape.triangleup,   location = location.belowbar, color = color.new(GRAY, 0), size = size.tiny, offset = -pivotRightLen)
@@ -2387,7 +2508,14 @@ if iceEnabled and barstate.isconfirmed and not na(volSMA) and volSMA > 0 and not
         bool isBullIce = volSpike and narrowRange and closeHigh and not closeLow
         bool isBearIce = volSpike and narrowRange and closeLow  and not closeHigh
 
-        if isBullIce or isBearIce
+        // v3.10: cooldown gate. During sustained absorption (long
+        // consolidation tail) 5-10 consecutive bars can each qualify —
+        // same-side, same SMA-20 baseline, not statistically independent.
+        // Treating each as a fresh signal spams labels/alerts and burns
+        // the 500-label budget. Suppress re-fires within iceCooldownBars
+        // of the last iceberg. Default 5; 0 disables (legacy behaviour).
+        bool iceCooldownOK = na(lastIceBar) or iceCooldownBars == 0 or (bar_index - lastIceBar) > iceCooldownBars
+        if (isBullIce or isBearIce) and iceCooldownOK
             string confluence = iceConfluence   // pre-computed at top-level (v3.2)
             bool hasConf  = str.length(confluence) > 0
             int  confCount = hasConf ? countConfluenceTags(confluence) : 0
@@ -2423,7 +2551,7 @@ if showDash and barstate.islast
 
     // Header.
     table.cell(dashTable, 0, 0, 'SMT+VP+Ice', text_color = color.white, text_size = dashTxtSz, bgcolor = hdrBg)
-    table.cell(dashTable, 1, 0, 'v3.9',       text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
+    table.cell(dashTable, 1, 0, 'v3.10',      text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
 
     // Current developing levels.
     table.cell(dashTable, 0, 1, 'Curr POC', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
