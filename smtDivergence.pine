@@ -1,4 +1,4 @@
-// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v3.10]
+// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v3.11]
 // Smart Money Technique (multi-symbol divergence) + session Volume Profile
 // with previous-session levels, naked POC tracking, confluence alerts, status
 // dashboard, session-anchored VWAP with σ bands, and iceberg/absorption
@@ -38,6 +38,39 @@
 //          of every realtime tick. Bins only update on `barstate.isconfirmed`,
 //          so the previous every-tick delete-and-rebuild of ~24 boxes
 //          produced identical output. Tracked via `lastVpDrawBar` var.
+// v3.11 — Both review claims valid → both applied. These together fix
+//        the indicator's weakest setup: fast-sweep reversal at an EQH /
+//        nPOC pool — the higher-EV setup smcV16's EQH×N tracking is
+//        designed for, but which v3.10 was structurally suppressing.
+//        Fix 1 — `levelsInBar` strict-containment relaxed to tolerance.
+//        Was: a level had to satisfy `level >= barLow and level <= barHigh`
+//        (strict containment). On a fast sweep-reversal bar whose
+//        body+low are ABOVE the swept level (wick pierced, body
+//        rejected), the swept nPOC/HVN was JUST BELOW barLow → zero
+//        confluence tags → `iceRequireConf=true` suppressed the
+//        absorption signal on the exact bar that mattered.
+//        Now: level needs to be within `[barLow - td, barHigh + td]`,
+//        where `td` is the same proximity tolerance checkConfluence
+//        uses (ATR mode by default, ticks legacy). Semantically:
+//        "the bar's range or its immediate vicinity straddles the
+//        level." Mirrors checkConfluence's "pivot near level" logic,
+//        applied to "bar near level." Catches the rejection-bar
+//        signal that strict containment was rejecting.
+//        Fix 2 — Direction-aware iceberg cooldown.
+//        v3.10's single `lastIceBar` gate suppressed the
+//        OPPOSITE-direction reversal iceberg if it printed within
+//        iceCooldownBars (default 5) of an absorption bar on the
+//        run-up — exactly the sweep-reversal setup. A bull absorption
+//        at bar X then a bear reversal at bar X+3 had the bear
+//        silently swallowed.
+//        Now: separate `lastBullIceBar` and `lastBearIceBar`
+//        trackers. Cooldown gates same-direction re-fires only
+//        (legitimate noise suppression — the original v3.10 intent
+//        for sustained one-side absorption) but lets opposite-direction
+//        icebergs fire freely. Bull at X, bear at X+3 → both fire,
+//        both labeled. Anti-spam intent preserved on the case it was
+//        designed for; the false suppression on the reversal case is
+//        gone.
 // v3.10 — Four real fixes from a 9-claim review (five rejected with
 //        reasoning — see end of this block).
 //        Fix 1 — Per-symbol prevPH / prevPL update on cmp-na bars.
@@ -717,7 +750,7 @@
 // Best paired with VP/AVWAP confluence gating for high-quality signals.
 
 //@version=6
-indicator('SMT + VP + AVWAP + Ice [v3.10]', 'SMT+VP3.10', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
+indicator('SMT + VP + AVWAP + Ice [v3.11]', 'SMT+VP3.11', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -1170,6 +1203,15 @@ var int    lastIceBar  = na
 var string lastIceType = ''   // 'Bull' or 'Bear'
 var bool   lastIceConf = false
 var int    lastIceConfCount = 0      // v3.0
+// v3.11: direction-specific cooldown trackers. v3.10's single
+// `lastIceBar` cooldown suppressed the REVERSAL iceberg of opposite
+// direction if it printed within iceCooldownBars of an absorption
+// bar on the run-up — exactly the high-EV sweep-reversal setup.
+// Tracking bull and bear last-fired bars separately means a bear
+// iceberg can fire shortly after a bull (and vice versa) without
+// being silently swallowed.
+var int    lastBullIceBar = na
+var int    lastBearIceBar = na
 
 // VP session aggregates.
 var float vpSessHigh  = na
@@ -1594,6 +1636,22 @@ checkConfluence(float price, int barOffset) =>
 levelsInBar(float barLow, float barHigh, int barOffset) =>
     string out = ''
     if barHigh >= barLow
+        // v3.11: tolerance-expanded range. Strict containment
+        // (`level >= barLow and level <= barHigh`) missed real sweep-
+        // reversal icebergs whose body+low are above the swept level —
+        // the wick pierced and the body rejected, but the bar's range
+        // didn't QUITE contain the nPOC/HVN that triggered the sweep
+        // → zero confluence tags → suppressed by iceRequireConf.
+        // Now expands the test range by `td` on each side. `td` is
+        // computed the same way as checkConfluence (ATR mode by
+        // default, ticks legacy). A level within `td` of the bar's
+        // range still counts as a confluence hit. Same semantics as
+        // checkConfluence's "pivot near level" check, applied to
+        // "bar's range near level."
+        float barAtr = confAtr[barOffset]
+        float td = confDistMode == 'ATR' ? (na(barAtr) ? confTicks * syminfo.mintick : confAtrMult * barAtr) : confTicks * syminfo.mintick
+        float lo = barLow  - td
+        float hi = barHigh + td
         // Developing-session levels at the bar being checked. v2.7: explicit
         // [barOffset] indexing for symmetry with checkConfluence. Iceberg
         // calls with barOffset=0 so currDevPOC[0]==currDevPOC (no behaviour
@@ -1601,11 +1659,11 @@ levelsInBar(float barLow, float barHigh, int barOffset) =>
         float barDevPOC = currDevPOC[barOffset]
         float barDevVAH = currDevVAH[barOffset]
         float barDevVAL = currDevVAL[barOffset]
-        if not na(barDevPOC) and barDevPOC >= barLow and barDevPOC <= barHigh
+        if not na(barDevPOC) and barDevPOC >= lo and barDevPOC <= hi
             out := out + 'POC '
-        if not na(barDevVAH) and barDevVAH >= barLow and barDevVAH <= barHigh
+        if not na(barDevVAH) and barDevVAH >= lo and barDevVAH <= hi
             out := out + 'VAH '
-        if not na(barDevVAL) and barDevVAL >= barLow and barDevVAL <= barHigh
+        if not na(barDevVAL) and barDevVAL >= lo and barDevVAL <= hi
             out := out + 'VAL '
         // Previous-session levels — v3.4: [barOffset] indexed for symmetry
         // with checkConfluence. Iceberg calls with barOffset=0 so this is
@@ -1615,12 +1673,12 @@ levelsInBar(float barLow, float barHigh, int barOffset) =>
         float  barPrevVAH  = prevSessVAH[barOffset]
         float  barPrevVAL  = prevSessVAL[barOffset]
         string barPrevSent = prevSessPOCSentiment[barOffset]
-        if not na(barPrevPOC) and barPrevPOC >= barLow and barPrevPOC <= barHigh
+        if not na(barPrevPOC) and barPrevPOC >= lo and barPrevPOC <= hi
             string sentSuffix = na(barPrevSent) or barPrevSent == 'Neutral' ? '' : '(' + barPrevSent + ')'
             out := out + 'pPOC' + sentSuffix + ' '
-        if not na(barPrevVAH) and barPrevVAH >= barLow and barPrevVAH <= barHigh
+        if not na(barPrevVAH) and barPrevVAH >= lo and barPrevVAH <= hi
             out := out + 'pVAH '
-        if not na(barPrevVAL) and barPrevVAL >= barLow and barPrevVAL <= barHigh
+        if not na(barPrevVAL) and barPrevVAL >= lo and barPrevVAL <= hi
             out := out + 'pVAL '
         // Composite (multi-session aggregate) levels — added in v3.0.
         // v3.1: same min-2-sessions gate as checkConfluence (see comment
@@ -1630,11 +1688,11 @@ levelsInBar(float barLow, float barHigh, int barOffset) =>
         float barComVAH   = compositeVAH[barOffset]
         float barComVAL   = compositeVAL[barOffset]
         int   barCompSess = compositeSessionCount[barOffset]
-        if not na(barComPOC) and barCompSess >= 2 and barComPOC >= barLow and barComPOC <= barHigh
+        if not na(barComPOC) and barCompSess >= 2 and barComPOC >= lo and barComPOC <= hi
             out := out + 'cPOC '
-        if not na(barComVAH) and barCompSess >= 2 and barComVAH >= barLow and barComVAH <= barHigh
+        if not na(barComVAH) and barCompSess >= 2 and barComVAH >= lo and barComVAH <= hi
             out := out + 'cVAH '
-        if not na(barComVAL) and barCompSess >= 2 and barComVAL >= barLow and barComVAL <= barHigh
+        if not na(barComVAL) and barCompSess >= 2 and barComVAL >= lo and barComVAL <= hi
             out := out + 'cVAL '
         // Naked POCs — v3.0: removed `break` so a bar straddling multiple
         // nPOCs tags all of them, not just the first.
@@ -1642,14 +1700,14 @@ levelsInBar(float barLow, float barHigh, int barOffset) =>
         if sz > 0
             for i = 0 to sz - 1
                 float p = array.get(nakedPOCs, i)
-                if p >= barLow and p <= barHigh
+                if p >= lo and p <= hi
                     out := out + 'nPOC@' + str.tostring(p, format.mintick) + ' '
         if avwapEnabled
             float pivAvwap = avwap[barOffset]
             float pivSigma = avwapSigma[barOffset]
             // Require pivSigma > 0 (same reasoning as checkConfluence — skips
             // session-boundary bars where AVWAP has only 1 bar of accumulation).
-            if not na(pivAvwap) and not na(pivSigma) and pivSigma > 0 and pivAvwap >= barLow and pivAvwap <= barHigh
+            if not na(pivAvwap) and not na(pivSigma) and pivSigma > 0 and pivAvwap >= lo and pivAvwap <= hi
                 out := out + 'AVWAP '
             if not na(pivAvwap) and not na(pivSigma) and pivSigma > 0
                 float u1 = pivAvwap + sigma1Mult * pivSigma
@@ -1658,17 +1716,17 @@ levelsInBar(float barLow, float barHigh, int barOffset) =>
                 float l2 = pivAvwap - sigma2Mult * pivSigma
                 float u3 = pivAvwap + sigma3Mult * pivSigma
                 float l3 = pivAvwap - sigma3Mult * pivSigma
-                if showSigma1 and u1 >= barLow and u1 <= barHigh
+                if showSigma1 and u1 >= lo and u1 <= hi
                     out := out + '+' + str.tostring(sigma1Mult, '#.#') + 'σ '
-                if showSigma1 and l1 >= barLow and l1 <= barHigh
+                if showSigma1 and l1 >= lo and l1 <= hi
                     out := out + '-' + str.tostring(sigma1Mult, '#.#') + 'σ '
-                if showSigma2 and u2 >= barLow and u2 <= barHigh
+                if showSigma2 and u2 >= lo and u2 <= hi
                     out := out + '+' + str.tostring(sigma2Mult, '#.#') + 'σ '
-                if showSigma2 and l2 >= barLow and l2 <= barHigh
+                if showSigma2 and l2 >= lo and l2 <= hi
                     out := out + '-' + str.tostring(sigma2Mult, '#.#') + 'σ '
-                if showSigma3 and u3 >= barLow and u3 <= barHigh
+                if showSigma3 and u3 >= lo and u3 <= hi
                     out := out + '+' + str.tostring(sigma3Mult, '#.#') + 'σ '
-                if showSigma3 and l3 >= barLow and l3 <= barHigh
+                if showSigma3 and l3 >= lo and l3 <= hi
                     out := out + '-' + str.tostring(sigma3Mult, '#.#') + 'σ '
     // Strip the trailing space left by the tag appends.
     if str.endswith(out, ' ')
@@ -2508,14 +2566,17 @@ if iceEnabled and barstate.isconfirmed and not na(volSMA) and volSMA > 0 and not
         bool isBullIce = volSpike and narrowRange and closeHigh and not closeLow
         bool isBearIce = volSpike and narrowRange and closeLow  and not closeHigh
 
-        // v3.10: cooldown gate. During sustained absorption (long
-        // consolidation tail) 5-10 consecutive bars can each qualify —
-        // same-side, same SMA-20 baseline, not statistically independent.
-        // Treating each as a fresh signal spams labels/alerts and burns
-        // the 500-label budget. Suppress re-fires within iceCooldownBars
-        // of the last iceberg. Default 5; 0 disables (legacy behaviour).
-        bool iceCooldownOK = na(lastIceBar) or iceCooldownBars == 0 or (bar_index - lastIceBar) > iceCooldownBars
-        if (isBullIce or isBearIce) and iceCooldownOK
+        // v3.10 + v3.11: direction-aware cooldown. v3.10's single
+        // lastIceBar gate suppressed the OPPOSITE-direction reversal
+        // iceberg if it printed within iceCooldownBars of an absorption
+        // bar on the run-up — exactly the high-EV sweep-reversal setup.
+        // v3.11 tracks bull/bear last-fired bars separately so a bull
+        // iceberg only blocks subsequent BULL re-fires (and bear blocks
+        // bear). Opposite-direction icebergs are independent events
+        // and fire freely.
+        bool bullCooldownOK = na(lastBullIceBar) or iceCooldownBars == 0 or (bar_index - lastBullIceBar) > iceCooldownBars
+        bool bearCooldownOK = na(lastBearIceBar) or iceCooldownBars == 0 or (bar_index - lastBearIceBar) > iceCooldownBars
+        if (isBullIce and bullCooldownOK) or (isBearIce and bearCooldownOK)
             string confluence = iceConfluence   // pre-computed at top-level (v3.2)
             bool hasConf  = str.length(confluence) > 0
             int  confCount = hasConf ? countConfluenceTags(confluence) : 0
@@ -2534,6 +2595,13 @@ if iceEnabled and barstate.isconfirmed and not na(volSMA) and volSMA > 0 and not
                 lastIceType      := typeS
                 lastIceConf      := hasConf
                 lastIceConfCount := confCount
+                // v3.11: also stamp the direction-specific cooldown tracker
+                // so the next iceberg of the OPPOSITE direction is allowed
+                // to fire immediately, but same-direction is gated.
+                if isBull
+                    lastBullIceBar := bar_index
+                else
+                    lastBearIceBar := bar_index
 
                 if iceAlertEnabled
                     alert(typeS + 'ish Iceberg' + (hasConf ? ' | ★' + str.tostring(confCount) + ' ' + confluence : ''), alert.freq_once_per_bar_close)
@@ -2551,7 +2619,7 @@ if showDash and barstate.islast
 
     // Header.
     table.cell(dashTable, 0, 0, 'SMT+VP+Ice', text_color = color.white, text_size = dashTxtSz, bgcolor = hdrBg)
-    table.cell(dashTable, 1, 0, 'v3.10',      text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
+    table.cell(dashTable, 1, 0, 'v3.11',      text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
 
     // Current developing levels.
     table.cell(dashTable, 0, 1, 'Curr POC', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
