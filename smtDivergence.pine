@@ -1,4 +1,4 @@
-// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v3.12]
+// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v3.13]
 // Smart Money Technique (multi-symbol divergence) + session Volume Profile
 // with previous-session levels, naked POC tracking, confluence alerts, status
 // dashboard, session-anchored VWAP with σ bands, and iceberg/absorption
@@ -38,6 +38,32 @@
 //          of every realtime tick. Bins only update on `barstate.isconfirmed`,
 //          so the previous every-tick delete-and-rebuild of ~24 boxes
 //          produced identical output. Tracked via `lastVpDrawBar` var.
+// v3.13 — Two refinements to the v3.10–v3.12 SMT work.
+//        Fix 1 — Comparison-symbol source decoupled, default Body.
+//        v3.10's local-extreme window reads the cmp via HIGH/LOW. A
+//        single noisy wick spike in the cmp then becomes the window
+//        max/min and flips the divergence classification → a phantom
+//        divergence. You cannot de-noise a wick with peak detection —
+//        the wick IS a valid local peak; the only cure is to stop
+//        sampling wicks. New `smtCmpSrc` input (default Body = max/min
+//        of open/close) makes the cmp window read bodies, removing the
+//        wick-spike noise source while keeping the window's offset-
+//        tolerance benefit. SMT only compares the cmp's DIRECTION vs
+//        its own prior pivot (not cross-symbol absolute price), so a
+//        noise-resistant cmp source is valid. The CHART pivots stay on
+//        `pivotSrcMode` (wick by default — wicks are the liquidity
+//        sweeps SMC wants); only the cmp fetch changed. Wick option
+//        reproduces v3.12 behaviour.
+//        Fix 2 — Per-symbol recency baseline bars (closes the v3.12 C4
+//        leftover). The recency gate measured against the GLOBAL
+//        prevPHBar/prevPLBar, but after the C2 per-symbol-baseline fix
+//        a gapped symbol's actual comparison baseline can be older than
+//        the global bar — so a stale per-symbol comparison could span
+//        more than smtMaxPivotBars while the global-bar recency check
+//        still passed. Now tracks prevPHBarS1..3 / prevPLBarS1..3 and
+//        gates each symbol's recency against its OWN baseline bar.
+//        Only matters when smtMaxPivotBars > 0 AND a cmp gapped — but
+//        makes the gate exact, consistent with the per-symbol design.
 // v3.12 — SMT core correctness pass. Four issues from a deep audit — the
 //        strongest review of the series. All four target the divergence
 //        engine itself (the decision logic), not visuals.
@@ -796,7 +822,7 @@
 // Best paired with VP/AVWAP confluence gating for high-quality signals.
 
 //@version=6
-indicator('SMT + VP + AVWAP + Ice [v3.12]', 'SMT+VP3.12', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
+indicator('SMT + VP + AVWAP + Ice [v3.13]', 'SMT+VP3.13', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -833,6 +859,17 @@ pivotRightLen = input.int(3, 'Pivot Right Bars', minval = 1, maxval = 50, toolti
 // ±N bars around the chart's pivot bar instead of the same-bar value.
 // 0 = same-bar (legacy, pre-v3.10). 1 = ±1 bar (3-bar window).
 smtCmpWindow  = input.int(1, 'Cmp Local-Extreme Window (± bars)', minval = 0, maxval = 5, tooltip = 'Bars on each side of the chart pivot bar over which to take the cmp symbol local high (for bear setups) or low (for bull setups). Handles 1-2 bar pivot offsets between tightly correlated symbols (ES/NQ, EUR/GBP), cutting false divergences. 0 disables (legacy same-bar sampling). MUST be <= Pivot Right Bars (the window cannot look into the future).', group = grpPivot)
+// v3.13: comparison-symbol SOURCE, decoupled from the chart pivot source.
+// The local-extreme window reads the cmp over a ±N-bar band; if it samples
+// HIGH/LOW, a single noisy wick spike in the cmp becomes the window max/min
+// and flips the divergence classification. (You can't de-noise a wick by
+// peak-detection — the wick IS a valid local peak.) Reading BODIES
+// (max/min of open/close) removes that noise source while keeping the
+// offset-tolerance benefit. SMT only cares about the cmp's DIRECTION vs its
+// own prior pivot, not cross-symbol absolute price, so a noise-resistant
+// source is valid. Chart pivots stay on `pivotSrcMode` (wick by default —
+// wicks are liquidity sweeps you WANT for SMC); only the cmp window uses this.
+smtCmpSrc     = input.string('Body', 'Cmp Comparison Source', options = ['Body', 'Wick'], tooltip = 'Source for sampling the comparison symbol inside the local-extreme window. Body (max/min of open/close) ignores single-bar wick spikes that otherwise flip the divergence classification — recommended, especially on noisy FX. Wick (high/low) = legacy v3.12 behaviour. Independent of the chart Pivot Source, which stays wick-based for sweep detection.', group = grpPivot)
 // v3.12 (C3): EQH/EQL tolerance. A chart high EXACTLY equal to the prior
 // pivot high used to register as neither higher NOR lower → no SMT could
 // fire at an equal high, which is THE premium liquidity-pool setup. This
@@ -1153,9 +1190,16 @@ computeProfile(array<float> bins, int rows, float vaTargetRatio) =>
 //     gap bars where the chart printed a pivot against a STALE cmp
 //     price. With gaps_on the existing na guards skip those pivots
 //     properly — fewer SMT signals but no data-artifact false positives.
-[s1High, s1Low] = request.security(sym1, timeframe.period, [pivotSrcHigh, pivotSrcLow], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_on, ignore_invalid_symbol = true)
-[s2High, s2Low] = request.security(sym2, timeframe.period, [pivotSrcHigh, pivotSrcLow], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_on, ignore_invalid_symbol = true)
-[s3High, s3Low] = request.security(sym3, timeframe.period, [pivotSrcHigh, pivotSrcLow], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_on, ignore_invalid_symbol = true)
+// v3.13: cmp fetch uses the cmp comparison source (body by default), NOT
+// the chart's pivotSrcHigh/Low. These expressions are evaluated in each
+// cmp's context inside request.security, so math.max(open, close) gives
+// THAT symbol's body extreme. Chart pivots (phVal/plVal) still use
+// pivotSrcHigh/Low independently.
+cmpHiSrc = smtCmpSrc == 'Body' ? math.max(open, close) : high
+cmpLoSrc = smtCmpSrc == 'Body' ? math.min(open, close) : low
+[s1High, s1Low] = request.security(sym1, timeframe.period, [cmpHiSrc, cmpLoSrc], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_on, ignore_invalid_symbol = true)
+[s2High, s2Low] = request.security(sym2, timeframe.period, [cmpHiSrc, cmpLoSrc], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_on, ignore_invalid_symbol = true)
+[s3High, s3Low] = request.security(sym3, timeframe.period, [cmpHiSrc, cmpLoSrc], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_on, ignore_invalid_symbol = true)
 
 // v3.10: cmp local-extreme series — rolling max/min over a window
 // centred on the chart's pivot bar. ta.highest/lowest at top level so
@@ -1260,6 +1304,15 @@ var int   prevPHBar   = na
 var float prevPHChartS1 = na
 var float prevPHChartS2 = na
 var float prevPHChartS3 = na
+// v3.13: per-symbol baseline BARS for the recency gate. After the C2
+// per-symbol-baseline fix, a symbol's actual comparison baseline can be
+// OLDER than the global prevPHBar if that symbol gapped. Gating recency
+// against the global bar would then let a stale per-symbol comparison
+// span more than smtMaxPivotBars while still passing. Tracking each
+// symbol's own baseline bar makes the recency gate exact.
+var int   prevPHBarS1 = na
+var int   prevPHBarS2 = na
+var int   prevPHBarS3 = na
 
 var float prevPLChart = na
 var float prevPLS1    = na
@@ -1269,6 +1322,9 @@ var int   prevPLBar   = na
 var float prevPLChartS1 = na
 var float prevPLChartS2 = na
 var float prevPLChartS3 = na
+var int   prevPLBarS1 = na
+var int   prevPLBarS2 = na
+var int   prevPLBarS3 = na
 
 // Last-fired SMT event for the dashboard.
 var int    lastBullBar = na
@@ -1882,9 +1938,14 @@ if not na(phVal)
     float s2At = sym2Corr == 'Inverse' ? s2LowMin[cmpOff]  : s2HighMax[cmpOff]
     float s3At = sym3Corr == 'Inverse' ? s3LowMin[cmpOff]  : s3HighMax[cmpOff]
 
-    // v3.12: EQH tolerance (C3) in price units, and recency gate (C4).
+    // v3.12: EQH tolerance (C3) in price units.
     float eqTd = na(confAtr[pivotRightLen]) ? 0.0 : smtEqTolAtr * confAtr[pivotRightLen]
-    bool  recencyOK = smtMaxPivotBars == 0 or na(prevPHBar) or (pivotBar - prevPHBar) <= smtMaxPivotBars
+    // v3.13: per-symbol recency gate (C4) — measured against THAT symbol's
+    // own baseline bar, not the global prevPHBar, so a gapped symbol whose
+    // baseline is stale is gated correctly.
+    bool recOK1 = smtMaxPivotBars == 0 or na(prevPHBarS1) or (pivotBar - prevPHBarS1) <= smtMaxPivotBars
+    bool recOK2 = smtMaxPivotBars == 0 or na(prevPHBarS2) or (pivotBar - prevPHBarS2) <= smtMaxPivotBars
+    bool recOK3 = smtMaxPivotBars == 0 or na(prevPHBarS3) or (pivotBar - prevPHBarS3) <= smtMaxPivotBars
 
     string conf = smtBearConf   // pre-computed at top-level for Pine consistency
     int    divCount     = 0
@@ -1894,7 +1955,7 @@ if not na(phVal)
     // prior chart baseline, so both legs share the same reference pivot.
     // (C3) `>= base - eqTd` makes an equal/near-equal high count as a
     // higher high so EQH-with-cmp-divergence fires.
-    if sym1Enabled and not na(s1At) and not na(prevPHS1) and not na(prevPHChartS1) and recencyOK
+    if sym1Enabled and not na(s1At) and not na(prevPHS1) and not na(prevPHChartS1) and recOK1
         bool chartHH = phVal >= prevPHChartS1 - eqTd
         bool chartLH = phVal <  prevPHChartS1 - eqTd
         bool s1HH = s1At > prevPHS1
@@ -1905,7 +1966,7 @@ if not na(phVal)
             divergedSyms := divergedSyms + (divCount > 0 ? ', ' : '') + shortName(sym1) + (sym1Corr == 'Inverse' ? ' (inv)' : '')
             divCount     += 1
 
-    if sym2Enabled and not na(s2At) and not na(prevPHS2) and not na(prevPHChartS2) and recencyOK
+    if sym2Enabled and not na(s2At) and not na(prevPHS2) and not na(prevPHChartS2) and recOK2
         bool chartHH = phVal >= prevPHChartS2 - eqTd
         bool chartLH = phVal <  prevPHChartS2 - eqTd
         bool s2HH = s2At > prevPHS2
@@ -1915,7 +1976,7 @@ if not na(phVal)
             divergedSyms := divergedSyms + (divCount > 0 ? ', ' : '') + shortName(sym2) + (sym2Corr == 'Inverse' ? ' (inv)' : '')
             divCount     += 1
 
-    if sym3Enabled and not na(s3At) and not na(prevPHS3) and not na(prevPHChartS3) and recencyOK
+    if sym3Enabled and not na(s3At) and not na(prevPHS3) and not na(prevPHChartS3) and recOK3
         bool chartHH = phVal >= prevPHChartS3 - eqTd
         bool chartLH = phVal <  prevPHChartS3 - eqTd
         bool s3HH = s3At > prevPHS3
@@ -1952,12 +2013,15 @@ if not na(phVal)
     if not na(s1At)
         prevPHS1      := s1At
         prevPHChartS1 := phVal
+        prevPHBarS1   := pivotBar
     if not na(s2At)
         prevPHS2      := s2At
         prevPHChartS2 := phVal
+        prevPHBarS2   := pivotBar
     if not na(s3At)
         prevPHS3      := s3At
         prevPHChartS3 := phVal
+        prevPHBarS3   := pivotBar
 
 // ─── Bullish SMT (confirmed pivot LOW) ──────────────────────────────────────
 // NOTE: structurally symmetric with the bearish block above. Any logic
@@ -1975,9 +2039,11 @@ if not na(plVal)
     float s2At = sym2Corr == 'Inverse' ? s2HighMax[cmpOff] : s2LowMin[cmpOff]
     float s3At = sym3Corr == 'Inverse' ? s3HighMax[cmpOff] : s3LowMin[cmpOff]
 
-    // v3.12: EQL tolerance (C3) and recency gate (C4) — mirror of bear block.
+    // v3.12: EQL tolerance (C3). v3.13: per-symbol recency gate — mirror of bear.
     float eqTd = na(confAtr[pivotRightLen]) ? 0.0 : smtEqTolAtr * confAtr[pivotRightLen]
-    bool  recencyOK = smtMaxPivotBars == 0 or na(prevPLBar) or (pivotBar - prevPLBar) <= smtMaxPivotBars
+    bool recOK1 = smtMaxPivotBars == 0 or na(prevPLBarS1) or (pivotBar - prevPLBarS1) <= smtMaxPivotBars
+    bool recOK2 = smtMaxPivotBars == 0 or na(prevPLBarS2) or (pivotBar - prevPLBarS2) <= smtMaxPivotBars
+    bool recOK3 = smtMaxPivotBars == 0 or na(prevPLBarS3) or (pivotBar - prevPLBarS3) <= smtMaxPivotBars
 
     string conf = smtBullConf   // pre-computed at top-level for Pine consistency
     int    divCount     = 0
@@ -1986,7 +2052,7 @@ if not na(plVal)
     // v3.12 (C2): per-symbol chartLL/chartHL against that symbol's OWN prior
     // chart baseline. (C3) `<= base + eqTd` makes an equal/near-equal low
     // count as a lower low so EQL-with-cmp-divergence fires.
-    if sym1Enabled and not na(s1At) and not na(prevPLS1) and not na(prevPLChartS1) and recencyOK
+    if sym1Enabled and not na(s1At) and not na(prevPLS1) and not na(prevPLChartS1) and recOK1
         bool chartLL = plVal <= prevPLChartS1 + eqTd
         bool chartHL = plVal >  prevPLChartS1 + eqTd
         bool s1LL = s1At < prevPLS1
@@ -1997,7 +2063,7 @@ if not na(plVal)
             divergedSyms := divergedSyms + (divCount > 0 ? ', ' : '') + shortName(sym1) + (sym1Corr == 'Inverse' ? ' (inv)' : '')
             divCount     += 1
 
-    if sym2Enabled and not na(s2At) and not na(prevPLS2) and not na(prevPLChartS2) and recencyOK
+    if sym2Enabled and not na(s2At) and not na(prevPLS2) and not na(prevPLChartS2) and recOK2
         bool chartLL = plVal <= prevPLChartS2 + eqTd
         bool chartHL = plVal >  prevPLChartS2 + eqTd
         bool s2LL = s2At < prevPLS2
@@ -2007,7 +2073,7 @@ if not na(plVal)
             divergedSyms := divergedSyms + (divCount > 0 ? ', ' : '') + shortName(sym2) + (sym2Corr == 'Inverse' ? ' (inv)' : '')
             divCount     += 1
 
-    if sym3Enabled and not na(s3At) and not na(prevPLS3) and not na(prevPLChartS3) and recencyOK
+    if sym3Enabled and not na(s3At) and not na(prevPLS3) and not na(prevPLChartS3) and recOK3
         bool chartLL = plVal <= prevPLChartS3 + eqTd
         bool chartHL = plVal >  prevPLChartS3 + eqTd
         bool s3LL = s3At < prevPLS3
@@ -2037,12 +2103,15 @@ if not na(plVal)
     if not na(s1At)
         prevPLS1      := s1At
         prevPLChartS1 := plVal
+        prevPLBarS1   := pivotBar
     if not na(s2At)
         prevPLS2      := s2At
         prevPLChartS2 := plVal
+        prevPLBarS2   := pivotBar
     if not na(s3At)
         prevPLS3      := s3At
         prevPLChartS3 := plVal
+        prevPLBarS3   := pivotBar
 
 plotshape(showPivotMarkers and not na(phVal), title = 'Pivot High', style = shape.triangledown, location = location.abovebar, color = color.new(GRAY, 0), size = size.tiny, offset = -pivotRightLen)
 plotshape(showPivotMarkers and not na(plVal), title = 'Pivot Low',  style = shape.triangleup,   location = location.belowbar, color = color.new(GRAY, 0), size = size.tiny, offset = -pivotRightLen)
@@ -2728,7 +2797,7 @@ if showDash and barstate.islast
 
     // Header.
     table.cell(dashTable, 0, 0, 'SMT+VP+Ice', text_color = color.white, text_size = dashTxtSz, bgcolor = hdrBg)
-    table.cell(dashTable, 1, 0, 'v3.12',      text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
+    table.cell(dashTable, 1, 0, 'v3.13',      text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
 
     // Current developing levels.
     table.cell(dashTable, 0, 1, 'Curr POC', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
