@@ -1,4 +1,4 @@
-// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v3.11]
+// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v3.12]
 // Smart Money Technique (multi-symbol divergence) + session Volume Profile
 // with previous-session levels, naked POC tracking, confluence alerts, status
 // dashboard, session-anchored VWAP with σ bands, and iceberg/absorption
@@ -38,6 +38,52 @@
 //          of every realtime tick. Bins only update on `barstate.isconfirmed`,
 //          so the previous every-tick delete-and-rebuild of ~24 boxes
 //          produced identical output. Tracked via `lastVpDrawBar` var.
+// v3.12 — SMT core correctness pass. Four issues from a deep audit — the
+//        strongest review of the series. All four target the divergence
+//        engine itself (the decision logic), not visuals.
+//        C1 — Negative history-offset crash guard. `cmpOff =
+//        pivotRightLen - smtCmpWindow` is used as `series[cmpOff]`. If a
+//        user set smtCmpWindow > pivotRightLen (both are valid input
+//        ranges — e.g. Right=3, Window=4, or Right=1 + any Window>=2),
+//        cmpOff goes negative and `series[-1]` throws a RUNTIME error —
+//        but only on the first pivot confirmation, so it passed compile
+//        and quick loads then detonated mid-session. Now a load-time
+//        runtime.error rejects the config (mirrors the HVN>LVN guard).
+//        C2 — Per-symbol baseline misalignment (the dangerous one).
+//        v3.10 advanced the chart baseline every pivot but cmp baselines
+//        only on non-na bars. After a cmp gap the chart leg measured
+//        pivot N->N+1 while the cmp leg measured N-1->N+1 — two legs
+//        anchored to DIFFERENT prior pivots, fabricating and masking
+//        divergences while still printing a confident ★ label. Hits the
+//        default 24h-chart-vs-RTH-futures (ES/NQ/YM) case directly. Fix:
+//        per-symbol chart baselines (prevPHChartS1..3 / prevPLChartS1..3)
+//        advanced in LOCKSTEP with each cmp baseline, so both legs of a
+//        symbol's comparison always reference the same prior pivot. On
+//        the common no-gap path these equal prevPHChart — no behaviour
+//        change there.
+//        C3 — EQH/EQL dead zone. `chartHH = phVal > prevPHChart` and
+//        `chartLH = phVal < prevPHChart` are BOTH false at an exact
+//        equal high — so no SMT could fire at an equal-high / equal-low,
+//        which is THE premium liquidity-pool setup in SMC. New
+//        `smtEqTolAtr` input (default 0.05 × ATR): a high within that
+//        tolerance of the prior counts as "matched/higher" (`>= base -
+//        eqTd`), unlocking EQH-with-cmp-divergence. 0 = strict legacy.
+//        C4 — No recency gate (opt-in). SMT only carries information
+//        when both instruments contest the same liquidity in the same
+//        window; comparing today's pivot to one 150 bars / 2 sessions
+//        back is meaningless and is the largest source of phantom
+//        signals. New `smtMaxPivotBars` input (default 0 = no limit)
+//        skips SMT when the prior pivot is too far back. Coarse filter
+//        (measured against the immediately-prior pivot).
+//        Audit's market-mechanics notes (M1-M6) acknowledged as correct
+//        context, not code bugs: iceberg can't separate absorption from
+//        initiative (use direction-filtered, never standalone); nPOCs
+//        are wick-fragile; money-flow POC sits structurally higher than
+//        volume POC (don't double-count as confluence); the whole
+//        volume stack degrades on tick-volume feeds (spot FX); VP
+//        truncates past 5000 bars on extreme anchor+TF combos; σ bands
+//        are dispersion not error bands. These inform USE, documented
+//        in the execution playbook, not fixable in code.
 // v3.11 — Both review claims valid → both applied. These together fix
 //        the indicator's weakest setup: fast-sweep reversal at an EQH /
 //        nPOC pool — the higher-EV setup smcV16's EQH×N tracking is
@@ -750,7 +796,7 @@
 // Best paired with VP/AVWAP confluence gating for high-quality signals.
 
 //@version=6
-indicator('SMT + VP + AVWAP + Ice [v3.11]', 'SMT+VP3.11', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
+indicator('SMT + VP + AVWAP + Ice [v3.12]', 'SMT+VP3.12', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000, max_polylines_count = 50)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -786,9 +832,31 @@ pivotRightLen = input.int(3, 'Pivot Right Bars', minval = 1, maxval = 50, toolti
 // → false divergences. This window takes cmp's local high/low over
 // ±N bars around the chart's pivot bar instead of the same-bar value.
 // 0 = same-bar (legacy, pre-v3.10). 1 = ±1 bar (3-bar window).
-smtCmpWindow  = input.int(1, 'Cmp Local-Extreme Window (± bars)', minval = 0, maxval = 5, tooltip = 'Bars on each side of the chart pivot bar over which to take the cmp symbol local high (for bear setups) or low (for bull setups). Handles 1-2 bar pivot offsets between tightly correlated symbols (ES/NQ, EUR/GBP), cutting false divergences. 0 disables (legacy same-bar sampling).', group = grpPivot)
+smtCmpWindow  = input.int(1, 'Cmp Local-Extreme Window (± bars)', minval = 0, maxval = 5, tooltip = 'Bars on each side of the chart pivot bar over which to take the cmp symbol local high (for bear setups) or low (for bull setups). Handles 1-2 bar pivot offsets between tightly correlated symbols (ES/NQ, EUR/GBP), cutting false divergences. 0 disables (legacy same-bar sampling). MUST be <= Pivot Right Bars (the window cannot look into the future).', group = grpPivot)
+// v3.12 (C3): EQH/EQL tolerance. A chart high EXACTLY equal to the prior
+// pivot high used to register as neither higher NOR lower → no SMT could
+// fire at an equal high, which is THE premium liquidity-pool setup. This
+// tolerance treats a high within `smtEqTolAtr × ATR` of the prior as
+// "matched/higher" (and symmetrically for lows), so an EQH-with-cmp-
+// divergence now signals. 0 = strict legacy behaviour (no EQH detection).
+smtEqTolAtr   = input.float(0.05, 'EQH/EQL Tolerance (× ATR14)', minval = 0.0, maxval = 1.0, step = 0.05, tooltip = 'A chart pivot high within this fraction of ATR(14) of the prior pivot high counts as an EQUAL high (still "held the level") rather than a lower high — so an equal-high / equal-low liquidity-pool sweep with comparison-symbol divergence can fire. 0.05 = 5% of a typical bar. Set 0 for strict legacy behaviour (exact equal highs produce no signal).', group = grpPivot)
+// v3.12 (C4): optional recency gate. SMT only has information content when
+// both instruments compete for the same liquidity in the same window.
+// Comparing today's pivot to one 150 bars / 2 sessions back is mechanically
+// meaningless. This caps how far back the prior pivot may be. 0 = no limit
+// (legacy). Coarse filter — measured against the immediately-prior pivot.
+smtMaxPivotBars = input.int(0, 'Max Bars Between Compared Pivots', minval = 0, maxval = 1000, tooltip = 'If > 0, skip SMT when the previous pivot is more than this many bars before the current one — filters phantom divergences between structurally unrelated swings far apart in time. 0 = no limit (legacy). A value near one session length (e.g., bars-per-day on your timeframe) is a sensible starting point.', group = grpPivot)
 pivotSrcMode = input.string('Wick', 'Pivot Source', options = ['Wick', 'Body'], tooltip = 'Wick uses high/low; Body uses max/min of open/close.', group = grpPivot)
 showPivotMarkers = input.bool(false, 'Show Pivot Markers', group = grpPivot)
+// v3.12 (C1): guard the negative-history-offset crash. cmpOff =
+// pivotRightLen - smtCmpWindow is used as `series[cmpOff]`; if smtCmpWindow
+// exceeds pivotRightLen, cmpOff < 0 and `series[-1]` throws a runtime error
+// — but only when the first pivot confirms, so it survives compile + quick
+// loads and detonates mid-session. Reject the impossible config at load,
+// mirroring the HVN>LVN runtime.error guard. (A clamp would silently
+// off-centre the window; an explicit error is the honest fix.)
+if smtCmpWindow > pivotRightLen
+    runtime.error('Cmp Local-Extreme Window (' + str.tostring(smtCmpWindow) + ') must be <= Pivot Right Bars (' + str.tostring(pivotRightLen) + '). The window cannot extend past the pivot confirmation point into the future. Settings -> SMT — Pivot Detection.')
 
 grpSymbols = 'SMT — Comparison Symbols'
 // Each symbol row: [enable checkbox] [symbol picker] [Positive/Inverse correlation].
@@ -1173,17 +1241,34 @@ float avwapL3 = na(avwap) or na(avwapSigma) ? na : avwap - sigma3Mult * avwapSig
 //══════════════════════════════════════════════════════════════════════════════
 
 // SMT state — previous-pivot snapshots, used to evaluate consecutive divergences.
+// prevPHChart / prevPHBar are the immediately-prior pivot (kept for drawing the
+// divergence line + the recency gate).
 var float prevPHChart = na
 var float prevPHS1    = na
 var float prevPHS2    = na
 var float prevPHS3    = na
 var int   prevPHBar   = na
+// v3.12 (C2): PER-SYMBOL chart baselines. Each cmp's comparison must be
+// anchored to the SAME prior pivot on BOTH legs (chart and cmp). Before
+// v3.12 the chart baseline advanced every pivot while cmp baselines
+// advanced only on non-na bars (v3.10) — so after a cmp gap the chart leg
+// measured pivot N->N+1 while the cmp leg measured N-1->N+1, comparing two
+// different prior references and fabricating/masking divergences. Storing
+// the chart pivot value as-of each cmp's last valid pivot keeps both legs
+// in lockstep per symbol. On the common no-gap path these all equal
+// prevPHChart, so no behaviour change there.
+var float prevPHChartS1 = na
+var float prevPHChartS2 = na
+var float prevPHChartS3 = na
 
 var float prevPLChart = na
 var float prevPLS1    = na
 var float prevPLS2    = na
 var float prevPLS3    = na
 var int   prevPLBar   = na
+var float prevPLChartS1 = na
+var float prevPLChartS2 = na
+var float prevPLChartS3 = na
 
 // Last-fired SMT event for the dashboard.
 var int    lastBullBar = na
@@ -1797,69 +1882,82 @@ if not na(phVal)
     float s2At = sym2Corr == 'Inverse' ? s2LowMin[cmpOff]  : s2HighMax[cmpOff]
     float s3At = sym3Corr == 'Inverse' ? s3LowMin[cmpOff]  : s3HighMax[cmpOff]
 
-    if not na(prevPHChart)
-        bool chartHH = phVal > prevPHChart
-        bool chartLH = phVal < prevPHChart
-        string conf = smtBearConf   // pre-computed at top-level for Pine consistency
+    // v3.12: EQH tolerance (C3) in price units, and recency gate (C4).
+    float eqTd = na(confAtr[pivotRightLen]) ? 0.0 : smtEqTolAtr * confAtr[pivotRightLen]
+    bool  recencyOK = smtMaxPivotBars == 0 or na(prevPHBar) or (pivotBar - prevPHBar) <= smtMaxPivotBars
 
-        int    divCount     = 0
-        string divergedSyms = ''
+    string conf = smtBearConf   // pre-computed at top-level for Pine consistency
+    int    divCount     = 0
+    string divergedSyms = ''
 
-        if sym1Enabled and not na(s1At) and not na(prevPHS1)
-            bool s1HH = s1At > prevPHS1
-            bool s1LH = s1At < prevPHS1
-            // Positive: divergence when directions OPPOSE.  Inverse: divergence when directions MATCH.
-            bool d1 = sym1Corr == 'Positive' ? ((chartHH and s1LH) or (chartLH and s1HH)) : ((chartHH and s1HH) or (chartLH and s1LH))
-            if d1
-                divergedSyms := divergedSyms + (divCount > 0 ? ', ' : '') + shortName(sym1) + (sym1Corr == 'Inverse' ? ' (inv)' : '')
-                divCount     += 1
+    // v3.12 (C2): per-symbol chartHH/chartLH against that symbol's OWN
+    // prior chart baseline, so both legs share the same reference pivot.
+    // (C3) `>= base - eqTd` makes an equal/near-equal high count as a
+    // higher high so EQH-with-cmp-divergence fires.
+    if sym1Enabled and not na(s1At) and not na(prevPHS1) and not na(prevPHChartS1) and recencyOK
+        bool chartHH = phVal >= prevPHChartS1 - eqTd
+        bool chartLH = phVal <  prevPHChartS1 - eqTd
+        bool s1HH = s1At > prevPHS1
+        bool s1LH = s1At < prevPHS1
+        // Positive: divergence when directions OPPOSE.  Inverse: divergence when directions MATCH.
+        bool d1 = sym1Corr == 'Positive' ? ((chartHH and s1LH) or (chartLH and s1HH)) : ((chartHH and s1HH) or (chartLH and s1LH))
+        if d1
+            divergedSyms := divergedSyms + (divCount > 0 ? ', ' : '') + shortName(sym1) + (sym1Corr == 'Inverse' ? ' (inv)' : '')
+            divCount     += 1
 
-        if sym2Enabled and not na(s2At) and not na(prevPHS2)
-            bool s2HH = s2At > prevPHS2
-            bool s2LH = s2At < prevPHS2
-            bool d2 = sym2Corr == 'Positive' ? ((chartHH and s2LH) or (chartLH and s2HH)) : ((chartHH and s2HH) or (chartLH and s2LH))
-            if d2
-                divergedSyms := divergedSyms + (divCount > 0 ? ', ' : '') + shortName(sym2) + (sym2Corr == 'Inverse' ? ' (inv)' : '')
-                divCount     += 1
+    if sym2Enabled and not na(s2At) and not na(prevPHS2) and not na(prevPHChartS2) and recencyOK
+        bool chartHH = phVal >= prevPHChartS2 - eqTd
+        bool chartLH = phVal <  prevPHChartS2 - eqTd
+        bool s2HH = s2At > prevPHS2
+        bool s2LH = s2At < prevPHS2
+        bool d2 = sym2Corr == 'Positive' ? ((chartHH and s2LH) or (chartLH and s2HH)) : ((chartHH and s2HH) or (chartLH and s2LH))
+        if d2
+            divergedSyms := divergedSyms + (divCount > 0 ? ', ' : '') + shortName(sym2) + (sym2Corr == 'Inverse' ? ' (inv)' : '')
+            divCount     += 1
 
-        if sym3Enabled and not na(s3At) and not na(prevPHS3)
-            bool s3HH = s3At > prevPHS3
-            bool s3LH = s3At < prevPHS3
-            bool d3 = sym3Corr == 'Positive' ? ((chartHH and s3LH) or (chartLH and s3HH)) : ((chartHH and s3HH) or (chartLH and s3LH))
-            if d3
-                divergedSyms := divergedSyms + (divCount > 0 ? ', ' : '') + shortName(sym3) + (sym3Corr == 'Inverse' ? ' (inv)' : '')
-                divCount     += 1
+    if sym3Enabled and not na(s3At) and not na(prevPHS3) and not na(prevPHChartS3) and recencyOK
+        bool chartHH = phVal >= prevPHChartS3 - eqTd
+        bool chartLH = phVal <  prevPHChartS3 - eqTd
+        bool s3HH = s3At > prevPHS3
+        bool s3LH = s3At < prevPHS3
+        bool d3 = sym3Corr == 'Positive' ? ((chartHH and s3LH) or (chartLH and s3HH)) : ((chartHH and s3HH) or (chartLH and s3LH))
+        if d3
+            divergedSyms := divergedSyms + (divCount > 0 ? ', ' : '') + shortName(sym3) + (sym3Corr == 'Inverse' ? ' (inv)' : '')
+            divCount     += 1
 
-        if divCount > 0
-            bool   hasConf = str.length(conf) > 0
-            // ONE combined line + label for the pivot (was previously drawn
-            // once per diverging symbol, causing visual overlap).
-            drawDivergence(false, prevPHBar, prevPHChart, phVal, divergedSyms, hasConf, conf, bearColor)
-            lastBearBar       := pivotBar
-            lastBearSym       := divergedSyms
-            lastBearPrice     := phVal
-            lastBearConf      := hasConf
-            lastBearConfCount := hasConf ? countConfluenceTags(conf) : 0
-            if alertBear
-                string base = 'Bearish SMT vs ' + divergedSyms
-                string msg  = hasConf ? base + ' | ★' + str.tostring(lastBearConfCount) + ' Confluence: ' + conf : base
-                alert(msg, alert.freq_once_per_bar_close)
+    if divCount > 0
+        bool   hasConf = str.length(conf) > 0
+        // ONE combined line + label for the pivot (was previously drawn
+        // once per diverging symbol, causing visual overlap). Line anchors
+        // at the immediately-prior pivot (prevPHBar/prevPHChart) for the
+        // visual; the comparison above used per-symbol baselines.
+        drawDivergence(false, prevPHBar, prevPHChart, phVal, divergedSyms, hasConf, conf, bearColor)
+        lastBearBar       := pivotBar
+        lastBearSym       := divergedSyms
+        lastBearPrice     := phVal
+        lastBearConf      := hasConf
+        lastBearConfCount := hasConf ? countConfluenceTags(conf) : 0
+        if alertBear
+            string base = 'Bearish SMT vs ' + divergedSyms
+            string msg  = hasConf ? base + ' | ★' + str.tostring(lastBearConfCount) + ' Confluence: ' + conf : base
+            alert(msg, alert.freq_once_per_bar_close)
 
-    // v3.10: per-symbol prevPH update — only overwrite for cmp symbols
-    // whose s*At is NON-na. With v3.9's gaps_on + ignore_invalid_symbol,
-    // s*At can legitimately be na at a chart pivot (cmp had a gap or
-    // invalid symbol). Before this gate, `prevPHS1 := na` then made the
-    // NEXT pivot's `not na(prevPHS1)` guard fail too — so one cmp-gap
-    // poisoned TWO consecutive divergence opportunities. Now the prev
-    // snapshot keeps its last good value across cmp-gap pivots.
+    // v3.12 (C2): lockstep per-symbol baseline update. For each cmp with
+    // a non-na value, advance BOTH its cmp baseline AND its chart baseline
+    // together — guaranteeing the next comparison anchors both legs to
+    // this same pivot. prevPHChart/prevPHBar still advance every pivot
+    // (used only for drawing the line + the recency gate).
     prevPHChart := phVal
     prevPHBar   := pivotBar
     if not na(s1At)
-        prevPHS1 := s1At
+        prevPHS1      := s1At
+        prevPHChartS1 := phVal
     if not na(s2At)
-        prevPHS2 := s2At
+        prevPHS2      := s2At
+        prevPHChartS2 := phVal
     if not na(s3At)
-        prevPHS3 := s3At
+        prevPHS3      := s3At
+        prevPHChartS3 := phVal
 
 // ─── Bullish SMT (confirmed pivot LOW) ──────────────────────────────────────
 // NOTE: structurally symmetric with the bearish block above. Any logic
@@ -1877,63 +1975,74 @@ if not na(plVal)
     float s2At = sym2Corr == 'Inverse' ? s2HighMax[cmpOff] : s2LowMin[cmpOff]
     float s3At = sym3Corr == 'Inverse' ? s3HighMax[cmpOff] : s3LowMin[cmpOff]
 
-    if not na(prevPLChart)
-        bool chartLL = plVal < prevPLChart
-        bool chartHL = plVal > prevPLChart
-        string conf = smtBullConf   // pre-computed at top-level for Pine consistency
+    // v3.12: EQL tolerance (C3) and recency gate (C4) — mirror of bear block.
+    float eqTd = na(confAtr[pivotRightLen]) ? 0.0 : smtEqTolAtr * confAtr[pivotRightLen]
+    bool  recencyOK = smtMaxPivotBars == 0 or na(prevPLBar) or (pivotBar - prevPLBar) <= smtMaxPivotBars
 
-        int    divCount     = 0
-        string divergedSyms = ''
+    string conf = smtBullConf   // pre-computed at top-level for Pine consistency
+    int    divCount     = 0
+    string divergedSyms = ''
 
-        if sym1Enabled and not na(s1At) and not na(prevPLS1)
-            bool s1LL = s1At < prevPLS1
-            bool s1HL = s1At > prevPLS1
-            // Positive: divergence when directions OPPOSE.  Inverse: divergence when directions MATCH.
-            bool d1 = sym1Corr == 'Positive' ? ((chartLL and s1HL) or (chartHL and s1LL)) : ((chartLL and s1LL) or (chartHL and s1HL))
-            if d1
-                divergedSyms := divergedSyms + (divCount > 0 ? ', ' : '') + shortName(sym1) + (sym1Corr == 'Inverse' ? ' (inv)' : '')
-                divCount     += 1
+    // v3.12 (C2): per-symbol chartLL/chartHL against that symbol's OWN prior
+    // chart baseline. (C3) `<= base + eqTd` makes an equal/near-equal low
+    // count as a lower low so EQL-with-cmp-divergence fires.
+    if sym1Enabled and not na(s1At) and not na(prevPLS1) and not na(prevPLChartS1) and recencyOK
+        bool chartLL = plVal <= prevPLChartS1 + eqTd
+        bool chartHL = plVal >  prevPLChartS1 + eqTd
+        bool s1LL = s1At < prevPLS1
+        bool s1HL = s1At > prevPLS1
+        // Positive: divergence when directions OPPOSE.  Inverse: divergence when directions MATCH.
+        bool d1 = sym1Corr == 'Positive' ? ((chartLL and s1HL) or (chartHL and s1LL)) : ((chartLL and s1LL) or (chartHL and s1HL))
+        if d1
+            divergedSyms := divergedSyms + (divCount > 0 ? ', ' : '') + shortName(sym1) + (sym1Corr == 'Inverse' ? ' (inv)' : '')
+            divCount     += 1
 
-        if sym2Enabled and not na(s2At) and not na(prevPLS2)
-            bool s2LL = s2At < prevPLS2
-            bool s2HL = s2At > prevPLS2
-            bool d2 = sym2Corr == 'Positive' ? ((chartLL and s2HL) or (chartHL and s2LL)) : ((chartLL and s2LL) or (chartHL and s2HL))
-            if d2
-                divergedSyms := divergedSyms + (divCount > 0 ? ', ' : '') + shortName(sym2) + (sym2Corr == 'Inverse' ? ' (inv)' : '')
-                divCount     += 1
+    if sym2Enabled and not na(s2At) and not na(prevPLS2) and not na(prevPLChartS2) and recencyOK
+        bool chartLL = plVal <= prevPLChartS2 + eqTd
+        bool chartHL = plVal >  prevPLChartS2 + eqTd
+        bool s2LL = s2At < prevPLS2
+        bool s2HL = s2At > prevPLS2
+        bool d2 = sym2Corr == 'Positive' ? ((chartLL and s2HL) or (chartHL and s2LL)) : ((chartLL and s2LL) or (chartHL and s2HL))
+        if d2
+            divergedSyms := divergedSyms + (divCount > 0 ? ', ' : '') + shortName(sym2) + (sym2Corr == 'Inverse' ? ' (inv)' : '')
+            divCount     += 1
 
-        if sym3Enabled and not na(s3At) and not na(prevPLS3)
-            bool s3LL = s3At < prevPLS3
-            bool s3HL = s3At > prevPLS3
-            bool d3 = sym3Corr == 'Positive' ? ((chartLL and s3HL) or (chartHL and s3LL)) : ((chartLL and s3LL) or (chartHL and s3HL))
-            if d3
-                divergedSyms := divergedSyms + (divCount > 0 ? ', ' : '') + shortName(sym3) + (sym3Corr == 'Inverse' ? ' (inv)' : '')
-                divCount     += 1
+    if sym3Enabled and not na(s3At) and not na(prevPLS3) and not na(prevPLChartS3) and recencyOK
+        bool chartLL = plVal <= prevPLChartS3 + eqTd
+        bool chartHL = plVal >  prevPLChartS3 + eqTd
+        bool s3LL = s3At < prevPLS3
+        bool s3HL = s3At > prevPLS3
+        bool d3 = sym3Corr == 'Positive' ? ((chartLL and s3HL) or (chartHL and s3LL)) : ((chartLL and s3LL) or (chartHL and s3HL))
+        if d3
+            divergedSyms := divergedSyms + (divCount > 0 ? ', ' : '') + shortName(sym3) + (sym3Corr == 'Inverse' ? ' (inv)' : '')
+            divCount     += 1
 
-        if divCount > 0
-            bool   hasConf = str.length(conf) > 0
-            // ONE combined line + label for the pivot.
-            drawDivergence(true, prevPLBar, prevPLChart, plVal, divergedSyms, hasConf, conf, bullColor)
-            lastBullBar       := pivotBar
-            lastBullSym       := divergedSyms
-            lastBullPrice     := plVal
-            lastBullConf      := hasConf
-            lastBullConfCount := hasConf ? countConfluenceTags(conf) : 0
-            if alertBull
-                string base = 'Bullish SMT vs ' + divergedSyms
-                string msg  = hasConf ? base + ' | ★' + str.tostring(lastBullConfCount) + ' Confluence: ' + conf : base
-                alert(msg, alert.freq_once_per_bar_close)
+    if divCount > 0
+        bool   hasConf = str.length(conf) > 0
+        // ONE combined line + label for the pivot.
+        drawDivergence(true, prevPLBar, prevPLChart, plVal, divergedSyms, hasConf, conf, bullColor)
+        lastBullBar       := pivotBar
+        lastBullSym       := divergedSyms
+        lastBullPrice     := plVal
+        lastBullConf      := hasConf
+        lastBullConfCount := hasConf ? countConfluenceTags(conf) : 0
+        if alertBull
+            string base = 'Bullish SMT vs ' + divergedSyms
+            string msg  = hasConf ? base + ' | ★' + str.tostring(lastBullConfCount) + ' Confluence: ' + conf : base
+            alert(msg, alert.freq_once_per_bar_close)
 
-    // v3.10: per-symbol prevPL update — only overwrite for cmp symbols
-    // whose s*At is NON-na (see bear block).
+    // v3.12 (C2): lockstep per-symbol baseline update (see bear block).
     prevPLChart := plVal
     prevPLBar   := pivotBar
     if not na(s1At)
-        prevPLS1 := s1At
+        prevPLS1      := s1At
+        prevPLChartS1 := plVal
     if not na(s2At)
-        prevPLS2 := s2At
+        prevPLS2      := s2At
+        prevPLChartS2 := plVal
     if not na(s3At)
-        prevPLS3 := s3At
+        prevPLS3      := s3At
+        prevPLChartS3 := plVal
 
 plotshape(showPivotMarkers and not na(phVal), title = 'Pivot High', style = shape.triangledown, location = location.abovebar, color = color.new(GRAY, 0), size = size.tiny, offset = -pivotRightLen)
 plotshape(showPivotMarkers and not na(plVal), title = 'Pivot Low',  style = shape.triangleup,   location = location.belowbar, color = color.new(GRAY, 0), size = size.tiny, offset = -pivotRightLen)
@@ -2619,7 +2728,7 @@ if showDash and barstate.islast
 
     // Header.
     table.cell(dashTable, 0, 0, 'SMT+VP+Ice', text_color = color.white, text_size = dashTxtSz, bgcolor = hdrBg)
-    table.cell(dashTable, 1, 0, 'v3.11',      text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
+    table.cell(dashTable, 1, 0, 'v3.12',      text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
 
     // Current developing levels.
     table.cell(dashTable, 0, 1, 'Curr POC', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)
