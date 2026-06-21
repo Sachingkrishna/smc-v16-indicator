@@ -1,0 +1,232 @@
+The smcV16 file is large (3479 lines). Let me focus on the functions that overlap with LuxAlgo to do a proper comparison.
+
+Now let me read the matching sections in smcV16.pine to compare each function.
+
+I have enough material to produce a function-by-function comparison. Here is the analysis.
+
+# Comparison: LuxAlgo SMC vs. smcV16 (v19.1)
+
+Both indicators share the same architectural skeleton (LuxAlgo CC BY-NC-SA 4.0 base), but smcV16 has refactored almost every shared function. Below is a side-by-side analysis of the **20 functions present in both files**.
+
+---
+
+## 1. `leg(int size)` — Pivot detector
+**Lux (337–346)**: Uses `ta.highest`/`ta.lowest` over the past `size` bars only. `high[size] > ta.highest(size)` is a **right-side-only** check — no left-side validation. Compares raw `high`/`low`.
+
+**v16 (1239–1278)**: Full **left + right** pivot validation (`size` bars on each side, `2*size` total). Guards `bar_index >= 2*size` to avoid vacuous early pivots (v15.3 fix). Compares `bodyHigh`/`bodyLow` (configurable Wick/Body via `pivotSourceInput`). Tie-breaks simultaneous swing high+low using wick asymmetry.
+
+> v16 is structurally more correct (Lux can flag a pivot that no longer holds once future bars confirm).
+
+---
+
+## 2. `startOfNewLeg` / `startOfBearishLeg` / `startOfBullishLeg`
+**Lux**: One-liners — `ta.change(leg) != 0`, `== -1`, `== +1`.
+
+**v16**: Adds a `firstEver` guard (`nz(l_eg[1], -1) < 0`) so the very first leg ever assigned also fires. Lux silently misses the first leg event.
+
+---
+
+## 3. `drawLabel`
+**Lux (370–376)**: Plain `label.new`; if `PRESENT` mode, deletes prior label.
+
+**v16 (1325–1329)**: Routes through `managedSwingLabel()` which **ring-buffers** labels (cap `MAX_SWING_LABELS = 200`). Prevents `max_labels_count` exhaustion on long histories.
+
+---
+
+## 4. `drawEqualHighLow` (EQH/EQL)
+**Lux (384–402)**: Draws `EQH`/`EQL` line + label.
+
+**v16 (1331–1356)**: Adds **streak counter** (`EQH×3`, `EQL×4` … from v18.0 liquidity-pool clustering). Uses managed line/label arrays (`managedEqLine`/`managedEqLabel`).
+
+---
+
+## 5. `getCurrentStructure`
+**Lux (409–457)**: Pivot levels stored directly from `low[size]`/`high[size]`. EQH/EQL test compares pivot level vs. raw `low[size]`/`high[size]`.
+
+**v16 (1361–1445)** — substantially extended:
+- Pivot level uses configurable Body or Wick (`pivotSourceInput`).
+- Stores both `currentLevel` (body) and `actualLevel` (wick) on the pivot.
+- **EQH/EQL** has independent source override (v18.9 `eqPivotComparisonInput`) + freshness timeout (v18.8 `eqMaxBarsBetweenMatchesInput`) + streak counter.
+- Snapshots **CVD** at each pivot for divergence detection (v17.0/v18.6).
+
+---
+
+## 6. `drawStructure`
+**Lux (467–476)**: Creates raw line+label; deletes in `PRESENT` mode only.
+
+**v16 (1479–1493)**: Same shape, plus ring-buffer management (`structureLines`/`structureLabels` capped at 200 each) in `HISTORICAL` mode.
+
+---
+
+## 7. `deleteOrderBlocks`
+**Lux (481–500)**: Forward iteration `for [index, eachOrderBlock] in orderBlocks` — **buggy when removing in-place** (index shift). Pure-mitigation: source > barHigh / < barLow. Sets crossed alert and removes.
+
+**v16 (1540–1586)**:
+- **Reverse iteration** `for index = sz-1 to 0` — safe for in-place removal.
+- Adds **minimum-penetration filter** (`minPen` from ATR fraction + tick floor) — filters wick-clip false mitigations.
+- On mitigation, **converts OB to a Breaker Block** with flipped bias if BB tracking is on (v12.2 feature), inheriting RVOL stamp.
+- Body-based mitigation mode added (v15.4 default).
+
+---
+
+## 8. `storeOrderBlock` (Lux: `storeOrdeBlock` — typo)
+**Lux (507–525)**: Slices `parsedHighs`/`parsedLows` between `p_ivot.barIndex` and `bar_index`, picks the max/min, stores as OB. Single-pivot input.
+
+**v16 (1660–1806)**:
+- Takes **two pivots** (`brokenPivot`, `originPivot`) for accurate window bracketing.
+- Searches for the **last opposite-color candle** before structure break (true ICT OB definition), with `consNon > 2` early break.
+- Falls back to max/min if no opposite candle found.
+- `orderBlockRangeInput`: choose Full Candle (wicks) vs. Body Only.
+- **Back-fills historical touch count** between OB candle and detection bar (v15.3) so the first user-visible "1x" matches a real first retest.
+- Drops the OB entirely if it would already have been mitigated historically.
+- Search cap: 3× internal length, **5× swing length** (v19.1 bump).
+- **RVOL stamp** at origin (v18.0 institutional flagging).
+- Fires `*OBFormed` alerts (v16.8).
+
+> This is the most architecturally different function of the two.
+
+---
+
+## 9. `drawOrderBlocks`
+**Lux (530–546)**: Slices up to `maxOrderBlocks`, sets box coords + colors. Internal OBs have `na` border.
+
+**v16 (1811–1872)**:
+- Same coord/color logic.
+- Touch-count text overlay (`1x`, `2x`, `3x`) when `showOBTouchCountInput`.
+- **CE midline** (50%) lines drawn per-OB (v14.0).
+- RVOL dimming/hiding for non-institutional OBs.
+- Resets unused boxes/lines to invisible white (slot recycling).
+- Internal OB **now has visible border** (fixed v16.8 cosmetic asymmetry).
+
+---
+
+## 10. `displayStructure`
+**Lux (551–612)**: Detects `ta.crossover(close, p_ivot.currentLevel)` inline, fires CHoCH/BOS, calls `storeOrdeBlock`.
+
+**v16 (1944–2089)**:
+- Runs only on `barstate.isconfirmed` (closed-bar gating).
+- Uses **snapshot pivots** (`snapHigh`/`snapLow`) decoupled from the live pivot stream so OB origin candle stays consistent.
+- Confluence filter (v19.1): `bullishBar := lowerWick >= upperWick` (**fixes inverted-flag bug** from earlier versions).
+- Simultaneous bull+bear cross → both invalidated (Lux: silently lets both fire).
+- Adds **MSS detection**: a CHoCH confirmed by a displacement candle (`displacementOffset()`) becomes an MSS — different label, alert, color, line style.
+- Optional `useTrailResetInput` → resets trailing extremes on flip (drives tighter Premium/Discount/OTE).
+- Honors `pivotSourceInput` on the reset.
+
+---
+
+## 11. `fairValueGapBox`
+**Lux (621)**: Inline `box.new` with `extend = fairValueGapsExtendInput * (time - time[1])`.
+
+**v16 (2094–2097)**: Same, but `htfBarDuration` (cached via `request.security`) used instead of `time - time[1]` so FVG extension is correct on higher-timeframe FVGs.
+
+---
+
+## 12. `deleteFairValueGaps`
+**Lux (625–630)**: Mitigation = `low < bottom` (bull) / `high > top` (bear) — i.e., **any wick** invalidates the gap. Forward iteration (buggy when removing).
+
+**v16 (2099–…)**:
+- **Body-based** mitigation: `math.min(open, close) < bottom` / `math.max(open, close) > top` — symmetric full-fill required for both directions (v16.4 fix; Lux is asymmetric).
+- Tracks mitigated FVGs to **convert them to Inverted FVGs (iFVGs)** (v14.0 feature).
+- Reverse iteration; safe removal.
+
+---
+
+## 13. `drawFairValueGaps`
+**Lux (634–649)**: Fetches `close[1], open[1], time[1], high[0], low[0], time[0], high[2], low[2]` from HTF; computes `barDeltaPercent = (lastClose - lastOpen) / (lastOpen * 100)` (**off by a factor of 100 — a known Lux bug**); detects bullish/bearish FVG; unshifts.
+
+**v16 (2324–2375)**:
+- Tuple reads `close[2]/open[2]/time[2]/high[1]/low[1]/time[1]/high[3]/low[3]` plus `volume[2]` and `sma(volume, N)[2]` for **HTF-correct RVOL** (v18.4 fix).
+- `barDeltaPercent` **corrected** to `delta / midOpen * 100` (v15.3 fix).
+- Guards `midOpen != 0` and `bar_index >= 1`.
+- Adds `barstate.isconfirmed` gate to prevent same-bar deletion.
+- RVOL stamping + opacity dimming for non-institutional FVGs.
+- `trimFairValueGaps()` cap.
+
+---
+
+## 14. `getStyle`
+**Lux (654–658)**: `switch` over `SOLID/DASHED/DOTTED` — **no default branch** → returns `na` on unmatched strings.
+
+**v16 (2380–2385)**: Adds default branch `=> line.style_solid` (v15.4 fix).
+
+---
+
+## 15. `drawLevels` (Daily/Weekly/Monthly MTF levels)
+**Lux (666–700)**: Indexes `timeArray.get(topArray.indexof(topArray.max()))` without bounds protection.
+
+**v16 (2387–2415)**: Same logic, but with `math.max(0, …)` / `math.min(times.size(), …)` clamps on `leftIndex`/`rightIndex` and a `rightIndex > leftIndex` guard. Hardens against `binary_search_rightmost` returning out-of-range indices.
+
+---
+
+## 16. `higherTimeframe`
+**Lux (705)** and **v16 (2417)**: **Identical** — `timeframe.in_seconds() > timeframe.in_seconds(tf)`.
+
+---
+
+## 17. `updateTrailingExtremes`
+**Lux (709–713)**: Locked to raw `high`/`low`.
+
+**v16 (2422–2437)**: Honors `pivotSourceInput` so trailing extremes use **the same source as the pivots** (v15.3 fix — prevents drift between Strong/Weak H/L and the swing pivots in Wick mode). Also seeds `barTime`/`barIndex` on first run.
+
+---
+
+## 18. `drawHighLowSwings`
+**Lux (717–733)** and **v16 (2439–2452)**: Functionally **identical**. Only minor formatting differences.
+
+---
+
+## 19. `drawZone`
+**Lux (744–751)**: Anchors box left edge to `trailing.barTime` (shared for all three zones).
+
+**v16 (2457–2462)**: Takes `leftTime` as a **per-zone parameter** — caller can anchor the Premium box to the trailing top, Discount to the trailing bottom, Equilibrium to the earlier of the two. More accurate visual placement.
+
+---
+
+## 20. `drawPremiumDiscountZones`
+**Lux (755–761)**: Simple `0.95×top + 0.05×bottom` band heights, fixed anchor.
+
+**v16 (2464–2486)**:
+- Computes `zoneRange` and uses **proportional band heights** with a `mintick*2` minimum floor.
+- Three independent left-edge anchors (per-zone left time).
+- Guards against `na`/inverted ranges.
+- `minBoxBars` floor so zones still render visibly on fresh sessions.
+
+---
+
+## What's in smcV16 that Lux doesn't have at all
+
+These aren't comparable per-function — Lux simply has no equivalent:
+
+- **Breaker Blocks** (deleteBreakerBlocks, drawBreakerBlocks, updateBreakerBlockTouches)
+- **Inverted FVGs**
+- **Liquidity Sweeps** (incl. EQH/EQL sweep alerts, v17.0)
+- **MSS / Displacement candles**
+- **OTE Zone** (Fib-based, premium/discount aware)
+- **Asian / London / NY / Initial Balance / Kill Zones / Silver Bullet** session ranges
+- **PDH/PDL, Midnight Open, NDOG/NWOG** opening gaps
+- **CVD divergence** (swing / internal / custom pivot sources)
+- **RVOL stamping** for OB/FVG (institutional vs. retail)
+- **Volume Imbalance** (VI)
+- **Anchored VWAP from MSS** (with Swing/Daily/Weekly anchor modes)
+- **OB/BB touch counting** (with back-fill, edge-detection, exhaust cap)
+
+---
+
+## Summary
+
+| Aspect | LuxAlgo | smcV16 |
+|---|---|---|
+| Pine version | v5 | v6 |
+| Lines | 848 | 3479 |
+| Pivot validation | right-side only | symmetric left+right + warm-up guard |
+| Pivot source | raw H/L | configurable Body/Wick |
+| OB origin candle | max/min over slice | last opposite-color candle (true ICT) |
+| OB mitigation | Close or High/Low | Close / **Body** / High/Low + min-penetration |
+| FVG mitigation | wick (any) | body (full-fill, symmetric) |
+| `barDeltaPercent` | `delta/(open*100)` (bug) | `delta/open*100` (correct) |
+| `getStyle` default | none (returns `na`) | `line.style_solid` fallback |
+| Array iteration (deletes) | forward (buggy) | reverse (safe) |
+| Drawing object management | uncapped | ring buffers (200/100 caps) |
+| Modules added | — | BB, iFVG, MSS, OTE, sessions, CVD, RVOL, VI, AVWAP, sweeps |
+
+smcV16 retains the LuxAlgo skeleton but is effectively a **fork with structural-correctness fixes** (pivot symmetry, mitigation source filtering, array iteration safety, the FVG percentage bug, `getStyle` fallback) plus a much larger ICT feature surface layered on top.

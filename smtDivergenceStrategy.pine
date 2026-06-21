@@ -1,0 +1,1112 @@
+// SMT Divergence Strategy [v1.3]
+// v1.3 — Two quality fixes mirrored from indicator v3.18 (both opt-in paths).
+//        (1) Correlation filter on per-bar RETURNS (ta.change) instead of raw
+//        price levels — co-trending instruments correlated spuriously on
+//        levels, so the decorrelation mute under-fired. (2) Sweep-gate scan
+//        window made SYMMETRIC around the pivot bar — smcV16 swing sweeps often
+//        confirm a bar or two AFTER the extreme, which the old one-sided window
+//        missed (the near-zero/few-trades result). (3) Sweep-gate inputs
+//        RELOCATED to the end of the input list — they had been inserted before
+//        the Backtest-Window group, shifting its positions; new inputs at the
+//        end never shift existing ones (TradingView maps saved settings by
+//        order). No Tag mode here — a strategy entry is binary, so the gate
+//        stays a hard Filter. Defaults unchanged (corr mute off, sweep gate
+//        off). Trade-management logic untouched.
+// v1.2 — Parity with indicator v3.16/v3.17 noise work. The strategy ALREADY had
+//        min-swing (useSwingFilter/minSwingAtr — same pivot-to-prior-opposite-
+//        pivot leg as indicator #3) and an entry cooldown (useCooldown), so the
+//        only genuine gap was the v3.16 liquidity-sweep gate. Added it: optional
+//        `smtRequireSweep` reading smcV16's exported "SMT Sweep/BOS/CHoCH Export"
+//        plot via input.source (longs require a bullish sweep at/near the pivot,
+//        shorts a bearish one) — reuses smcV16's validated detection, no second
+//        definition. Default OFF; explicit max_bars_back on the source. The
+//        indicator's same-level dedup band + structure-reset are NOT mirrored:
+//        the strategy already de-duplicates via position management + the entry
+//        cooldown, so they'd be redundant here. Trade-management unchanged.
+// v1.1 — Full parity with indicator v3.13/v3.15: Composite VP + Money Flow in
+//        confluence, AVWAP linebr, and the live rolling-correlation filter +
+//        auto-mute (per cmp symbol, sign-aware, default OFF) with a correlation
+//        mini-table. Trade-management logic unchanged.
+// Backtesting harness for the SMT divergence engine from
+// smtDivergence.pine (v3.11–v3.13). Purpose: get OBJECTIVE win-rate /
+// profit-factor / expectancy numbers for different pivot / window /
+// tolerance / recency settings — on the SAME TradingView feed the
+// indicator uses, so there is NO Python re-implementation risk and NO
+// data-feed mismatch.
+//
+// What it reproduces faithfully from the indicator (so the signals match):
+//   • Asymmetric pivot Left/Right (v3.3)
+//   • Per-symbol comparison + correlation (Positive/Inverse) (v1.8/v2.0)
+//   • Cmp local-extreme window (v3.10) + negative-offset guard (C1/v3.12)
+//   • Cmp comparison source Body/Wick (C/v3.13 wick-noise fix)
+//   • EQH/EQL tolerance (C3/v3.12)
+//   • Per-symbol lockstep baselines (C2/v3.12)
+//   • Recency gate Max-Bars-between-pivots (C4/v3.12)
+//   • gaps_on + ignore_invalid_symbol cmp fetches (v3.9)
+//
+// Confluence filter: a SELF-CONTAINED AVWAP ± σ proxy for the indicator's
+// ★ tag. It does NOT reproduce the full Volume-Profile / naked-POC stack
+// (that needs the whole session-bin engine). So "confluence" here ≈ the
+// AVWAP/σ subset of ★. Good enough to test "does requiring confluence
+// improve expectancy?"; for full ★2+ fidelity you'd port the VP too.
+//
+// Trade model (reversal): Bull SMT → long, Bear SMT → short. Entry at the
+// confirmation bar's close (the bar the pivot confirms on). Stop beyond the
+// pivot extreme + an ATR buffer. Target = fixed reward:risk multiple.
+//
+// ⚠ Backtesting caveats baked into the defaults: commission + slippage are
+// ON, process_orders_on_close = true (no look-ahead — orders fill at the
+// close you actually saw). Don't optimize all knobs at once (curve-fitting);
+// change one or two, keep an out-of-sample window, and prefer settings that
+// are STABLE across a range over the single backtest peak.
+
+//@version=6
+strategy('SMT Divergence Strategy [v1.3]', 'SMT Strat', overlay = true,
+     default_qty_type = strategy.percent_of_equity, default_qty_value = 10,
+     initial_capital = 10000,
+     commission_type = strategy.commission.percent, commission_value = 0.0,
+     slippage = 1, pyramiding = 0, process_orders_on_close = true,
+     max_lines_count = 500, calc_on_every_tick = false)
+// v3.15 (RE10067 fix): per-series max_bars_back instead of a global 5000 — see
+// the indicator. The VP recompute reads high/low/volume deep; a global 5000 over
+// every series plus the new correlation series exceeded Pine's 300k total cap.
+max_bars_back(high,   5000)
+max_bars_back(low,    5000)
+max_bars_back(close,  5000)
+max_bars_back(open,   5000)
+max_bars_back(volume, 5000)
+
+GREEN = #089981
+RED   = #F23645
+
+//──────────────────────────────────────────────────────────────────────────────
+// Inputs — SMT pivot detection  (MIRROR of smtDivergence.pine defaults)
+//──────────────────────────────────────────────────────────────────────────────
+grpPivot = 'SMT — Pivot Detection'
+pivotLeftLen  = input.int(5, 'Pivot Left Bars',  minval = 1, maxval = 50, group = grpPivot,
+     tooltip = 'Swing-significance filter. Higher = only major swings (fewer signals). No signal lag.')
+pivotRightLen = input.int(3, 'Pivot Right Bars', minval = 1, maxval = 50, group = grpPivot,
+     tooltip = 'Confirmation bars. THIS is the signal lag — a divergence prints this many bars after the pivot. Lower = faster but more false pivots.')
+smtCmpWindow  = input.int(1, 'Cmp Local-Extreme Window (± bars)', minval = 0, maxval = 5, group = grpPivot,
+     tooltip = 'Local high/low band around the chart pivot for sampling the cmp symbol. MUST be <= Pivot Right Bars.')
+smtCmpSrc     = input.string('Body', 'Cmp Comparison Source', options = ['Body', 'Wick'], group = grpPivot,
+     tooltip = 'Body (max/min of open/close) ignores single-bar wick spikes that flip the cmp classification — recommended on FX. Wick = high/low.')
+smtEqTolAtr   = input.float(0.05, 'EQH/EQL Tolerance (× ATR14)', minval = 0.0, maxval = 1.0, step = 0.05, group = grpPivot,
+     tooltip = 'A pivot within this fraction of ATR of the prior counts as an EQUAL high/low (catches double-top/bottom SMT). 0 = strict.')
+smtMaxPivotBars = input.int(0, 'Max Bars Between Compared Pivots', minval = 0, maxval = 1000, group = grpPivot,
+     tooltip = 'Skip SMT when the previous pivot is more than this many bars away (filters far-apart phantom divergences). 0 = no limit. Try ~1 session of bars.')
+pivotSrcMode  = input.string('Wick', 'Pivot Source', options = ['Wick', 'Body'], group = grpPivot,
+     tooltip = 'How the CHART pivots are detected. Wick = high/low (liquidity sweeps).')
+
+// C1 guard (mirrors the indicator): negative history-offset crash if the
+// window extends past the pivot confirmation point.
+if smtCmpWindow > pivotRightLen
+    runtime.error('Cmp Local-Extreme Window (' + str.tostring(smtCmpWindow) + ') must be <= Pivot Right Bars (' + str.tostring(pivotRightLen) + ').')
+
+grpSymbols = 'SMT — Comparison Symbols'
+sym1Enabled = input.bool(true,  '', inline = 's1', group = grpSymbols)
+sym1        = input.symbol('PEPPERSTONE:EURUSD', 'Symbol 1', inline = 's1', group = grpSymbols)
+sym1Corr    = input.string('Positive', '', options = ['Positive', 'Inverse'], inline = 's1', group = grpSymbols)
+sym2Enabled = input.bool(true,  '', inline = 's2', group = grpSymbols)
+sym2        = input.symbol('PEPPERSTONE:USDX', 'Symbol 2', inline = 's2', group = grpSymbols)
+sym2Corr    = input.string('Inverse', '', options = ['Positive', 'Inverse'], inline = 's2', group = grpSymbols)
+sym3Enabled = input.bool(false, '', inline = 's3', group = grpSymbols)
+sym3        = input.symbol('CBOT_MINI:YM1!', 'Symbol 3', inline = 's3', group = grpSymbols)
+sym3Corr    = input.string('Positive', '', options = ['Positive', 'Inverse'], inline = 's3', group = grpSymbols)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Inputs — SMT Correlation Filter (mirrors the indicator v3.15)
+//──────────────────────────────────────────────────────────────────────────────
+grpCorr = 'SMT — Correlation Filter'
+corrEnabled   = input.bool(false, 'Mute SMT When Decorrelated', group = grpCorr,
+     tooltip = 'When ON, a comparison symbol stops contributing a divergence whenever its rolling correlation no longer matches its Positive/Inverse setting with enough strength. SMT is only valid while the pair is correlated. Default OFF.')
+corrLen       = input.int(50, 'Correlation Length', minval = 10, maxval = 500, group = grpCorr,
+     tooltip = 'Bars in the rolling Pearson correlation (chart close vs comparison-symbol close).')
+corrThreshold = input.float(0.5, 'Min Correlation', minval = 0.0, maxval = 1.0, step = 0.05, group = grpCorr,
+     tooltip = 'Minimum correlation in the EXPECTED direction. Positive needs corr >= +this; Inverse needs corr <= -this. Below it the symbol is muted.')
+showCorrTable = input.bool(true, 'Show Correlation Table', group = grpCorr)
+corrTablePos  = input.string('Top Right', 'Correlation Table Position', options = ['Top Left', 'Top Right', 'Bottom Left', 'Middle Right'], group = grpCorr)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Inputs — SMT ★ confluence (number of diverging symbols)
+//──────────────────────────────────────────────────────────────────────────────
+// ★ = how many comparison symbols diverged against the SAME chart pivot.
+// 2 symbols diverging = ★2 (stronger), 1 symbol = ★1, etc. — independent of
+// WHICH symbols. Pick the minimum ★ required to take a trade.
+grpStars = 'SMT ★ Confluence (diverging symbols)'
+minSmtStars = input.int(1, 'Minimum ★ (diverging symbols)', minval = 1, maxval = 3, group = grpStars,
+     tooltip = '★ = number of comparison symbols that diverged at the pivot. 1 = take any divergence. 2 = require at least 2 symbols to agree (stronger, fewer trades). 3 = all three must diverge. Enable enough symbols above to reach your chosen ★.')
+showStats   = input.bool(true, 'Show ★ Stats Panel', group = grpStars,
+     tooltip = 'Bottom-right table: Trades / Win% / Profit Factor / Net split by ★ level — so you can see whether ★2 actually outperforms ★1 on your data.')
+
+//──────────────────────────────────────────────────────────────────────────────
+// Inputs — Optional EXTRA filter: AVWAP ± σ (on top of the ★ filter)
+//──────────────────────────────────────────────────────────────────────────────
+grpConf = 'Confluence Filter (price levels)'
+requireConf  = input.bool(false, 'Require Price-Level Confluence', group = grpConf,
+     tooltip = 'MASTER switch for the price-level confluence filter. When ON, a trade is taken only if the pivot is near one of the ENABLED levels: AVWAP/σ (toggle below) and/or the Volume Profile levels (Volume Profile group). When OFF, no price-level confluence is required (the ★ diverging-symbol filter still applies). Use the individual level toggles to choose which levels count — e.g. master ON + AVWAP OFF + VP ON = require VP confluence only.')
+useAvwapConf = input.bool(true, 'Confluence: AVWAP / σ bands', group = grpConf,
+     tooltip = 'Include AVWAP and its σ bands as confluence levels. Turn OFF (with the master ON) to require ONLY Volume-Profile confluence, independent of AVWAP.')
+confAtrMult  = input.float(0.1, 'Confluence Distance (× ATR14)', minval = 0.01, maxval = 2.0, step = 0.05, group = grpConf)
+avwapAnchor  = input.string('Daily', 'AVWAP Anchor', options = ['Daily', 'Weekly', 'Monthly'], group = grpConf)
+// AVWAP center line + three σ bands, each independently toggleable AND adjustable,
+// so you can backtest which level gives the best entries — enable ONE at a time to
+// isolate it. Each band is checked ABOVE and BELOW (+Nσ catches short pivots near
+// the upper band, -Nσ catches long pivots near the lower band).
+useSigMid  = input.bool(true,  'Confluence: AVWAP center line', group = grpConf)
+useSig1    = input.bool(true,  '', inline = 'sg1', group = grpConf)
+sigma1Mult = input.float(1.0, '±σ #1 band ×', minval = 0.1, maxval = 5, step = 0.1, inline = 'sg1', group = grpConf)
+useSig2    = input.bool(true,  '', inline = 'sg2', group = grpConf)
+sigma2Mult = input.float(2.0, '±σ #2 band ×', minval = 0.1, maxval = 5, step = 0.1, inline = 'sg2', group = grpConf)
+useSig3    = input.bool(true,  '', inline = 'sg3', group = grpConf)
+sigma3Mult = input.float(3.0, '±σ #3 band ×', minval = 0.1, maxval = 5, step = 0.1, inline = 'sg3', group = grpConf)
+useSideAware = input.bool(false, 'Side-aware σ (short→upper, long→lower)', group = grpConf,
+     tooltip = 'ON = a SHORT only counts σ bands ABOVE AVWAP and a LONG only bands BELOW (pure mean-reversion fades). OFF = both sides count (also catches trend-continuation pivots on the far side). Default OFF — test both.')
+
+//──────────────────────────────────────────────────────────────────────────────
+// Inputs — Volume Profile (real levels for confluence + Volume-POC target)
+//──────────────────────────────────────────────────────────────────────────────
+grpVP = 'Volume Profile (confluence + targets)'
+vpEnabled    = input.bool(true, 'Compute Volume Profile Levels', group = grpVP,
+     tooltip = 'Adds REAL VP levels (developing + previous-session POC/VAH/VAL and naked POCs) to the confluence filter, and enables the Volume-POC target. Uses the same anchor as AVWAP. This is the full price-level ★ the indicator uses.')
+vpRows       = input.int(24, 'Profile Rows', minval = 5, maxval = 80, group = grpVP, tooltip = 'More rows = finer level resolution.')
+vpValueAreaP = input.float(70.0, 'Value Area %', minval = 50, maxval = 95, step = 1, group = grpVP) / 100.0
+vpSource     = input.string('Volume', 'Profile Source', options = ['Volume', 'Money Flow'], group = grpVP,
+     tooltip = 'Volume: bin weight = overlap x volume. Money Flow: overlap x volume x bin-midprice (dollar value), which shifts POC/VAH/VAL upward. Mirrors the indicator Profile Source.')
+vpUseDev     = input.bool(true,  'Confluence: Developing POC/VAH/VAL', group = grpVP)
+vpUsePrev    = input.bool(true,  'Confluence: Previous-session POC/VAH/VAL', group = grpVP)
+vpUseNaked   = input.bool(true,  'Confluence: Naked POCs', group = grpVP)
+nPocMax      = input.int(20, 'Max Naked POCs Tracked', minval = 1, maxval = 100, group = grpVP)
+vpCompositeEnabled  = input.bool(true, 'Composite VP (multi-session)', group = grpVP,
+     tooltip = 'Aggregate the last N finalized sessions into a unified profile, yielding composite POC/VAH/VAL (mirrors the indicator).')
+vpCompositeSessions = input.int(5, 'Composite Sessions', minval = 2, maxval = 20, group = grpVP)
+vpUseComposite      = input.bool(true, 'Confluence: Composite POC/VAH/VAL', group = grpVP,
+     tooltip = 'Gated to 2+ sessions (like the indicator) so it does not double-count the previous session.')
+
+//──────────────────────────────────────────────────────────────────────────────
+// Inputs — Trade management
+//──────────────────────────────────────────────────────────────────────────────
+grpTrade = 'Trade Management'
+tradeDir    = input.string('Both', 'Direction', options = ['Both', 'Long Only', 'Short Only'], group = grpTrade)
+stopAtrMult = input.float(0.5, 'Stop Buffer Beyond Pivot (× ATR14)', minval = 0.0, maxval = 5.0, step = 0.1, group = grpTrade,
+     tooltip = 'Stop is placed this many ATRs beyond the pivot extreme (above a swept high / below a swept low).')
+tpRR        = input.float(2.0, 'Target (Reward : Risk)', minval = 0.5, maxval = 10.0, step = 0.5, group = grpTrade,
+     tooltip = 'Take-profit distance as a multiple of risk (stop distance). 2.0 = 2R target.')
+closeOpp    = input.bool(true, 'Close Opposite Position on New Signal', group = grpTrade)
+
+grpSLTP = 'SL / TP Projection (visual)'
+showSLTP     = input.bool(true, 'Draw SL/TP Lines on Chart', group = grpSLTP,
+     tooltip = 'Draws the stop (red) and target (green) as short horizontal lines at each entry so you can see the risk/reward visually. Visual only — does NOT affect the backtest. In Trailing-ATR mode there is no fixed target, so only the stop line is drawn.')
+sltpProjBars = input.int(20, 'Projection Length (bars)', minval = 3, maxval = 200, group = grpSLTP,
+     tooltip = 'How many bars to the right the SL/TP lines extend from each entry.')
+
+grpRisk = 'Risk Management'
+useBreakeven = input.bool(false, 'Move Stop to Breakeven after Trigger', group = grpRisk,
+     tooltip = 'Once price reaches the trigger profit, ratchet the stop up to (around) the entry, so a winner that reverses ends flat instead of a loss. Cuts the grab-then-fail losers. Works alongside trailing/partials.')
+beTriggerR   = input.float(1.0, 'Breakeven Trigger (R)', minval = 0.1, maxval = 5.0, step = 0.1, group = grpRisk,
+     tooltip = 'Move to breakeven once price is this many R in profit (1.0 = one stop-distance in your favour).')
+beLockR      = input.float(0.0, 'Lock-in at Breakeven (R)', minval = 0.0, maxval = 2.0, step = 0.1, group = grpRisk,
+     tooltip = '0 = exact entry (true breakeven). 0.2 = lock in 0.2R of profit when the stop ratchets up.')
+useMinRR     = input.bool(false, 'Require Minimum Reward:Risk', group = grpRisk,
+     tooltip = 'Skip a trade whose target is too close relative to its stop (poor R:R). No effect in Fixed R:R mode (R:R is constant by definition); useful for structural targets (AVWAP / Volume POC / Opposite Swing) where reward varies. Skipped in Trailing ATR mode (no fixed target).')
+minRR        = input.float(1.5, 'Minimum Reward:Risk', minval = 0.5, maxval = 10.0, step = 0.5, group = grpRisk)
+
+grpTgt = 'Target / Exit Mode'
+targetMode    = input.string('Fixed R:R', 'Target Mode', options = ['Fixed R:R', 'AVWAP', 'Volume POC', 'Opposite Swing', 'ATR Multiple', 'Trailing ATR'], group = grpTgt,
+     tooltip = 'Fixed R:R: target = Reward:Risk multiple (clean yardstick for comparing settings). AVWAP: revert to session fair value (mean-reversion thesis). Opposite Swing: target the prior opposite pivot (liquidity-to-liquidity). ATR Multiple: fixed volatility distance. Trailing ATR: no fixed target — trail the whole position. AVWAP & Opposite Swing fall back to Fixed R:R if their level is on the wrong side of entry.')
+atrTargetMult = input.float(3.0, 'ATR Target (× ATR14)', minval = 0.5, maxval = 20, step = 0.5, group = grpTgt,
+     tooltip = 'Target distance when Target Mode = ATR Multiple.')
+trailAtrMult  = input.float(2.0, 'Trail Distance (× ATR14)', minval = 0.5, maxval = 10, step = 0.5, group = grpTgt,
+     tooltip = 'Trailing-stop distance behind the run-up extreme. Used by Trailing ATR mode and by the partial-exit runner.')
+usePartial    = input.bool(false, 'Partial Exit + Trail Runner', group = grpTgt,
+     tooltip = 'Close Partial % at the target, then trail the remainder by Trail Distance. Best of both: bank a high-probability win, ride the tail. Ignored when Target Mode = Trailing ATR (whole position trails).')
+partialPct    = input.int(50, 'Partial % Closed at Target', minval = 10, maxval = 90, step = 5, group = grpTgt)
+
+grpChop = 'Chop / Consolidation Filter'
+useSwingFilter = input.bool(false, 'Require Minimum Swing Size', group = grpChop,
+     tooltip = 'MAIN "no trades in tight consolidation" toggle. Skips an SMT whose swing leg (the move from the prior opposite pivot to this pivot) is smaller than Min Swing × ATR. Small back-and-forth wiggles around one price get filtered; only meaningful swings trade.')
+minSwingAtr    = input.float(1.0, 'Min Swing Size (× ATR14)', minval = 0.1, maxval = 10, step = 0.1, group = grpChop,
+     tooltip = 'The pivot-to-prior-opposite-pivot leg must be at least this many ATRs. Raise it to demand bigger swings (fewer, cleaner trades).')
+useCooldown    = input.bool(false, 'Trade Cooldown', group = grpChop,
+     tooltip = 'Minimum bars between entries — stops re-entering on every wiggle inside a range.')
+cooldownBars   = input.int(10, 'Cooldown (bars)', minval = 1, maxval = 200, group = grpChop)
+useAdx         = input.bool(false, 'ADX Regime Filter', group = grpChop,
+     tooltip = 'Only trade when ADX(14) is above the threshold. Low ADX = directionless range/chop → skip. Higher threshold = stricter.')
+adxMin         = input.float(20.0, 'Min ADX', minval = 5, maxval = 50, step = 1, group = grpChop)
+
+// v1.3: the Sweep-gate inputs were RELOCATED to the END of the input list
+// (search "SMT — Sweep Gate") so new inputs never shift existing ones' saved
+// positions on an in-place source update (TradingView maps by input order).
+grpDate = 'Backtest Window'
+useDateFilter = input.bool(false, 'Limit to Date Range', group = grpDate,
+     tooltip = 'Enable to test in-sample vs out-of-sample windows separately. Best practice: tune on one range, validate on another.')
+startDate = input.time(timestamp('01 Jan 2024 00:00'), 'Start', group = grpDate)
+endDate   = input.time(timestamp('01 Jan 2027 00:00'), 'End',   group = grpDate)
+
+// v1.2 liquidity-sweep gate (parity with indicator v3.16) — reuses smcV16's
+// validated sweep detection via its exported plot; no second definition here.
+// v1.3: kept at the END of the input list so future inputs don't shift the
+// positions of existing ones (TradingView maps saved settings by input order).
+grpSweep = 'SMT — Sweep Gate (smcV16)'
+smtRequireSweep  = input.bool(false, 'Require Liquidity Sweep', group = grpSweep,
+     tooltip = 'Only take a trade when smcV16 reported a same-direction liquidity sweep at/near the pivot (longs need a bullish sweep, shorts a bearish one). REQUIRES wiring the source below to smcV16 on the SAME chart/symbol/timeframe. Default OFF.')
+smtSweepSrc      = input.source(close, 'SMC Sweep Export source', group = grpSweep,
+     tooltip = 'Point at smcV16 -> "SMT Sweep/BOS/CHoCH Export". Only used when Require Liquidity Sweep is ON. If left as Close while ON it reads garbage, so wire it.')
+smtSweepLookback = input.int(3, 'Sweep Lookback (± bars around pivot)', minval = 0, maxval = 20, group = grpSweep,
+     tooltip = 'Accept a sweep within this many bars on EITHER side of the pivot bar (symmetric, v1.3) — smcV16 swing sweeps can confirm before or after the extreme.')
+// Buffer: smtSweepSrc is read up to [pivotRightLen + smtSweepLookback] (<=70).
+max_bars_back(smtSweepSrc, 100)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Helpers — pivot source, cmp fetch, window series, ATR
+//──────────────────────────────────────────────────────────────────────────────
+pivotSrcHigh = pivotSrcMode == 'Body' ? math.max(open, close) : high
+pivotSrcLow  = pivotSrcMode == 'Body' ? math.min(open, close) : low
+
+// Strip the "EXCHANGE:" prefix for compact reason labels.
+shortName(string s) =>
+    int colonIdx = str.pos(s, ':')
+    na(colonIdx) ? s : str.substring(s, colonIdx + 1)
+
+confAtr = ta.atr(14)
+
+// Cmp fetch using the cmp comparison source (body by default), evaluated in
+// each symbol's own context. gaps_on + ignore_invalid_symbol (v3.9 hardening).
+cmpHiSrc = smtCmpSrc == 'Body' ? math.max(open, close) : high
+cmpLoSrc = smtCmpSrc == 'Body' ? math.min(open, close) : low
+// v3.15: cmp close added (free) for the rolling-correlation filter.
+[s1High, s1Low, s1Close] = request.security(sym1, timeframe.period, [cmpHiSrc, cmpLoSrc, close], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_on, ignore_invalid_symbol = true)
+[s2High, s2Low, s2Close] = request.security(sym2, timeframe.period, [cmpHiSrc, cmpLoSrc, close], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_on, ignore_invalid_symbol = true)
+[s3High, s3Low, s3Close] = request.security(sym3, timeframe.period, [cmpHiSrc, cmpLoSrc, close], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_on, ignore_invalid_symbol = true)
+
+smtCmpWinLen = 2 * smtCmpWindow + 1
+s1HighMax = ta.highest(s1High, smtCmpWinLen)
+s1LowMin  = ta.lowest (s1Low,  smtCmpWinLen)
+s2HighMax = ta.highest(s2High, smtCmpWinLen)
+s2LowMin  = ta.lowest (s2Low,  smtCmpWinLen)
+s3HighMax = ta.highest(s3High, smtCmpWinLen)
+s3LowMin  = ta.lowest (s3Low,  smtCmpWinLen)
+
+// v3.15: rolling correlation per cmp symbol. v1.3: on per-bar RETURNS
+// (ta.change), not raw price levels — co-trending instruments correlate
+// spuriously on levels; returns measure real co-movement (Pearson is
+// scale-invariant, so ta.change works across price scales).
+corr1 = ta.correlation(ta.change(close), ta.change(s1Close), corrLen)
+corr2 = ta.correlation(ta.change(close), ta.change(s2Close), corrLen)
+corr3 = ta.correlation(ta.change(close), ta.change(s3Close), corrLen)
+
+phVal = ta.pivothigh(pivotSrcHigh, pivotLeftLen, pivotRightLen)
+plVal = ta.pivotlow (pivotSrcLow,  pivotLeftLen, pivotRightLen)
+
+// v1.2: liquidity-sweep decode (mirror of indicator v3.16 smtSweepDir). Reads
+// smcV16's packed export (sweep = packed % 3; 0 none / 1 bull / 2 bear) over the
+// window [pivotRightLen .. +lookback]. Returns true if a sweep of wantCode
+// (1 bull / 2 bear) printed in the window. No-ops unless the gate is enabled.
+smtSweepDir(int wantCode) =>
+    bool found = false
+    if smtRequireSweep
+        // v1.3: symmetric window around the pivot bar (mirror of indicator
+        // v3.18) — smcV16 swing sweeps often confirm a bar or two AFTER the
+        // extreme, which the old one-sided [pivotRightLen..+lookback] missed.
+        int loOff = math.max(0, pivotRightLen - smtSweepLookback)
+        int hiOff = pivotRightLen + smtSweepLookback
+        for off = loOff to hiOff
+            int packed = int(math.round(nz(smtSweepSrc[off])))
+            if packed % 3 == wantCode
+                found := true
+    found
+
+//──────────────────────────────────────────────────────────────────────────────
+// Anchored VWAP + σ (self-contained confluence proxy)
+//──────────────────────────────────────────────────────────────────────────────
+avwapTF = avwapAnchor == 'Daily' ? 'D' : avwapAnchor == 'Weekly' ? 'W' : 'M'
+isNewSession = ta.change(time(avwapTF)) != 0
+
+var float cumPV  = 0.0
+var float cumV   = 0.0
+var float cumPV2 = 0.0
+if barstate.isconfirmed
+    float tp  = hlc3
+    float vol = nz(volume)
+    float pv  = tp * vol
+    if isNewSession or cumV == 0
+        cumPV  := pv
+        cumV   := vol
+        cumPV2 := tp * pv
+    else
+        cumPV  += pv
+        cumV   += vol
+        cumPV2 += tp * pv
+float avwap      = cumV > 0 ? cumPV / cumV : na
+float avwapVar   = cumV > 0 ? math.max(0.0, cumPV2 / cumV - avwap * avwap) : na
+float avwapSigma = na(avwapVar) ? na : math.sqrt(avwapVar)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Volume Profile — lean port (levels only, no drawings). Same session anchor as
+// AVWAP. Produces developing + previous-session POC/VAH/VAL and naked POCs,
+// using the indicator's drift-free recompute (rebuild bins from raw on range
+// change, else accumulate the current bar).
+//──────────────────────────────────────────────────────────────────────────────
+var float vpSessHigh   = na
+var float vpSessLow    = na
+var int   vpSessStart  = na
+var array<float> vpBins = array.new<float>(vpRows, 0.0)
+var float lastRecompHigh = na
+var float lastRecompLow  = na
+var float currDevPOC = na
+var float currDevVAH = na
+var float currDevVAL = na
+var float prevSessPOC = na
+var float prevSessVAH = na
+var float prevSessVAL = na
+var array<float> nakedPOCs    = array.new<float>()
+var array<int>   nakedPOCBars = array.new<int>()
+// Composite VP state (mirrors the indicator; no startBars array — no drawings).
+var matrix<float> compositeSessionBins  = matrix.new<float>(0, vpRows, 0.0)
+var array<float>  compositeSessionHighs = array.new<float>()
+var array<float>  compositeSessionLows  = array.new<float>()
+var array<float>  compositeBins         = array.new<float>(vpRows, 0.0)
+var int   compositeSessionCount = 0
+var float compositePOC = na
+var float compositeVAH = na
+var float compositeVAL = na
+
+computeProfile(array<float> bins, int rows, float vaTargetRatio) =>
+    int   pocIdx = 0
+    float maxV   = 0.0
+    float totalV = 0.0
+    for i = 0 to rows - 1
+        float v = array.get(bins, i)
+        totalV += v
+        if v > maxV
+            maxV   := v
+            pocIdx := i
+    int   vaL = pocIdx
+    int   vaH = pocIdx
+    float vaV = array.get(bins, pocIdx)
+    float target = totalV * vaTargetRatio
+    while vaV < target and (vaL > 0 or vaH < rows - 1)
+        float upV = vaH < rows - 1 ? array.get(bins, vaH + 1) : -1.0
+        float dnV = vaL > 0        ? array.get(bins, vaL - 1) : -1.0
+        if upV < 0 and dnV < 0
+            break
+        if upV >= dnV
+            vaH += 1
+            vaV += upV
+        else
+            vaL -= 1
+            vaV += dnV
+    [pocIdx, vaL, vaH, totalV]
+
+recomputeBinsFromRaw(int startOffset, int endOffset) =>
+    array.fill(vpBins, 0.0)
+    int safeEnd = math.min(endOffset, 4999)
+    if safeEnd >= startOffset and not na(vpSessHigh) and not na(vpSessLow) and vpSessHigh > vpSessLow
+        float binSize = (vpSessHigh - vpSessLow) / vpRows
+        if binSize > 0
+            for offset = startOffset to safeEnd
+                float bH = high[offset]
+                float bL = low[offset]
+                float bV = nz(volume[offset])
+                float bRange = bH - bL
+                if bRange > 0 and bV > 0
+                    bool moneyFlow = vpSource == 'Money Flow'
+                    int iStart = math.max(0,         int(math.floor((bL - vpSessLow) / binSize)) - 1)
+                    int iEnd   = math.min(vpRows - 1, int(math.floor((bH - vpSessLow) / binSize)) + 1)
+                    for i = iStart to iEnd
+                        float binLow  = vpSessLow + i * binSize
+                        float binHigh = binLow + binSize
+                        float overlap = math.max(0.0, math.min(bH, binHigh) - math.max(bL, binLow))
+                        if overlap > 0
+                            float ratio = overlap / bRange
+                            float w = moneyFlow ? bV * ratio * (binLow + binSize * 0.5) : bV * ratio
+                            array.set(vpBins, i, array.get(vpBins, i) + w)
+    0
+
+accumulateCurrentBar() =>
+    if not na(vpSessHigh) and not na(vpSessLow) and vpSessHigh > vpSessLow
+        float binSize  = (vpSessHigh - vpSessLow) / vpRows
+        float barRange = high - low
+        float vol      = nz(volume)
+        if barRange > 0 and binSize > 0 and vol > 0
+            int iStart = math.max(0,         int(math.floor((low  - vpSessLow) / binSize)) - 1)
+            int iEnd   = math.min(vpRows - 1, int(math.floor((high - vpSessLow) / binSize)) + 1)
+            for i = iStart to iEnd
+                float binLow  = vpSessLow + i * binSize
+                float binHigh = binLow + binSize
+                float overlap = math.max(0.0, math.min(high, binHigh) - math.max(low, binLow))
+                if overlap > 0
+                    float ratio = overlap / barRange
+                    float w = vpSource == 'Money Flow' ? vol * ratio * (binLow + binSize * 0.5) : vol * ratio
+                    array.set(vpBins, i, array.get(vpBins, i) + w)
+    0
+
+// Composite VP — re-aggregate the stored session bin snapshots onto a unified
+// grid (mirrors the indicator). Returns [rangeHigh, rangeLow, POC, VAH, VAL].
+recomputeComposite() =>
+    float retHigh = na
+    float retLow  = na
+    float retPOC  = na
+    float retVAH  = na
+    float retVAL  = na
+    int nSess = matrix.rows(compositeSessionBins)
+    if nSess > 0
+        float cHigh = -1.0e30
+        float cLow  =  1.0e30
+        for i = 0 to nSess - 1
+            cHigh := math.max(cHigh, array.get(compositeSessionHighs, i))
+            cLow  := math.min(cLow,  array.get(compositeSessionLows,  i))
+        retHigh := cHigh
+        retLow  := cLow
+        array.fill(compositeBins, 0.0)
+        if cHigh > cLow
+            float compBinSize = (cHigh - cLow) / vpRows
+            for s = 0 to nSess - 1
+                float sHigh = array.get(compositeSessionHighs, s)
+                float sLow  = array.get(compositeSessionLows,  s)
+                if sHigh > sLow
+                    float sBinSize = (sHigh - sLow) / vpRows
+                    for j = 0 to vpRows - 1
+                        float bV = matrix.get(compositeSessionBins, s, j)
+                        if bV > 0
+                            float bLowP  = sLow + j * sBinSize
+                            float bHighP = bLowP + sBinSize
+                            int kStart = math.max(0,         int(math.floor((bLowP  - cLow) / compBinSize)) - 1)
+                            int kEnd   = math.min(vpRows - 1, int(math.floor((bHighP - cLow) / compBinSize)) + 1)
+                            for k = kStart to kEnd
+                                float cLowP  = cLow + k * compBinSize
+                                float cHighP = cLowP + compBinSize
+                                float overlap = math.max(0.0, math.min(bHighP, cHighP) - math.max(bLowP, cLowP))
+                                if overlap > 0
+                                    array.set(compositeBins, k, array.get(compositeBins, k) + bV * (overlap / sBinSize))
+            [cPocIdx, cVaL, cVaH, cTotalV] = computeProfile(compositeBins, vpRows, vpValueAreaP)
+            if cTotalV > 0
+                retPOC := cLow + (cPocIdx + 0.5) * compBinSize
+                retVAH := cLow + (cVaH + 1) * compBinSize
+                retVAL := cLow + cVaL * compBinSize
+    [retHigh, retLow, retPOC, retVAH, retVAL]
+
+// 1) Session finalize → previous-session levels + push naked POC.
+if vpEnabled and isNewSession and not na(vpSessHigh) and vpSessHigh > vpSessLow
+    recomputeBinsFromRaw(1, bar_index - vpSessStart)
+    [fPocIdx, fVaL, fVaH, fTotalV] = computeProfile(vpBins, vpRows, vpValueAreaP)
+    if fTotalV > 0
+        float fBinSize = (vpSessHigh - vpSessLow) / vpRows
+        prevSessPOC := vpSessLow + (fPocIdx + 0.5) * fBinSize
+        prevSessVAH := vpSessLow + (fVaH + 1) * fBinSize
+        prevSessVAL := vpSessLow + fVaL * fBinSize
+        array.push(nakedPOCs, prevSessPOC)
+        array.push(nakedPOCBars, bar_index)
+        while array.size(nakedPOCs) > nPocMax
+            array.shift(nakedPOCs)
+            array.shift(nakedPOCBars)
+
+        // Composite VP — snapshot this finalized session's bins, trim to N, recompute.
+        if vpCompositeEnabled
+            array<float> sessBinsCopy = array.copy(vpBins)
+            matrix.add_row(compositeSessionBins, matrix.rows(compositeSessionBins), sessBinsCopy)
+            array.push(compositeSessionHighs, vpSessHigh)
+            array.push(compositeSessionLows,  vpSessLow)
+            while matrix.rows(compositeSessionBins) > vpCompositeSessions
+                matrix.remove_row(compositeSessionBins, 0)
+                array.shift(compositeSessionHighs)
+                array.shift(compositeSessionLows)
+            [_cRH, _cRL, cP, cVH, cVL] = recomputeComposite()
+            compositePOC := cP
+            compositeVAH := cVH
+            compositeVAL := cVL
+            compositeSessionCount := matrix.rows(compositeSessionBins)
+
+// 2) Naked-POC touch removal (1-bar grace — skip the creation bar).
+if vpEnabled and barstate.isconfirmed and array.size(nakedPOCs) > 0
+    int sz = array.size(nakedPOCs)
+    for n = 0 to sz - 1
+        int idx = sz - 1 - n
+        if idx < array.size(nakedPOCs)
+            int created = array.get(nakedPOCBars, idx)
+            if bar_index > created
+                float p = array.get(nakedPOCs, idx)
+                if high >= p and low <= p
+                    array.remove(nakedPOCs, idx)
+                    array.remove(nakedPOCBars, idx)
+
+// 3) Session reset.
+if vpEnabled and (isNewSession or na(vpSessHigh))
+    vpSessHigh  := high
+    vpSessLow   := low
+    vpSessStart := bar_index
+    array.fill(vpBins, 0.0)
+    currDevPOC := na
+    currDevVAH := na
+    currDevVAL := na
+    lastRecompHigh := na
+    lastRecompLow  := na
+else if vpEnabled
+    vpSessHigh := math.max(vpSessHigh, high)
+    vpSessLow  := math.min(vpSessLow, low)
+
+// 4) Drift-free bin recompute + publish developing POC/VAH/VAL each confirmed bar.
+if vpEnabled and barstate.isconfirmed and not na(vpSessHigh) and vpSessHigh > vpSessLow
+    bool rangeChanged = na(lastRecompHigh) or na(lastRecompLow) or vpSessHigh != lastRecompHigh or vpSessLow != lastRecompLow
+    if rangeChanged
+        recomputeBinsFromRaw(0, bar_index - vpSessStart)
+        lastRecompHigh := vpSessHigh
+        lastRecompLow  := vpSessLow
+    else
+        accumulateCurrentBar()
+    if array.sum(vpBins) > 0
+        [cPocIdx, cVaL, cVaH, _ct] = computeProfile(vpBins, vpRows, vpValueAreaP)
+        float cBinSize = (vpSessHigh - vpSessLow) / vpRows
+        currDevPOC := vpSessLow + (cPocIdx + 0.5) * cBinSize
+        currDevVAH := vpSessLow + (cVaH + 1) * cBinSize
+        currDevVAL := vpSessLow + cVaL * cBinSize
+
+// Confluence at the pivot bar (offset back by pivotRightLen). Now includes the
+// VP levels, so "Require Confluence" ≈ the indicator's price-level ★
+// (AVWAP/σ + developing & previous VP + naked POCs).
+// Returns a STRING of matched level tags ('' = no confluence). Side-aware: when
+// useSideAware, a LONG counts only the LOWER σ bands and a SHORT only the UPPER
+// ones (mean-reversion fades). The tag is appended to the entry comment so the
+// trade list shows WHICH level each trade came from (e.g. '+2σ', 'POC', 'nPOC').
+checkConf(float price, bool isLong) =>
+    string tag = ''
+    if not na(price)
+        float pivAtr = confAtr[pivotRightLen]
+        float td = na(pivAtr) ? syminfo.mintick * 10 : confAtrMult * pivAtr
+        float a  = avwap[pivotRightLen]
+        float s  = avwapSigma[pivotRightLen]
+        if useAvwapConf and not na(a) and not na(s) and s > 0
+            bool sUp = not useSideAware or not isLong   // short fades UPPER bands
+            bool sLo = not useSideAware or isLong       // long  fades LOWER bands
+            if useSigMid and math.abs(price - a) <= td
+                tag := tag + 'AVWAP '
+            if useSig1
+                if sUp and math.abs(price - (a + sigma1Mult * s)) <= td
+                    tag := tag + '+' + str.tostring(sigma1Mult, '#.#') + 'σ '
+                else if sLo and math.abs(price - (a - sigma1Mult * s)) <= td
+                    tag := tag + '-' + str.tostring(sigma1Mult, '#.#') + 'σ '
+            if useSig2
+                if sUp and math.abs(price - (a + sigma2Mult * s)) <= td
+                    tag := tag + '+' + str.tostring(sigma2Mult, '#.#') + 'σ '
+                else if sLo and math.abs(price - (a - sigma2Mult * s)) <= td
+                    tag := tag + '-' + str.tostring(sigma2Mult, '#.#') + 'σ '
+            if useSig3
+                if sUp and math.abs(price - (a + sigma3Mult * s)) <= td
+                    tag := tag + '+' + str.tostring(sigma3Mult, '#.#') + 'σ '
+                else if sLo and math.abs(price - (a - sigma3Mult * s)) <= td
+                    tag := tag + '-' + str.tostring(sigma3Mult, '#.#') + 'σ '
+        if vpEnabled and vpUseDev
+            float dp  = currDevPOC[pivotRightLen]
+            float dvh = currDevVAH[pivotRightLen]
+            float dvl = currDevVAL[pivotRightLen]
+            if not na(dp)  and math.abs(price - dp)  <= td
+                tag := tag + 'POC '
+            if not na(dvh) and math.abs(price - dvh) <= td
+                tag := tag + 'VAH '
+            if not na(dvl) and math.abs(price - dvl) <= td
+                tag := tag + 'VAL '
+        if vpEnabled and vpUsePrev
+            float pp  = prevSessPOC[pivotRightLen]
+            float pvh = prevSessVAH[pivotRightLen]
+            float pvl = prevSessVAL[pivotRightLen]
+            if not na(pp)  and math.abs(price - pp)  <= td
+                tag := tag + 'pPOC '
+            if not na(pvh) and math.abs(price - pvh) <= td
+                tag := tag + 'pVAH '
+            if not na(pvl) and math.abs(price - pvl) <= td
+                tag := tag + 'pVAL '
+        if vpEnabled and vpUseComposite
+            float cp  = compositePOC[pivotRightLen]
+            float cvh = compositeVAH[pivotRightLen]
+            float cvl = compositeVAL[pivotRightLen]
+            int   csess = compositeSessionCount[pivotRightLen]
+            if csess >= 2   // gated to 2+ sessions (mirrors indicator)
+                if not na(cp)  and math.abs(price - cp)  <= td
+                    tag := tag + 'cPOC '
+                if not na(cvh) and math.abs(price - cvh) <= td
+                    tag := tag + 'cVAH '
+                if not na(cvl) and math.abs(price - cvl) <= td
+                    tag := tag + 'cVAL '
+        if vpEnabled and vpUseNaked
+            int nsz = array.size(nakedPOCs)
+            if nsz > 0
+                int pivBarIdx = bar_index - pivotRightLen
+                for i = 0 to nsz - 1
+                    // fix #4: only count nPOCs that already existed at the pivot bar
+                    if array.get(nakedPOCBars, i) <= pivBarIdx and math.abs(price - array.get(nakedPOCs, i)) <= td
+                        tag := tag + 'nPOC '
+    tag
+
+//──────────────────────────────────────────────────────────────────────────────
+// SMT state + detection (faithful reproduction of v3.13)
+//──────────────────────────────────────────────────────────────────────────────
+var float prevPHChart   = na
+var int   prevPHBar     = na
+var float prevPHS1      = na
+var float prevPHS2      = na
+var float prevPHS3      = na
+var float prevPHChartS1 = na
+var float prevPHChartS2 = na
+var float prevPHChartS3 = na
+
+var float prevPLChart   = na
+var int   prevPLBar     = na
+var float prevPLS1      = na
+var float prevPLS2      = na
+var float prevPLS3      = na
+var float prevPLChartS1 = na
+var float prevPLChartS2 = na
+var float prevPLChartS3 = na
+
+bool   bearSig   = false
+float  bearPivot = na
+int    bearStars = 0
+string bearSyms  = ''
+bool   bullSig   = false
+float  bullPivot = na
+int    bullStars = 0
+string bullSyms  = ''
+
+// ─── Bearish SMT (confirmed pivot HIGH → short) ───
+if not na(phVal)
+    int   pivotBar = bar_index - pivotRightLen
+    int   cmpOff   = pivotRightLen - smtCmpWindow
+    float s1At = sym1Corr == 'Inverse' ? s1LowMin[cmpOff] : s1HighMax[cmpOff]
+    float s2At = sym2Corr == 'Inverse' ? s2LowMin[cmpOff] : s2HighMax[cmpOff]
+    float s3At = sym3Corr == 'Inverse' ? s3LowMin[cmpOff] : s3HighMax[cmpOff]
+    float eqTd = na(confAtr[pivotRightLen]) ? 0.0 : smtEqTolAtr * confAtr[pivotRightLen]
+    bool  recencyOK = smtMaxPivotBars == 0 or na(prevPHBar) or (pivotBar - prevPHBar) <= smtMaxPivotBars
+    // v3.15: sign-aware correlation gate at the pivot bar (fail-open on na).
+    float chc1 = corr1[pivotRightLen]
+    float chc2 = corr2[pivotRightLen]
+    float chc3 = corr3[pivotRightLen]
+    bool corrOK1 = not corrEnabled or na(chc1) or (sym1Corr == 'Inverse' ? -chc1 : chc1) >= corrThreshold
+    bool corrOK2 = not corrEnabled or na(chc2) or (sym2Corr == 'Inverse' ? -chc2 : chc2) >= corrThreshold
+    bool corrOK3 = not corrEnabled or na(chc3) or (sym3Corr == 'Inverse' ? -chc3 : chc3) >= corrThreshold
+
+    int    divCount     = 0
+    string divergedSyms = ''
+    if sym1Enabled and not na(s1At) and not na(prevPHS1) and not na(prevPHChartS1) and recencyOK and corrOK1
+        bool chartHH = phVal >= prevPHChartS1 - eqTd
+        bool chartLH = phVal <  prevPHChartS1 - eqTd
+        // cmp leg stays STRICT (no eqTd) BY DESIGN — an exactly-equal cmp high
+        // means the cmp CONFIRMED its prior high (agreement), not a divergence.
+        // Tolerance here would fabricate divergences. Chart-tolerant / cmp-strict
+        // asymmetry is intentional (mirrors the indicator).
+        bool s1HH = s1At > prevPHS1
+        bool s1LH = s1At < prevPHS1
+        bool d1 = sym1Corr == 'Positive' ? ((chartHH and s1LH) or (chartLH and s1HH)) : ((chartHH and s1HH) or (chartLH and s1LH))
+        if d1
+            divergedSyms := divergedSyms + (divCount > 0 ? ', ' : '') + shortName(sym1) + (sym1Corr == 'Inverse' ? '(inv)' : '')
+            divCount += 1
+    if sym2Enabled and not na(s2At) and not na(prevPHS2) and not na(prevPHChartS2) and recencyOK and corrOK2
+        bool chartHH = phVal >= prevPHChartS2 - eqTd
+        bool chartLH = phVal <  prevPHChartS2 - eqTd
+        bool s2HH = s2At > prevPHS2
+        bool s2LH = s2At < prevPHS2
+        bool d2 = sym2Corr == 'Positive' ? ((chartHH and s2LH) or (chartLH and s2HH)) : ((chartHH and s2HH) or (chartLH and s2LH))
+        if d2
+            divergedSyms := divergedSyms + (divCount > 0 ? ', ' : '') + shortName(sym2) + (sym2Corr == 'Inverse' ? '(inv)' : '')
+            divCount += 1
+    if sym3Enabled and not na(s3At) and not na(prevPHS3) and not na(prevPHChartS3) and recencyOK and corrOK3
+        bool chartHH = phVal >= prevPHChartS3 - eqTd
+        bool chartLH = phVal <  prevPHChartS3 - eqTd
+        bool s3HH = s3At > prevPHS3
+        bool s3LH = s3At < prevPHS3
+        bool d3 = sym3Corr == 'Positive' ? ((chartHH and s3LH) or (chartLH and s3HH)) : ((chartHH and s3HH) or (chartLH and s3LH))
+        if d3
+            divergedSyms := divergedSyms + (divCount > 0 ? ', ' : '') + shortName(sym3) + (sym3Corr == 'Inverse' ? '(inv)' : '')
+            divCount += 1
+
+    if divCount > 0
+        bearSig   := true
+        bearPivot := phVal
+        bearStars := divCount
+        bearSyms  := divergedSyms
+
+    prevPHChart := phVal
+    prevPHBar   := pivotBar
+    if not na(s1At)
+        prevPHS1      := s1At
+        prevPHChartS1 := phVal
+    if not na(s2At)
+        prevPHS2      := s2At
+        prevPHChartS2 := phVal
+    if not na(s3At)
+        prevPHS3      := s3At
+        prevPHChartS3 := phVal
+
+// ─── Bullish SMT (confirmed pivot LOW → long) ───
+if not na(plVal)
+    int   pivotBar = bar_index - pivotRightLen
+    int   cmpOff   = pivotRightLen - smtCmpWindow
+    float s1At = sym1Corr == 'Inverse' ? s1HighMax[cmpOff] : s1LowMin[cmpOff]
+    float s2At = sym2Corr == 'Inverse' ? s2HighMax[cmpOff] : s2LowMin[cmpOff]
+    float s3At = sym3Corr == 'Inverse' ? s3HighMax[cmpOff] : s3LowMin[cmpOff]
+    float eqTd = na(confAtr[pivotRightLen]) ? 0.0 : smtEqTolAtr * confAtr[pivotRightLen]
+    bool  recencyOK = smtMaxPivotBars == 0 or na(prevPLBar) or (pivotBar - prevPLBar) <= smtMaxPivotBars
+    // v3.15: sign-aware correlation gate (mirror of the bear block).
+    float chc1 = corr1[pivotRightLen]
+    float chc2 = corr2[pivotRightLen]
+    float chc3 = corr3[pivotRightLen]
+    bool corrOK1 = not corrEnabled or na(chc1) or (sym1Corr == 'Inverse' ? -chc1 : chc1) >= corrThreshold
+    bool corrOK2 = not corrEnabled or na(chc2) or (sym2Corr == 'Inverse' ? -chc2 : chc2) >= corrThreshold
+    bool corrOK3 = not corrEnabled or na(chc3) or (sym3Corr == 'Inverse' ? -chc3 : chc3) >= corrThreshold
+
+    int    divCount     = 0
+    string divergedSyms = ''
+    if sym1Enabled and not na(s1At) and not na(prevPLS1) and not na(prevPLChartS1) and recencyOK and corrOK1
+        bool chartLL = plVal <= prevPLChartS1 + eqTd
+        bool chartHL = plVal >  prevPLChartS1 + eqTd
+        bool s1LL = s1At < prevPLS1
+        bool s1HL = s1At > prevPLS1
+        bool d1 = sym1Corr == 'Positive' ? ((chartLL and s1HL) or (chartHL and s1LL)) : ((chartLL and s1LL) or (chartHL and s1HL))
+        if d1
+            divergedSyms := divergedSyms + (divCount > 0 ? ', ' : '') + shortName(sym1) + (sym1Corr == 'Inverse' ? '(inv)' : '')
+            divCount += 1
+    if sym2Enabled and not na(s2At) and not na(prevPLS2) and not na(prevPLChartS2) and recencyOK and corrOK2
+        bool chartLL = plVal <= prevPLChartS2 + eqTd
+        bool chartHL = plVal >  prevPLChartS2 + eqTd
+        bool s2LL = s2At < prevPLS2
+        bool s2HL = s2At > prevPLS2
+        bool d2 = sym2Corr == 'Positive' ? ((chartLL and s2HL) or (chartHL and s2LL)) : ((chartLL and s2LL) or (chartHL and s2HL))
+        if d2
+            divergedSyms := divergedSyms + (divCount > 0 ? ', ' : '') + shortName(sym2) + (sym2Corr == 'Inverse' ? '(inv)' : '')
+            divCount += 1
+    if sym3Enabled and not na(s3At) and not na(prevPLS3) and not na(prevPLChartS3) and recencyOK and corrOK3
+        bool chartLL = plVal <= prevPLChartS3 + eqTd
+        bool chartHL = plVal >  prevPLChartS3 + eqTd
+        bool s3LL = s3At < prevPLS3
+        bool s3HL = s3At > prevPLS3
+        bool d3 = sym3Corr == 'Positive' ? ((chartLL and s3HL) or (chartHL and s3LL)) : ((chartLL and s3LL) or (chartHL and s3HL))
+        if d3
+            divergedSyms := divergedSyms + (divCount > 0 ? ', ' : '') + shortName(sym3) + (sym3Corr == 'Inverse' ? '(inv)' : '')
+            divCount += 1
+
+    if divCount > 0
+        bullSig   := true
+        bullPivot := plVal
+        bullStars := divCount
+        bullSyms  := divergedSyms
+
+    prevPLChart := plVal
+    prevPLBar   := pivotBar
+    if not na(s1At)
+        prevPLS1      := s1At
+        prevPLChartS1 := plVal
+    if not na(s2At)
+        prevPLS2      := s2At
+        prevPLChartS2 := plVal
+    if not na(s3At)
+        prevPLS3      := s3At
+        prevPLChartS3 := plVal
+
+//──────────────────────────────────────────────────────────────────────────────
+// Trade execution
+//──────────────────────────────────────────────────────────────────────────────
+bool inRange  = not useDateFilter or (time >= startDate and time <= endDate)
+bool canLong  = tradeDir != 'Short Only'
+bool canShort = tradeDir != 'Long Only'
+float atrNow  = nz(confAtr, syminfo.mintick * 10)
+
+// ── Chop / consolidation filters ──
+var int lastEntryBar = na
+[_diP, _diM, adxVal] = ta.dmi(14, 14)
+// Swing leg = pivot to the prior OPPOSITE pivot (the move into the SMT).
+float bearSwing = not na(bearPivot) and not na(prevPLChart) ? bearPivot - prevPLChart : na
+float bullSwing = not na(bullPivot) and not na(prevPHChart) ? prevPHChart - bullPivot : na
+bool bearSwingOK = not useSwingFilter or na(bearSwing) or bearSwing >= minSwingAtr * atrNow
+bool bullSwingOK = not useSwingFilter or na(bullSwing) or bullSwing >= minSwingAtr * atrNow
+bool cooldownOK  = not useCooldown or na(lastEntryBar) or (bar_index - lastEntryBar) >= cooldownBars
+bool adxOK       = not useAdx or (not na(adxVal) and adxVal >= adxMin)
+// v1.2: liquidity-sweep gate (mirror of indicator v3.16). Longs need a bullish
+// sweep at/near the pivot, shorts a bearish one. Pass-through when OFF.
+// Unconditional calls (assign first) so the history-reading function runs every
+// bar — avoids Pine's "call on every bar for consistency" warning that firing it
+// directly inside `not X or call()` (short-circuit) would trip.
+bool smtSweepBullHit = smtSweepDir(1)
+bool smtSweepBearHit = smtSweepDir(2)
+bool bullSweepOK = not smtRequireSweep or smtSweepBullHit
+bool bearSweepOK = not smtRequireSweep or smtSweepBearHit
+
+// Confluence pre-computed UNCONDITIONALLY every bar (mirrors the indicator's
+// hoisted smtBullConf/smtBearConf) — calling checkConf inside the longOK/shortOK
+// short-circuit triggered Pine's "function may not run every bar" warning.
+// checkConf returns false on na pivots, so this is behaviour-identical.
+string bullConfTag = checkConf(bullPivot, true)
+string bearConfTag = checkConf(bearPivot, false)
+bool bullConfOK = str.length(bullConfTag) > 0
+bool bearConfOK = str.length(bearConfTag) > 0
+
+// Primary gate = SMT ★ (≥ minSmtStars) + optional confluence + chop filters.
+bool longOK  = bullSig and canLong  and inRange and bullStars >= minSmtStars and (not requireConf or bullConfOK) and bullSwingOK and cooldownOK and adxOK and bullSweepOK
+bool shortOK = bearSig and canShort and inRange and bearStars >= minSmtStars and (not requireConf or bearConfOK) and bearSwingOK and cooldownOK and adxOK and bearSweepOK
+
+// ── Active-trade state (stop / target / trailing) ──
+var float tStop     = na
+var float tTP       = na      // na in Trailing ATR mode (no fixed target)
+var bool  tTrailing = false
+var float tInitSize = na      // position size at entry (to detect a partial fill)
+var float tTrailExt = na      // run-up extreme since entry (for the ATR trail)
+var float tEntry    = na      // entry price (for the breakeven trigger)
+
+// Target price for an entry, with a safe fallback to Fixed R:R when a
+// structural level is missing or on the wrong side of the entry.
+calcTP(bool isLong, float entryP, float risk) =>
+    float fixed = isLong ? entryP + tpRR * risk : entryP - tpRR * risk
+    float tp = fixed
+    if targetMode == 'ATR Multiple'
+        tp := isLong ? entryP + atrTargetMult * atrNow : entryP - atrTargetMult * atrNow
+    else if targetMode == 'AVWAP'
+        tp := not na(avwap) and (isLong ? avwap > entryP : avwap < entryP) ? avwap : fixed
+    else if targetMode == 'Volume POC'
+        float poc = currDevPOC
+        tp := not na(poc) and (isLong ? poc > entryP : poc < entryP) ? poc : fixed
+    else if targetMode == 'Opposite Swing'
+        float sw = isLong ? prevPHChart : prevPLChart
+        tp := not na(sw) and (isLong ? sw > entryP : sw < entryP) ? sw : fixed
+    else if targetMode == 'Trailing ATR'
+        tp := na
+    tp
+
+// closeOpp = true → reverse an opposite position (strategy.entry auto-reverses
+// with pyramiding = 0). closeOpp = false → ignore the signal while an opposite
+// position is open. The entry `comment` is the WHY shown on chart + trade list.
+bool enteredThisBar = false
+if longOK
+    float stopP  = bullPivot - stopAtrMult * atrNow
+    float entryP = close
+    float risk   = entryP - stopP
+    float wouldTP = calcTP(true, entryP, risk)
+    bool  rrOK    = not useMinRR or na(wouldTP) or (risk > 0 and math.abs(wouldTP - entryP) / risk >= minRR)
+    if risk > 0 and rrOK and (closeOpp or strategy.position_size >= 0)
+        strategy.entry('Long', strategy.long, comment = str.tostring(bullStars) + '★ ' + bullSyms + (str.length(bullConfTag) > 0 ? ' @' + bullConfTag : ''))
+        tStop     := stopP
+        tTP       := wouldTP
+        tEntry    := entryP
+        tTrailing := targetMode == 'Trailing ATR'
+        tInitSize := na
+        tTrailExt := na
+        // fix #3: protect from the entry bar instead of waiting for the mgmt block
+        if tTrailing
+            strategy.exit('Long X', 'Long', stop = stopP)
+        else if usePartial
+            if not na(tTP)
+                strategy.exit('TP1', 'Long', qty_percent = partialPct, limit = tTP)
+            strategy.exit('Long X', 'Long', stop = stopP)
+        else
+            strategy.exit('Long X', 'Long', stop = stopP, limit = tTP)
+        enteredThisBar := true
+        lastEntryBar := bar_index
+        if showSLTP
+            int pr = bar_index + sltpProjBars
+            line.new(bar_index, stopP, pr, stopP, color = color.new(RED, 0),   width = 1, style = line.style_dotted)
+            if not na(tTP)
+                line.new(bar_index, tTP, pr, tTP, color = color.new(GREEN, 0), width = 1, style = line.style_dotted)
+
+if shortOK
+    float stopP  = bearPivot + stopAtrMult * atrNow
+    float entryP = close
+    float risk   = stopP - entryP
+    float wouldTP = calcTP(false, entryP, risk)
+    bool  rrOK    = not useMinRR or na(wouldTP) or (risk > 0 and math.abs(wouldTP - entryP) / risk >= minRR)
+    if risk > 0 and rrOK and (closeOpp or strategy.position_size <= 0)
+        strategy.entry('Short', strategy.short, comment = str.tostring(bearStars) + '★ ' + bearSyms + (str.length(bearConfTag) > 0 ? ' @' + bearConfTag : ''))
+        tStop     := stopP
+        tTP       := wouldTP
+        tEntry    := entryP
+        tTrailing := targetMode == 'Trailing ATR'
+        tInitSize := na
+        tTrailExt := na
+        // fix #3: protect from the entry bar instead of waiting for the mgmt block
+        if tTrailing
+            strategy.exit('Short X', 'Short', stop = stopP)
+        else if usePartial
+            if not na(tTP)
+                strategy.exit('TP1', 'Short', qty_percent = partialPct, limit = tTP)
+            strategy.exit('Short X', 'Short', stop = stopP)
+        else
+            strategy.exit('Short X', 'Short', stop = stopP, limit = tTP)
+        enteredThisBar := true
+        lastEntryBar := bar_index
+        if showSLTP
+            int pr = bar_index + sltpProjBars
+            line.new(bar_index, stopP, pr, stopP, color = color.new(RED, 0),   width = 1, style = line.style_dotted)
+            if not na(tTP)
+                line.new(bar_index, tTP, pr, tTP, color = color.new(GREEN, 0), width = 1, style = line.style_dotted)
+
+// ── Exit management (every bar in a position; skip the reversal/entry bar so a
+//    just-set opposite stop can't fire against the position being closed) ──
+bool inPos     = strategy.position_size != 0
+bool isLongPos = strategy.position_size > 0
+if inPos and not enteredThisBar
+    if na(tInitSize)
+        tInitSize := math.abs(strategy.position_size)
+    tTrailExt := na(tTrailExt) ? (isLongPos ? high : low) : (isLongPos ? math.max(tTrailExt, high) : math.min(tTrailExt, low))
+    // Once part of the position has been banked, trail the runner.
+    bool partialTaken = usePartial and not na(tInitSize) and math.abs(strategy.position_size) < tInitSize * 0.999
+    bool trailNow = tTrailing or partialTaken
+    float curStop = tStop
+    if trailNow and not na(tTrailExt)
+        curStop := isLongPos ? math.max(tStop, tTrailExt - trailAtrMult * atrNow) : math.min(tStop, tTrailExt + trailAtrMult * atrNow)
+    // Breakeven ratchet: once the run-up extreme reaches beTriggerR × risk in
+    // profit, pull the stop to entry (+ optional locked R). tTrailExt is the
+    // since-entry max/min, so the trigger is STICKY (stays armed once hit).
+    if useBreakeven and not na(tEntry) and not na(tTrailExt)
+        float beR = math.abs(tEntry - tStop)
+        if beR > 0
+            if isLongPos and tTrailExt >= tEntry + beTriggerR * beR
+                curStop := math.max(curStop, tEntry + beLockR * beR)
+            if not isLongPos and tTrailExt <= tEntry - beTriggerR * beR
+                curStop := math.min(curStop, tEntry - beLockR * beR)
+    string exId = isLongPos ? 'Long X' : 'Short X'
+    string enId = isLongPos ? 'Long' : 'Short'
+    if tTrailing
+        strategy.exit(exId, from_entry = enId, stop = curStop)                                  // whole position trails
+    else if usePartial
+        if not na(tTP) and not partialTaken
+            strategy.exit('TP1', from_entry = enId, qty_percent = partialPct, limit = tTP)      // bank Partial % at target
+        strategy.exit(exId, from_entry = enId, stop = curStop)                                  // protect/trail the rest
+    else
+        strategy.exit(exId, from_entry = enId, stop = curStop, limit = tTP)                      // single TP + stop
+if not inPos
+    tInitSize := na
+    tTrailExt := na
+
+//──────────────────────────────────────────────────────────────────────────────
+// Visuals
+//──────────────────────────────────────────────────────────────────────────────
+// v3.13 parity: session-break + linebr so AVWAP doesn't draw a diagonal across
+// each VWAP reset (default plot.style_line BRIDGES na). Visual only — entries use
+// the avwap value directly, so this changes no backtest result.
+plot((targetMode == 'AVWAP' or requireConf) and not isNewSession ? avwap : na, 'AVWAP', color = color.new(#FF6D00, 0), linewidth = 1, style = plot.style_linebr)
+
+//──────────────────────────────────────────────────────────────────────────────
+// Stats panel — performance split by ★ level (number of diverging symbols).
+// Each closed trade is attributed to the ★ parsed from its entry comment
+// (digit-first), so partial exits and reversals attribute correctly.
+//──────────────────────────────────────────────────────────────────────────────
+var array<int>   stN  = array.new<int>(4, 0)     // trades per ★ (index 1..3)
+var array<int>   stW  = array.new<int>(4, 0)     // wins
+var array<float> stGP = array.new<float>(4, 0.0) // gross profit
+var array<float> stGL = array.new<float>(4, 0.0) // gross loss (absolute)
+var int stLastProc = 0
+// fix #1: attribute ONE trade per POSITION, not per exit record — otherwise a
+// partial exit (TP1 + runner) double-counts and inflates Win%. Closed-trade
+// records that share an entry_bar_index belong to the same position; sum their
+// P&L and bank a single win/loss when the next position begins.
+var int   accEntryBar = -1
+var int   accStar     = 0
+var float accPnl      = 0.0
+var bool  accActive   = false
+
+if strategy.closedtrades > stLastProc
+    for i = stLastProc to strategy.closedtrades - 1
+        int    eb   = strategy.closedtrades.entry_bar_index(i)
+        float  pf   = strategy.closedtrades.profit(i)
+        string cm   = strategy.closedtrades.entry_comment(i)
+        int    star = na(cm) or str.length(cm) == 0 ? 0 : int(nz(str.tonumber(str.substring(cm, 0, 1)), 0))
+        if eb != accEntryBar
+            // a new position began → bank the previous one as a single trade
+            if accActive and accStar >= 1 and accStar <= 3
+                array.set(stN, accStar, array.get(stN, accStar) + 1)
+                if accPnl > 0
+                    array.set(stW,  accStar, array.get(stW,  accStar) + 1)
+                    array.set(stGP, accStar, array.get(stGP, accStar) + accPnl)
+                else
+                    array.set(stGL, accStar, array.get(stGL, accStar) - accPnl)
+            accEntryBar := eb
+            accStar     := star
+            accPnl      := pf
+            accActive   := true
+        else
+            accPnl += pf
+    stLastProc := strategy.closedtrades
+
+var table stTbl = na
+if showStats and barstate.islast
+    if na(stTbl)
+        stTbl := table.new(position.bottom_right, 5, 5, bgcolor = color.new(color.black, 20), border_width = 1, border_color = color.new(color.gray, 50))
+    color hdr = color.new(color.gray, 40)
+    table.cell(stTbl, 0, 0, '★',      text_color = color.white, text_size = size.small, bgcolor = hdr)
+    table.cell(stTbl, 1, 0, 'Trades', text_color = color.white, text_size = size.small, bgcolor = hdr)
+    table.cell(stTbl, 2, 0, 'Win%',   text_color = color.white, text_size = size.small, bgcolor = hdr)
+    table.cell(stTbl, 3, 0, 'PF',     text_color = color.white, text_size = size.small, bgcolor = hdr)
+    table.cell(stTbl, 4, 0, 'Net',    text_color = color.white, text_size = size.small, bgcolor = hdr)
+    int   allN  = 0
+    int   allW  = 0
+    float allGP = 0.0
+    float allGL = 0.0
+    for s = 1 to 3
+        // include the still-pending (last) position without mutating the buckets
+        bool  pend = accActive and accStar == s
+        int   n  = array.get(stN, s)  + (pend ? 1 : 0)
+        int   w  = array.get(stW, s)  + (pend and accPnl > 0 ? 1 : 0)
+        float gp = array.get(stGP, s) + (pend and accPnl > 0 ? accPnl : 0.0)
+        float gl = array.get(stGL, s) + (pend and accPnl <= 0 ? -accPnl : 0.0)
+        allN  += n
+        allW  += w
+        allGP += gp
+        allGL += gl
+        string winStr = n > 0 ? str.tostring(100.0 * w / n, '#.#') : '—'   // fix #2: float
+        string pfStr  = gl > 0 ? str.tostring(gp / gl, '#.##') : (gp > 0 ? '∞' : '—')
+        float  net    = gp - gl
+        color  netCol = net > 0 ? GREEN : net < 0 ? RED : color.gray
+        table.cell(stTbl, 0, s, '★' + str.tostring(s),     text_color = color.white, text_size = size.small)
+        table.cell(stTbl, 1, s, str.tostring(n),           text_color = color.white, text_size = size.small)
+        table.cell(stTbl, 2, s, winStr,                    text_color = color.white, text_size = size.small)
+        table.cell(stTbl, 3, s, pfStr,                     text_color = color.white, text_size = size.small)
+        table.cell(stTbl, 4, s, str.tostring(net, '#.##'), text_color = netCol,      text_size = size.small)
+    string aWin = allN  > 0 ? str.tostring(100.0 * allW / allN, '#.#') : '—'   // fix #2: float
+    string aPf  = allGL > 0 ? str.tostring(allGP / allGL, '#.##') : (allGP > 0 ? '∞' : '—')
+    float  aNet = allGP - allGL
+    color  aCol = aNet > 0 ? GREEN : aNet < 0 ? RED : color.gray
+    color  allBg = color.new(color.gray, 60)
+    table.cell(stTbl, 0, 4, 'All',                      text_color = color.white, text_size = size.small, bgcolor = allBg)
+    table.cell(stTbl, 1, 4, str.tostring(allN),         text_color = color.white, text_size = size.small, bgcolor = allBg)
+    table.cell(stTbl, 2, 4, aWin,                       text_color = color.white, text_size = size.small, bgcolor = allBg)
+    table.cell(stTbl, 3, 4, aPf,                        text_color = color.white, text_size = size.small, bgcolor = allBg)
+    table.cell(stTbl, 4, 4, str.tostring(aNet, '#.##'), text_color = aCol,        text_size = size.small, bgcolor = allBg)
+
+//──────────────────────────────────────────────────────────────────────────────
+// SMT Correlation table (v3.15) — live rolling corr per cmp symbol. Shows the
+// CURRENT value (corrN[0]); the mute gate uses corrN[pivotRightLen].
+//──────────────────────────────────────────────────────────────────────────────
+corrPos(string s) =>
+    switch s
+        'Top Left'     => position.top_left
+        'Top Right'    => position.top_right
+        'Bottom Left'  => position.bottom_left
+        'Middle Right' => position.middle_right
+        =>                position.top_right
+
+corrCell(bool en, float c, string corrType) =>
+    string txt = '—'
+    color  col = color.gray
+    if en
+        if na(c)
+            txt := 'na'
+            col := color.gray
+        else
+            float eff   = corrType == 'Inverse' ? -c : c
+            bool  valid = eff >= corrThreshold
+            txt := str.tostring(c, '#.##') + (corrEnabled and not valid ? ' (muted)' : '')
+            col := valid ? GREEN : (corrEnabled ? RED : color.orange)
+    [txt, col]
+
+var table corrTbl = na
+if showCorrTable and barstate.islast
+    if na(corrTbl)
+        corrTbl := table.new(corrPos(corrTablePos), 2, 4, bgcolor = color.new(color.black, 20), border_width = 1, border_color = color.new(color.gray, 50))
+    color chdr = color.new(color.gray, 40)
+    table.cell(corrTbl, 0, 0, 'SMT Corr (' + str.tostring(corrLen) + ')', text_color = color.white, text_size = size.small, bgcolor = chdr)
+    table.cell(corrTbl, 1, 0, corrEnabled ? 'mute ON' : 'off', text_color = corrEnabled ? color.orange : color.gray, text_size = size.small, bgcolor = chdr)
+    [t1, cl1] = corrCell(sym1Enabled, corr1, sym1Corr)
+    [t2, cl2] = corrCell(sym2Enabled, corr2, sym2Corr)
+    [t3, cl3] = corrCell(sym3Enabled, corr3, sym3Corr)
+    table.cell(corrTbl, 0, 1, sym1Enabled ? shortName(sym1) + (sym1Corr == 'Inverse' ? ' (inv)' : '') : 'Sym 1', text_color = color.white, text_size = size.small)
+    table.cell(corrTbl, 1, 1, t1, text_color = cl1, text_size = size.small)
+    table.cell(corrTbl, 0, 2, sym2Enabled ? shortName(sym2) + (sym2Corr == 'Inverse' ? ' (inv)' : '') : 'Sym 2', text_color = color.white, text_size = size.small)
+    table.cell(corrTbl, 1, 2, t2, text_color = cl2, text_size = size.small)
+    table.cell(corrTbl, 0, 3, sym3Enabled ? shortName(sym3) + (sym3Corr == 'Inverse' ? ' (inv)' : '') : 'Sym 3', text_color = color.white, text_size = size.small)
+    table.cell(corrTbl, 1, 3, t3, text_color = cl3, text_size = size.small)
