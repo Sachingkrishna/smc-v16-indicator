@@ -1,4 +1,15 @@
-// SMT Divergence Strategy [v1.4]
+// SMT Divergence Strategy [v1.5]
+// v1.5 — AVWAP σ confluence changed from line-TOUCH to BAND-ZONE. Was: '+Nσ'
+//        fired only when the pivot came within `td` of the exact Nσ LINE. Now:
+//        '+Nσ' fires when the pivot sits in the σ-zone whose OUTER edge is the
+//        Nσ band — '+3σ' = between the 2σ and 3σ bands (and beyond), '+2σ' =
+//        1σ–2σ, '+1σ' = AVWAP–1σ. Outermost-enabled zone wins (one σ tag per
+//        side); side-aware kept (long fades lower zones, short upper). AVWAP
+//        mid stays a touch. Makes σ confluence much more permissive (a whole
+//        band vs a line) — more pivots qualify. NOTE: indicator (smtDivergence)
+//        still uses line-touch σ confluence; mirror it there only if this
+//        backtests better. The '+1σ' zone is broad (most pivots are <1σ) — turn
+//        off Sigma #1 to require only the stretched 2σ+ zones.
 // v1.4 — Correlation BASIS switchable (mirror of indicator v3.19). New
 //        `corrMode` = 'Returns' (v1.3, default) or 'Price (legacy)'. Both
 //        variants computed unconditionally, selected on the results (no
@@ -67,7 +78,7 @@
 // are STABLE across a range over the single backtest peak.
 
 //@version=6
-strategy('SMT Divergence Strategy [v1.4]', 'SMT Strat', overlay = true,
+strategy('SMT Divergence Strategy [v1.5]', 'SMT Strat', overlay = true,
      default_qty_type = strategy.percent_of_equity, default_qty_value = 10,
      initial_capital = 10000,
      commission_type = strategy.commission.percent, commission_value = 0.0,
@@ -598,23 +609,35 @@ checkConf(float price, bool isLong) =>
         if useAvwapConf and not na(a) and not na(s) and s > 0
             bool sUp = not useSideAware or not isLong   // short fades UPPER bands
             bool sLo = not useSideAware or isLong       // long  fades LOWER bands
+            // AVWAP mid stays a line-touch (price AT fair value).
             if useSigMid and math.abs(price - a) <= td
                 tag := tag + 'AVWAP '
-            if useSig1
-                if sUp and math.abs(price - (a + sigma1Mult * s)) <= td
-                    tag := tag + '+' + str.tostring(sigma1Mult, '#.#') + 'σ '
-                else if sLo and math.abs(price - (a - sigma1Mult * s)) <= td
-                    tag := tag + '-' + str.tostring(sigma1Mult, '#.#') + 'σ '
-            if useSig2
-                if sUp and math.abs(price - (a + sigma2Mult * s)) <= td
-                    tag := tag + '+' + str.tostring(sigma2Mult, '#.#') + 'σ '
-                else if sLo and math.abs(price - (a - sigma2Mult * s)) <= td
-                    tag := tag + '-' + str.tostring(sigma2Mult, '#.#') + 'σ '
-            if useSig3
-                if sUp and math.abs(price - (a + sigma3Mult * s)) <= td
+            // v1.5: σ confluence is now ZONE-based, not line-touch. The tag is
+            // named by the OUTER band of the σ-zone the pivot sits in:
+            //   '+Nσ' fires when the pivot is in the band BETWEEN the (N-1) and N
+            //   σ lines — '+3σ' = between the 2σ and 3σ bands (and beyond),
+            //   '+2σ' = between 1σ and 2σ, '+1σ' = between AVWAP and 1σ.
+            // Outermost-ENABLED zone wins (one σ tag per side; the else-if
+            // cascade bounds the inner zones). Side-aware as before (long fades
+            // the LOWER zones, short the UPPER). NOTE: the '+1σ' (0–1σ) zone is
+            // broad — most pivots fall within 1σ — so turn off Sigma #1 if you
+            // only want the stretched (2σ+) zones to count as confluence.
+            float dU = price - a   // > 0 when pivot is ABOVE the AVWAP
+            float dL = a - price   // > 0 when pivot is BELOW the AVWAP
+            if sUp and dU > 0
+                if useSig3 and dU >= sigma2Mult * s
                     tag := tag + '+' + str.tostring(sigma3Mult, '#.#') + 'σ '
-                else if sLo and math.abs(price - (a - sigma3Mult * s)) <= td
+                else if useSig2 and dU >= sigma1Mult * s
+                    tag := tag + '+' + str.tostring(sigma2Mult, '#.#') + 'σ '
+                else if useSig1
+                    tag := tag + '+' + str.tostring(sigma1Mult, '#.#') + 'σ '
+            if sLo and dL > 0
+                if useSig3 and dL >= sigma2Mult * s
                     tag := tag + '-' + str.tostring(sigma3Mult, '#.#') + 'σ '
+                else if useSig2 and dL >= sigma1Mult * s
+                    tag := tag + '-' + str.tostring(sigma2Mult, '#.#') + 'σ '
+                else if useSig1
+                    tag := tag + '-' + str.tostring(sigma1Mult, '#.#') + 'σ '
         if vpEnabled and vpUseDev
             float dp  = currDevPOC[pivotRightLen]
             float dvh = currDevVAH[pivotRightLen]
