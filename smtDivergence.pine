@@ -1,4 +1,4 @@
-// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v3.19]
+// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v3.20]
 // Smart Money Technique (multi-symbol divergence) + session Volume Profile
 // with previous-session levels, naked POC tracking, confluence alerts, status
 // dashboard, session-anchored VWAP with σ bands, and iceberg/absorption
@@ -38,6 +38,18 @@
 //          of every realtime tick. Bins only update on `barstate.isconfirmed`,
 //          so the previous every-tick delete-and-rebuild of ~24 boxes
 //          produced identical output. Tracked via `lastVpDrawBar` var.
+// v3.20 — σ confluence Touch ↔ Zone toggle (mirrors strategy v1.6).
+//        New `sigConfMode`: 'Touch' (default, original behaviour) = a σ tag
+//        fires only when the pivot is within the confluence distance of the
+//        exact Nσ LINE. 'Zone' = the pivot is in the σ-BAND whose outer edge is
+//        the Nσ line ('+3σ' = 2σ-3σ band & beyond, '+2σ' = 1σ-2σ, '+1σ' =
+//        AVWAP-1σ; outermost-enabled zone wins). Zone is far more permissive (a
+//        whole band vs a line) and weakens the confluence filter — the '+1σ'
+//        zone catches most pivots — so it's OFF by default; A/B it (strategy
+//        backtest) before relying on it. Applies to the SMT-pivot confluence
+//        (checkConfluence) only; the iceberg confluence (levelsInBar) stays
+//        line-touch. Input at the END of the list (no input-position shift).
+//        Default 'Touch' = no behaviour change from v3.19.
 // v3.19 — Correlation BASIS made switchable (v3.17 ↔ v3.18 logic).
 //        v3.18 changed the decorrelation mute to correlate per-bar RETURNS
 //        (ta.change) instead of raw price LEVELS. Some users may want the old
@@ -971,7 +983,7 @@
 // Best paired with VP/AVWAP confluence gating for high-quality signals.
 
 //@version=6
-indicator('SMT + VP + AVWAP + Ice [v3.19]', 'SMT+VP3.19', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_polylines_count = 50)
+indicator('SMT + VP + AVWAP + Ice [v3.20]', 'SMT+VP3.20', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_polylines_count = 50)
 // v3.15 (RE10067 fix): per-series max_bars_back instead of a global 5000. The VP
 // recompute reads high/low/close/open/volume up to ~4999 bars back; only THOSE
 // series need the deep buffer. A GLOBAL max_bars_back=5000 applied 5000 to EVERY
@@ -1299,6 +1311,10 @@ smtCooldownResetStruct = input.bool(false, 'Reset Cooldown on BOS/CHoCH', toolti
 // existing input positions, but grouped under "SMT — Correlation Filter" in the
 // settings UI. Returns = v3.18 (recommended); Price = v3.17 legacy behaviour.
 corrMode = input.string('Returns', 'Correlation Basis', options = ['Returns', 'Price (legacy)'], tooltip = 'Basis for the rolling correlation used by "Mute SMT When Decorrelated". Returns (v3.18, recommended): per-bar RETURNS (ta.change) — measures real bar-to-bar co-movement. Price (legacy, v3.17): raw price LEVELS — reads spuriously high for two co-trending instruments, so the mute under-fires. Only matters when the mute is ON.', group = grpCorr)
+// v3.20: σ confluence mode (at the end of the list so it doesn't shift existing
+// inputs; shows under the Confluence group). Touch = original line-touch; Zone =
+// band membership. SMT pivots only — the iceberg confluence stays line-touch.
+sigConfMode = input.string('Touch', 'σ Confluence Mode', options = ['Touch', 'Zone'], tooltip = 'How a pivot earns a σ confluence tag. Touch (default, original): the pivot is within the Confluence Distance of the exact Nσ LINE. Zone: the pivot sits in the σ-BAND whose outer edge is the Nσ line — "+3σ" = between the 2σ and 3σ bands (and beyond), "+2σ" = 1σ-2σ, "+1σ" = AVWAP-1σ (outermost-enabled zone wins). Zone is much more permissive (a whole band vs a line); most pivots fall within 1σ, so turn off σ#1 if you only want stretched 2σ+ zones. Affects SMT confluence only, not iceberg.', group = grpConf)
 
 //──────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -1986,18 +2002,37 @@ checkConfluence(float price, int barOffset) =>
             if not na(pivAvwap) and not na(pivSigma) and pivSigma > 0 and math.abs(price - pivAvwap) <= td
                 out := out + 'AVWAP '
             if not na(pivAvwap) and not na(pivSigma) and pivSigma > 0
-                if showSigma1 and math.abs(price - (pivAvwap + sigma1Mult * pivSigma)) <= td
-                    out := out + '+' + str.tostring(sigma1Mult, '#.#') + 'σ '
-                if showSigma1 and math.abs(price - (pivAvwap - sigma1Mult * pivSigma)) <= td
-                    out := out + '-' + str.tostring(sigma1Mult, '#.#') + 'σ '
-                if showSigma2 and math.abs(price - (pivAvwap + sigma2Mult * pivSigma)) <= td
-                    out := out + '+' + str.tostring(sigma2Mult, '#.#') + 'σ '
-                if showSigma2 and math.abs(price - (pivAvwap - sigma2Mult * pivSigma)) <= td
-                    out := out + '-' + str.tostring(sigma2Mult, '#.#') + 'σ '
-                if showSigma3 and math.abs(price - (pivAvwap + sigma3Mult * pivSigma)) <= td
-                    out := out + '+' + str.tostring(sigma3Mult, '#.#') + 'σ '
-                if showSigma3 and math.abs(price - (pivAvwap - sigma3Mult * pivSigma)) <= td
-                    out := out + '-' + str.tostring(sigma3Mult, '#.#') + 'σ '
+                // v3.20: σ confluence Touch (line) vs Zone (band) — see sigConfMode.
+                if sigConfMode == 'Zone'
+                    float dU = price - pivAvwap   // > 0 above the AVWAP
+                    float dL = pivAvwap - price   // > 0 below the AVWAP
+                    if dU > 0
+                        if showSigma3 and dU >= sigma2Mult * pivSigma
+                            out := out + '+' + str.tostring(sigma3Mult, '#.#') + 'σ '
+                        else if showSigma2 and dU >= sigma1Mult * pivSigma
+                            out := out + '+' + str.tostring(sigma2Mult, '#.#') + 'σ '
+                        else if showSigma1
+                            out := out + '+' + str.tostring(sigma1Mult, '#.#') + 'σ '
+                    if dL > 0
+                        if showSigma3 and dL >= sigma2Mult * pivSigma
+                            out := out + '-' + str.tostring(sigma3Mult, '#.#') + 'σ '
+                        else if showSigma2 and dL >= sigma1Mult * pivSigma
+                            out := out + '-' + str.tostring(sigma2Mult, '#.#') + 'σ '
+                        else if showSigma1
+                            out := out + '-' + str.tostring(sigma1Mult, '#.#') + 'σ '
+                else
+                    if showSigma1 and math.abs(price - (pivAvwap + sigma1Mult * pivSigma)) <= td
+                        out := out + '+' + str.tostring(sigma1Mult, '#.#') + 'σ '
+                    if showSigma1 and math.abs(price - (pivAvwap - sigma1Mult * pivSigma)) <= td
+                        out := out + '-' + str.tostring(sigma1Mult, '#.#') + 'σ '
+                    if showSigma2 and math.abs(price - (pivAvwap + sigma2Mult * pivSigma)) <= td
+                        out := out + '+' + str.tostring(sigma2Mult, '#.#') + 'σ '
+                    if showSigma2 and math.abs(price - (pivAvwap - sigma2Mult * pivSigma)) <= td
+                        out := out + '-' + str.tostring(sigma2Mult, '#.#') + 'σ '
+                    if showSigma3 and math.abs(price - (pivAvwap + sigma3Mult * pivSigma)) <= td
+                        out := out + '+' + str.tostring(sigma3Mult, '#.#') + 'σ '
+                    if showSigma3 and math.abs(price - (pivAvwap - sigma3Mult * pivSigma)) <= td
+                        out := out + '-' + str.tostring(sigma3Mult, '#.#') + 'σ '
         // Strip the trailing space left by the tag appends.
         if str.endswith(out, ' ')
             out := str.substring(out, 0, str.length(out) - 1)
@@ -3148,7 +3183,7 @@ if showDash and barstate.islast
 
     // Header.
     table.cell(dashTable, 0, 0, 'SMT+VP+Ice', text_color = color.white, text_size = dashTxtSz, bgcolor = hdrBg)
-    table.cell(dashTable, 1, 0, 'v3.19',      text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
+    table.cell(dashTable, 1, 0, 'v3.20',      text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
 
     // Current developing levels.
     table.cell(dashTable, 0, 1, 'Curr POC', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)

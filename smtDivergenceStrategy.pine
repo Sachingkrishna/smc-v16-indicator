@@ -1,4 +1,12 @@
-// SMT Divergence Strategy [v1.5]
+// SMT Divergence Strategy [v1.6]
+// v1.6 — σ confluence Touch ↔ Zone is now a TOGGLE (was hardcoded Zone in v1.5).
+//        New `sigConfMode` = 'Touch' (default — restores the original line-touch
+//        behaviour) or 'Zone' (the v1.5 band-membership). Both implemented;
+//        outermost-enabled zone wins, side-aware kept, AVWAP mid stays a touch.
+//        Default 'Touch' so the strategy reverts to its pre-v1.5 σ behaviour
+//        unless you opt into Zone. Mirrors indicator v3.20. A/B the two via this
+//        toggle on a FIXED date range before deciding. Input at the END of the
+//        list (no input-position shift).
 // v1.5 — AVWAP σ confluence changed from line-TOUCH to BAND-ZONE. Was: '+Nσ'
 //        fired only when the pivot came within `td` of the exact Nσ LINE. Now:
 //        '+Nσ' fires when the pivot sits in the σ-zone whose OUTER edge is the
@@ -78,7 +86,7 @@
 // are STABLE across a range over the single backtest peak.
 
 //@version=6
-strategy('SMT Divergence Strategy [v1.5]', 'SMT Strat', overlay = true,
+strategy('SMT Divergence Strategy [v1.6]', 'SMT Strat', overlay = true,
      default_qty_type = strategy.percent_of_equity, default_qty_value = 10,
      initial_capital = 10000,
      commission_type = strategy.commission.percent, commission_value = 0.0,
@@ -278,6 +286,9 @@ max_bars_back(smtSweepSrc, 100)
 // input positions; grouped under "SMT — Correlation Filter" in the UI.
 corrMode = input.string('Returns', 'Correlation Basis', options = ['Returns', 'Price (legacy)'], group = grpCorr,
      tooltip = 'Basis for the rolling correlation used by the decorrelation mute. Returns (v1.3, recommended): per-bar RETURNS (ta.change) — real co-movement. Price (legacy): raw price LEVELS — spuriously high for two co-trending instruments. Only matters when "Mute SMT When Decorrelated" is ON.')
+// v1.6: σ confluence mode (at the end so it doesn't shift existing inputs).
+sigConfMode = input.string('Touch', 'σ Confluence Mode', options = ['Touch', 'Zone'], group = grpConf,
+     tooltip = 'How a pivot earns a σ confluence tag. Touch (default, original): pivot within the confluence distance of the exact Nσ LINE. Zone: pivot is in the σ-BAND whose outer edge is the Nσ line — "+3σ" = 2σ-3σ band (and beyond), "+2σ" = 1σ-2σ, "+1σ" = AVWAP-1σ (outermost-enabled zone wins, side-aware). Zone is far more permissive; the "+1σ" zone catches most pivots, so turn off σ#1 for stretched 2σ+ only. Backtest both before relying on Zone.')
 
 //──────────────────────────────────────────────────────────────────────────────
 // Helpers — pivot source, cmp fetch, window series, ATR
@@ -612,32 +623,45 @@ checkConf(float price, bool isLong) =>
             // AVWAP mid stays a line-touch (price AT fair value).
             if useSigMid and math.abs(price - a) <= td
                 tag := tag + 'AVWAP '
-            // v1.5: σ confluence is now ZONE-based, not line-touch. The tag is
-            // named by the OUTER band of the σ-zone the pivot sits in:
-            //   '+Nσ' fires when the pivot is in the band BETWEEN the (N-1) and N
-            //   σ lines — '+3σ' = between the 2σ and 3σ bands (and beyond),
-            //   '+2σ' = between 1σ and 2σ, '+1σ' = between AVWAP and 1σ.
-            // Outermost-ENABLED zone wins (one σ tag per side; the else-if
-            // cascade bounds the inner zones). Side-aware as before (long fades
-            // the LOWER zones, short the UPPER). NOTE: the '+1σ' (0–1σ) zone is
-            // broad — most pivots fall within 1σ — so turn off Sigma #1 if you
-            // only want the stretched (2σ+) zones to count as confluence.
-            float dU = price - a   // > 0 when pivot is ABOVE the AVWAP
-            float dL = a - price   // > 0 when pivot is BELOW the AVWAP
-            if sUp and dU > 0
-                if useSig3 and dU >= sigma2Mult * s
-                    tag := tag + '+' + str.tostring(sigma3Mult, '#.#') + 'σ '
-                else if useSig2 and dU >= sigma1Mult * s
-                    tag := tag + '+' + str.tostring(sigma2Mult, '#.#') + 'σ '
-                else if useSig1
-                    tag := tag + '+' + str.tostring(sigma1Mult, '#.#') + 'σ '
-            if sLo and dL > 0
-                if useSig3 and dL >= sigma2Mult * s
-                    tag := tag + '-' + str.tostring(sigma3Mult, '#.#') + 'σ '
-                else if useSig2 and dL >= sigma1Mult * s
-                    tag := tag + '-' + str.tostring(sigma2Mult, '#.#') + 'σ '
-                else if useSig1
-                    tag := tag + '-' + str.tostring(sigma1Mult, '#.#') + 'σ '
+            // v1.6: σ confluence Touch (line) vs Zone (band) — see sigConfMode.
+            if sigConfMode == 'Zone'
+                // Zone: '+Nσ' fires when the pivot is in the band whose OUTER edge
+                // is the Nσ line — '+3σ' = 2σ-3σ band (and beyond), '+2σ' = 1σ-2σ,
+                // '+1σ' = AVWAP-1σ. Outermost-enabled zone wins; side-aware. The
+                // '+1σ' zone is broad (most pivots <1σ) — turn off σ#1 for 2σ+ only.
+                float dU = price - a   // > 0 when pivot is ABOVE the AVWAP
+                float dL = a - price   // > 0 when pivot is BELOW the AVWAP
+                if sUp and dU > 0
+                    if useSig3 and dU >= sigma2Mult * s
+                        tag := tag + '+' + str.tostring(sigma3Mult, '#.#') + 'σ '
+                    else if useSig2 and dU >= sigma1Mult * s
+                        tag := tag + '+' + str.tostring(sigma2Mult, '#.#') + 'σ '
+                    else if useSig1
+                        tag := tag + '+' + str.tostring(sigma1Mult, '#.#') + 'σ '
+                if sLo and dL > 0
+                    if useSig3 and dL >= sigma2Mult * s
+                        tag := tag + '-' + str.tostring(sigma3Mult, '#.#') + 'σ '
+                    else if useSig2 and dL >= sigma1Mult * s
+                        tag := tag + '-' + str.tostring(sigma2Mult, '#.#') + 'σ '
+                    else if useSig1
+                        tag := tag + '-' + str.tostring(sigma1Mult, '#.#') + 'σ '
+            else
+                // Touch (original): pivot within td of the exact Nσ line.
+                if useSig1
+                    if sUp and math.abs(price - (a + sigma1Mult * s)) <= td
+                        tag := tag + '+' + str.tostring(sigma1Mult, '#.#') + 'σ '
+                    else if sLo and math.abs(price - (a - sigma1Mult * s)) <= td
+                        tag := tag + '-' + str.tostring(sigma1Mult, '#.#') + 'σ '
+                if useSig2
+                    if sUp and math.abs(price - (a + sigma2Mult * s)) <= td
+                        tag := tag + '+' + str.tostring(sigma2Mult, '#.#') + 'σ '
+                    else if sLo and math.abs(price - (a - sigma2Mult * s)) <= td
+                        tag := tag + '-' + str.tostring(sigma2Mult, '#.#') + 'σ '
+                if useSig3
+                    if sUp and math.abs(price - (a + sigma3Mult * s)) <= td
+                        tag := tag + '+' + str.tostring(sigma3Mult, '#.#') + 'σ '
+                    else if sLo and math.abs(price - (a - sigma3Mult * s)) <= td
+                        tag := tag + '-' + str.tostring(sigma3Mult, '#.#') + 'σ '
         if vpEnabled and vpUseDev
             float dp  = currDevPOC[pivotRightLen]
             float dvh = currDevVAH[pivotRightLen]
