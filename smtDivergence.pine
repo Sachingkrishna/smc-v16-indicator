@@ -1,4 +1,4 @@
-// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v3.18]
+// SMT Divergence + Volume Profile + Anchored VWAP + Iceberg [v3.19]
 // Smart Money Technique (multi-symbol divergence) + session Volume Profile
 // with previous-session levels, naked POC tracking, confluence alerts, status
 // dashboard, session-anchored VWAP with σ bands, and iceberg/absorption
@@ -38,6 +38,17 @@
 //          of every realtime tick. Bins only update on `barstate.isconfirmed`,
 //          so the previous every-tick delete-and-rebuild of ~24 boxes
 //          produced identical output. Tracked via `lastVpDrawBar` var.
+// v3.19 — Correlation BASIS made switchable (v3.17 ↔ v3.18 logic).
+//        v3.18 changed the decorrelation mute to correlate per-bar RETURNS
+//        (ta.change) instead of raw price LEVELS. Some users may want the old
+//        price-level behaviour back (or to A/B them), so the basis is now a
+//        toggle: new `corrMode` = 'Returns' (v3.18, default/recommended) or
+//        'Price (legacy)' (v3.17). Both variants are computed UNCONDITIONALLY
+//        and selected on the results — calling ta.correlation inside a ternary
+//        would trip the "call on every bar" warning and risk internal-state
+//        gaps. Input lives at the END of the list (grouped under "SMT —
+//        Correlation Filter" in the UI) so it doesn't shift existing input
+//        positions. Default 'Returns' = no behaviour change from v3.18.
 // v3.18 — Two quality fixes from a regression-review pass (both opt-in paths).
 //        Fix 1 — Correlation filter on RETURNS, not raw price (v3.15 weakness).
 //        `corrEnabled` muting used `ta.correlation(close, cmpClose, len)` on
@@ -960,7 +971,7 @@
 // Best paired with VP/AVWAP confluence gating for high-quality signals.
 
 //@version=6
-indicator('SMT + VP + AVWAP + Ice [v3.18]', 'SMT+VP3.18', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_polylines_count = 50)
+indicator('SMT + VP + AVWAP + Ice [v3.19]', 'SMT+VP3.19', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_polylines_count = 50)
 // v3.15 (RE10067 fix): per-series max_bars_back instead of a global 5000. The VP
 // recompute reads high/low/close/open/volume up to ~4999 bars back; only THOSE
 // series need the deep buffer. A GLOBAL max_bars_back=5000 applied 5000 to EVERY
@@ -1284,6 +1295,11 @@ smtCooldownBars        = input.int(0, 'Cooldown (bars, same direction)', minval 
 smtDedupAtr            = input.float(0.5, 'Same-Level Band (× ATR14)', minval = 0.0, maxval = 10.0, step = 0.1, tooltip = 'Price band defining "same level" for the cooldown: a re-fire within this × ATR(14) of the last fired signal counts as a duplicate. A signal at a genuinely new level (outside the band) is NOT suppressed. Only used when Cooldown > 0.', group = grpNoise)
 smtCooldownResetStruct = input.bool(false, 'Reset Cooldown on BOS/CHoCH', tooltip = 'When ON, a structure shift (BOS/CHoCH) within the cooldown window clears the cooldown so a genuine post-shift re-test at the same level can re-fire. REQUIRES the "SMC Sweep Export source" wired to smcV16 — it decodes BOS/CHoCH from that same export. Leave OFF if the source is not wired.', group = grpNoise)
 
+// v3.19: correlation BASIS selector. Declared at the END so it doesn't shift
+// existing input positions, but grouped under "SMT — Correlation Filter" in the
+// settings UI. Returns = v3.18 (recommended); Price = v3.17 legacy behaviour.
+corrMode = input.string('Returns', 'Correlation Basis', options = ['Returns', 'Price (legacy)'], tooltip = 'Basis for the rolling correlation used by "Mute SMT When Decorrelated". Returns (v3.18, recommended): per-bar RETURNS (ta.change) — measures real bar-to-bar co-movement. Price (legacy, v3.17): raw price LEVELS — reads spuriously high for two co-trending instruments, so the mute under-fires. Only matters when the mute is ON.', group = grpCorr)
+
 //──────────────────────────────────────────────────────────────────────────────
 // Helpers
 //──────────────────────────────────────────────────────────────────────────────
@@ -1413,13 +1429,24 @@ s3LowMin  = ta.lowest (s3Low,  smtCmpWinLen)
 
 // v3.15: rolling correlation per cmp symbol (chart close vs cmp close). Top-level
 // for Pine series consistency. na during warmup (<corrLen) or flat-stdev windows.
-// v3.18: correlate per-bar RETURNS (ta.change), not raw price levels. Two
+// v3.18: correlate per-bar RETURNS (ta.change), not raw price levels — two
 // co-trending instruments show spuriously high price-LEVEL correlation even
 // when their bar-to-bar moves decouple; returns measure actual co-movement.
-// Pearson is scale-invariant, so ta.change is fine across price scales.
-corr1 = ta.correlation(ta.change(close), ta.change(s1Close), corrLen)
-corr2 = ta.correlation(ta.change(close), ta.change(s2Close), corrLen)
-corr3 = ta.correlation(ta.change(close), ta.change(s3Close), corrLen)
+// v3.19: `corrMode` selects the basis (Returns = v3.18, Price = v3.17 legacy).
+// Compute BOTH variants UNCONDITIONALLY (no conditional ta.correlation → no
+// internal-state gaps and no "call on every bar" warning), then pick on the
+// RESULTS. Pearson is scale-invariant, so ta.change is fine across price scales.
+bool  corrRet = corrMode == 'Returns'
+float dC  = ta.change(close)
+float c1r = ta.correlation(dC, ta.change(s1Close), corrLen)
+float c1p = ta.correlation(close, s1Close, corrLen)
+float c2r = ta.correlation(dC, ta.change(s2Close), corrLen)
+float c2p = ta.correlation(close, s2Close, corrLen)
+float c3r = ta.correlation(dC, ta.change(s3Close), corrLen)
+float c3p = ta.correlation(close, s3Close, corrLen)
+corr1 = corrRet ? c1r : c1p
+corr2 = corrRet ? c2r : c2p
+corr3 = corrRet ? c3r : c3p
 
 // v3.3: asymmetric L/R — pivotRightLen controls confirmation lag.
 phVal = ta.pivothigh(pivotSrcHigh, pivotLeftLen, pivotRightLen)
@@ -3121,7 +3148,7 @@ if showDash and barstate.islast
 
     // Header.
     table.cell(dashTable, 0, 0, 'SMT+VP+Ice', text_color = color.white, text_size = dashTxtSz, bgcolor = hdrBg)
-    table.cell(dashTable, 1, 0, 'v3.18',      text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
+    table.cell(dashTable, 1, 0, 'v3.19',      text_color = color.new(color.white, 40), text_size = dashTxtSz, bgcolor = hdrBg)
 
     // Current developing levels.
     table.cell(dashTable, 0, 1, 'Curr POC', text_color = lblTx, text_size = dashTxtSz, bgcolor = rowBg)

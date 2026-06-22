@@ -1,4 +1,10 @@
-// SMT Divergence Strategy [v1.3]
+// SMT Divergence Strategy [v1.4]
+// v1.4 — Correlation BASIS switchable (mirror of indicator v3.19). New
+//        `corrMode` = 'Returns' (v1.3, default) or 'Price (legacy)'. Both
+//        variants computed unconditionally, selected on the results (no
+//        conditional ta.correlation → no warning / state gaps). Input at the
+//        end of the list (grouped under Correlation Filter). Default 'Returns'
+//        = no behaviour change from v1.3.
 // v1.3 — Two quality fixes mirrored from indicator v3.18 (both opt-in paths).
 //        (1) Correlation filter on per-bar RETURNS (ta.change) instead of raw
 //        price levels — co-trending instruments correlated spuriously on
@@ -61,7 +67,7 @@
 // are STABLE across a range over the single backtest peak.
 
 //@version=6
-strategy('SMT Divergence Strategy [v1.3]', 'SMT Strat', overlay = true,
+strategy('SMT Divergence Strategy [v1.4]', 'SMT Strat', overlay = true,
      default_qty_type = strategy.percent_of_equity, default_qty_value = 10,
      initial_capital = 10000,
      commission_type = strategy.commission.percent, commission_value = 0.0,
@@ -257,6 +263,11 @@ smtSweepLookback = input.int(3, 'Sweep Lookback (± bars around pivot)', minval 
 // Buffer: smtSweepSrc is read up to [pivotRightLen + smtSweepLookback] (<=70).
 max_bars_back(smtSweepSrc, 100)
 
+// v1.4: correlation BASIS selector. At the END so it doesn't shift existing
+// input positions; grouped under "SMT — Correlation Filter" in the UI.
+corrMode = input.string('Returns', 'Correlation Basis', options = ['Returns', 'Price (legacy)'], group = grpCorr,
+     tooltip = 'Basis for the rolling correlation used by the decorrelation mute. Returns (v1.3, recommended): per-bar RETURNS (ta.change) — real co-movement. Price (legacy): raw price LEVELS — spuriously high for two co-trending instruments. Only matters when "Mute SMT When Decorrelated" is ON.')
+
 //──────────────────────────────────────────────────────────────────────────────
 // Helpers — pivot source, cmp fetch, window series, ATR
 //──────────────────────────────────────────────────────────────────────────────
@@ -287,13 +298,22 @@ s2LowMin  = ta.lowest (s2Low,  smtCmpWinLen)
 s3HighMax = ta.highest(s3High, smtCmpWinLen)
 s3LowMin  = ta.lowest (s3Low,  smtCmpWinLen)
 
-// v3.15: rolling correlation per cmp symbol. v1.3: on per-bar RETURNS
-// (ta.change), not raw price levels — co-trending instruments correlate
-// spuriously on levels; returns measure real co-movement (Pearson is
-// scale-invariant, so ta.change works across price scales).
-corr1 = ta.correlation(ta.change(close), ta.change(s1Close), corrLen)
-corr2 = ta.correlation(ta.change(close), ta.change(s2Close), corrLen)
-corr3 = ta.correlation(ta.change(close), ta.change(s3Close), corrLen)
+// v3.15: rolling correlation per cmp symbol. v1.3: on per-bar RETURNS, not raw
+// price levels — co-trending instruments correlate spuriously on levels.
+// v1.4: `corrMode` selects the basis (Returns = v1.3, Price = legacy). Compute
+// BOTH variants UNCONDITIONALLY (no conditional ta.correlation → no state gaps /
+// "call every bar" warning), then pick on the results.
+bool  corrRet = corrMode == 'Returns'
+float dC  = ta.change(close)
+float c1r = ta.correlation(dC, ta.change(s1Close), corrLen)
+float c1p = ta.correlation(close, s1Close, corrLen)
+float c2r = ta.correlation(dC, ta.change(s2Close), corrLen)
+float c2p = ta.correlation(close, s2Close, corrLen)
+float c3r = ta.correlation(dC, ta.change(s3Close), corrLen)
+float c3p = ta.correlation(close, s3Close, corrLen)
+corr1 = corrRet ? c1r : c1p
+corr2 = corrRet ? c2r : c2p
+corr3 = corrRet ? c3r : c3p
 
 phVal = ta.pivothigh(pivotSrcHigh, pivotLeftLen, pivotRightLen)
 plVal = ta.pivotlow (pivotSrcLow,  pivotLeftLen, pivotRightLen)
