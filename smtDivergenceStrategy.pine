@@ -1,4 +1,13 @@
-// SMT Divergence Strategy [v1.9]
+// SMT Divergence Strategy [v1.10]
+// v1.10 — SL/TP visualisation overhaul. The bare red/green dotted lines are
+//         replaced (default) by labelled Risk/Reward ZONES: a red risk box
+//         (entry→stop) + green reward box (entry→target) that span entry to exit,
+//         with SL / TP / entry PRICE + R-multiple labels on the right edge. New
+//         `rrStyle` input (default 'R:R Boxes'; 'Lines (legacy)' restores the old
+//         dotted lines) appended at the END of the list, shown in the SL/TP UI
+//         group. Pure cosmetic — same stopP/tTP values, no logic/trade change.
+//         strategy() now declares max_boxes_count/max_labels_count = 500 so recent
+//         trades' zones render (TradingView prunes oldest beyond that).
 // v1.9 — Comparison-symbol auto-preset. New `cmpPreset` (default 'Auto') detects
 //        the chart instrument and fills Symbol 1/2/3 + polarity automatically:
 //          • XAUUSD or GC futures → Gold basket: XPTUSD(+), USDX(−), XAGUSD(+)
@@ -132,12 +141,12 @@
 // are STABLE across a range over the single backtest peak.
 
 //@version=6
-strategy('SMT Divergence Strategy [v1.6]', 'SMT Strat', overlay = true,
+strategy('SMT Divergence Strategy [v1.10]', 'SMT Strat', overlay = true,
      default_qty_type = strategy.percent_of_equity, default_qty_value = 10,
      initial_capital = 10000,
      commission_type = strategy.commission.percent, commission_value = 0.0,
      slippage = 1, pyramiding = 0, process_orders_on_close = true,
-     max_lines_count = 500, calc_on_every_tick = false)
+     max_lines_count = 500, max_boxes_count = 500, max_labels_count = 500, calc_on_every_tick = false)
 // v3.15 (RE10067 fix): per-series max_bars_back instead of a global 5000 — see
 // the indicator. The VP recompute reads high/low/volume deep; a global 5000 over
 // every series plus the new correlation series exceeded Pine's 300k total cap.
@@ -390,6 +399,11 @@ sym3Corr    := _basket == 'Gold' ? 'Positive' : _basket == 'GBP' ? 'Inverse' : s
 sym1Enabled := _basket == 'Custom' ? sym1Enabled : true
 sym2Enabled := _basket == 'Custom' ? sym2Enabled : true
 sym3Enabled := _basket == 'Custom' ? sym3Enabled : true
+
+// v1.10: SL/TP visual style. At the END of the inputs (no position shift); shows
+// in the SL/TP UI group via group=grpSLTP.
+rrStyle = input.string('R:R Boxes', 'SL/TP Style', options = ['R:R Boxes', 'Lines (legacy)'], group = grpSLTP,
+     tooltip = 'R:R Boxes (default): red risk zone (entry->stop) + green reward zone (entry->target) spanning entry to exit, with SL / TP / entry price + R-multiple labels. Lines (legacy): the original red/green dotted horizontal lines projected forward by Projection Length.')
 
 //──────────────────────────────────────────────────────────────────────────────
 // Helpers — pivot source, cmp fetch, window series, ATR
@@ -1045,6 +1059,32 @@ var float tInitSize = na      // position size at entry (to detect a partial fil
 var float tTrailExt = na      // run-up extreme since entry (for the ATR trail)
 var float tEntry    = na      // entry price (for the breakeven trigger)
 
+// v1.10: handles for the active trade's R:R zone drawings (extended each bar to
+// the exit). Reassigned on every new entry; old objects persist as history.
+var box   rrRiskBox = na
+var box   rrRewBox  = na
+var label rrSlLbl   = na
+var label rrTpLbl   = na
+var label rrEnLbl   = na
+
+// Draws the labelled R:R zones for a new entry and returns the handles so the
+// caller can extend them to the exit bar. Risk zone = entry→stop (red), reward
+// zone = entry→target (green). Labels carry SL / TP / entry price + R-multiple.
+// Box left/right both start at bar_index (zero width); the per-bar block grows
+// the right edge while the position is open.
+makeRR(bool isLong, float ep, float sp, float tp, float rsk) =>
+    box rb = box.new(bar_index, math.max(ep, sp), bar_index, math.min(ep, sp), border_color = color.new(RED, 55), bgcolor = color.new(RED, 88))
+    box gb = na
+    label tl = na
+    if not na(tp)
+        gb := box.new(bar_index, math.max(ep, tp), bar_index, math.min(ep, tp), border_color = color.new(GREEN, 55), bgcolor = color.new(GREEN, 88))
+    label sl = label.new(bar_index, sp, 'SL ' + str.tostring(sp, format.mintick) + ' · -1R', style = label.style_label_left, color = color.new(color.black, 100), textcolor = RED, size = size.small)
+    if not na(tp)
+        float rr = rsk > 0 ? math.abs(tp - ep) / rsk : na
+        tl := label.new(bar_index, tp, 'TP ' + str.tostring(tp, format.mintick) + (na(rr) ? '' : ' · ' + str.tostring(rr, '0.0') + 'R'), style = label.style_label_left, color = color.new(color.black, 100), textcolor = GREEN, size = size.small)
+    label el = label.new(bar_index, ep, 'E ' + str.tostring(ep, format.mintick), style = label.style_label_left, color = color.new(color.black, 100), textcolor = color.gray, size = size.small)
+    [rb, gb, sl, tl, el]
+
 // Target price for an entry, with a safe fallback to Fixed R:R when a
 // structural level is missing or on the wrong side of the entry.
 calcTP(bool isLong, float entryP, float risk) =>
@@ -1094,10 +1134,18 @@ if longOK
         enteredThisBar := true
         lastEntryBar := bar_index
         if showSLTP
-            int pr = bar_index + sltpProjBars
-            line.new(bar_index, stopP, pr, stopP, color = color.new(RED, 0),   width = 1, style = line.style_dotted)
-            if not na(tTP)
-                line.new(bar_index, tTP, pr, tTP, color = color.new(GREEN, 0), width = 1, style = line.style_dotted)
+            if rrStyle == 'R:R Boxes'
+                [rb, gb, sl, tl, el] = makeRR(true, entryP, stopP, tTP, risk)
+                rrRiskBox := rb
+                rrRewBox  := gb
+                rrSlLbl   := sl
+                rrTpLbl   := tl
+                rrEnLbl   := el
+            else
+                int pr = bar_index + sltpProjBars
+                line.new(bar_index, stopP, pr, stopP, color = color.new(RED, 0),   width = 1, style = line.style_dotted)
+                if not na(tTP)
+                    line.new(bar_index, tTP, pr, tTP, color = color.new(GREEN, 0), width = 1, style = line.style_dotted)
 
 if shortOK
     float stopP  = bearPivot + stopAtrMult * atrNow
@@ -1125,10 +1173,30 @@ if shortOK
         enteredThisBar := true
         lastEntryBar := bar_index
         if showSLTP
-            int pr = bar_index + sltpProjBars
-            line.new(bar_index, stopP, pr, stopP, color = color.new(RED, 0),   width = 1, style = line.style_dotted)
-            if not na(tTP)
-                line.new(bar_index, tTP, pr, tTP, color = color.new(GREEN, 0), width = 1, style = line.style_dotted)
+            if rrStyle == 'R:R Boxes'
+                [rb, gb, sl, tl, el] = makeRR(false, entryP, stopP, tTP, risk)
+                rrRiskBox := rb
+                rrRewBox  := gb
+                rrSlLbl   := sl
+                rrTpLbl   := tl
+                rrEnLbl   := el
+            else
+                int pr = bar_index + sltpProjBars
+                line.new(bar_index, stopP, pr, stopP, color = color.new(RED, 0),   width = 1, style = line.style_dotted)
+                if not na(tTP)
+                    line.new(bar_index, tTP, pr, tTP, color = color.new(GREEN, 0), width = 1, style = line.style_dotted)
+
+// v1.10: grow the active trade's R:R zones to the current bar (freezes at exit).
+if showSLTP and rrStyle == 'R:R Boxes' and strategy.position_size != 0 and not na(rrRiskBox)
+    box.set_right(rrRiskBox, bar_index)
+    if not na(rrRewBox)
+        box.set_right(rrRewBox, bar_index)
+    if not na(rrSlLbl)
+        label.set_x(rrSlLbl, bar_index)
+    if not na(rrTpLbl)
+        label.set_x(rrTpLbl, bar_index)
+    if not na(rrEnLbl)
+        label.set_x(rrEnLbl, bar_index)
 
 // ── Exit management (every bar in a position; skip the reversal/entry bar so a
 //    just-set opposite stop can't fire against the position being closed) ──
