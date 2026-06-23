@@ -1,4 +1,11 @@
-// SMT Divergence Strategy [v1.10]
+// SMT Divergence Strategy [v1.11]
+// v1.11 — One trade = one R:R zone. A same-direction signal firing while a
+//         position is already open is now ignored entirely (was: drew a 2nd zone
+//         AND silently re-anchored the live stop/target to the new pivot). Entry
+//         guards now fire only when flat, or to reverse an opposite position when
+//         closeOpp is ON. Fixes the "two boxes for one long" artifact and the
+//         unintended mid-trade stop move. Trade-logic change — backtest numbers
+//         shift slightly (stops no longer re-anchor on repeat signals).
 // v1.10 — SL/TP visualisation overhaul. The bare red/green dotted lines are
 //         replaced (default) by labelled Risk/Reward ZONES: a red risk box
 //         (entry→stop) + green reward box (entry→target) that span entry to exit,
@@ -141,7 +148,7 @@
 // are STABLE across a range over the single backtest peak.
 
 //@version=6
-strategy('SMT Divergence Strategy [v1.10]', 'SMT Strat', overlay = true,
+strategy('SMT Divergence Strategy [v1.11]', 'SMT Strat', overlay = true,
      default_qty_type = strategy.percent_of_equity, default_qty_value = 10,
      initial_capital = 10000,
      commission_type = strategy.commission.percent, commission_value = 0.0,
@@ -1114,7 +1121,7 @@ if longOK
     float risk   = entryP - stopP
     float wouldTP = calcTP(true, entryP, risk)
     bool  rrOK    = not useMinRR or na(wouldTP) or (risk > 0 and math.abs(wouldTP - entryP) / risk >= minRR)
-    if risk > 0 and rrOK and (closeOpp or strategy.position_size >= 0)
+    if risk > 0 and rrOK and (closeOpp ? strategy.position_size <= 0 : strategy.position_size == 0)
         strategy.entry('Long', strategy.long, comment = str.tostring(bullStars) + '★ ' + bullSyms + (str.length(bullConfTag) > 0 ? ' @' + bullConfTag : ''))
         tStop     := stopP
         tTP       := wouldTP
@@ -1153,7 +1160,7 @@ if shortOK
     float risk   = stopP - entryP
     float wouldTP = calcTP(false, entryP, risk)
     bool  rrOK    = not useMinRR or na(wouldTP) or (risk > 0 and math.abs(wouldTP - entryP) / risk >= minRR)
-    if risk > 0 and rrOK and (closeOpp or strategy.position_size <= 0)
+    if risk > 0 and rrOK and (closeOpp ? strategy.position_size >= 0 : strategy.position_size == 0)
         strategy.entry('Short', strategy.short, comment = str.tostring(bearStars) + '★ ' + bearSyms + (str.length(bearConfTag) > 0 ? ' @' + bearConfTag : ''))
         tStop     := stopP
         tTP       := wouldTP
