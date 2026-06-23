@@ -1,4 +1,18 @@
-// SMT Divergence Strategy [v1.6]
+// SMT Divergence Strategy [v1.7]
+// v1.7 — Kill Zone session filter (parity with smcV16 v13.0 kill zones). New
+//        opt-in `useKillZone` gate: only take entries when the signal bar falls
+//        inside one of the enabled ICT kill-zone windows (Asian 20:00–00:00,
+//        London Open 02:00–05:00, NY Open 07:00–10:00, London Close 10:00–12:00,
+//        + Silver Bullet AM/PM/London). Windows + timezone selector mirror
+//        smcV16 EXACTLY (inKillZone = not na(time(tf, sess, kzTZ))). Default OFF
+//        → no behaviour change. When ON: gate = bar is in ≥1 enabled window;
+//        if NO sub-window is enabled the gate passes (nothing selected = don't
+//        filter); the gate is a no-op on non-intraday timeframes (a daily bar
+//        spans every session, so it can't meaningfully filter). Per-window
+//        default toggles match smcV16 (Asian/London Open/NY Open ON, the rest
+//        OFF) but are inert until the master toggle is ON. A strategy entry is
+//        binary, so this is a hard Filter (no Tag mode). Inputs appended at the
+//        END of the list (no input-position shift). Trade-management untouched.
 // v1.6 — σ confluence Touch ↔ Zone is now a TOGGLE (was hardcoded Zone in v1.5).
 //        New `sigConfMode` = 'Touch' (default — restores the original line-touch
 //        behaviour) or 'Zone' (the v1.5 band-membership). Both implemented;
@@ -289,6 +303,24 @@ corrMode = input.string('Returns', 'Correlation Basis', options = ['Returns', 'P
 // v1.6: σ confluence mode (at the end so it doesn't shift existing inputs).
 sigConfMode = input.string('Touch', 'σ Confluence Mode', options = ['Touch', 'Zone'], group = grpConf,
      tooltip = 'How a pivot earns a σ confluence tag. Touch (default, original): pivot within the confluence distance of the exact Nσ LINE. Zone: pivot is in the σ-BAND whose outer edge is the Nσ line — "+3σ" = 2σ-3σ band (and beyond), "+2σ" = 1σ-2σ, "+1σ" = AVWAP-1σ (outermost-enabled zone wins, side-aware). Zone is far more permissive; the "+1σ" zone catches most pivots, so turn off σ#1 for stretched 2σ+ only. Backtest both before relying on Zone.')
+
+// v1.7: Kill Zone session filter (parity with smcV16 v13.0 kill zones). At the
+// END so it doesn't shift existing input positions. Default OFF = no change.
+grpKZ = 'SMT — Kill Zone Filter (smcV16)'
+useKillZone   = input.bool(false, 'Only Trade in Kill Zones', group = grpKZ,
+     tooltip = 'Only take an entry when the signal bar falls inside one of the enabled ICT kill-zone windows below. Mirrors smcV16 kill zones exactly. No-op on non-intraday timeframes and when no window is enabled. Default OFF.')
+kzAsian       = input.bool(true,  'Asian KZ (20:00–00:00)',        group = grpKZ)
+kzLondonOpen  = input.bool(true,  'London Open KZ (02:00–05:00)',  group = grpKZ)
+kzNYOpen      = input.bool(true,  'NY Open KZ (07:00–10:00)',      group = grpKZ)
+kzLondonClose = input.bool(false, 'London Close KZ (10:00–12:00)', group = grpKZ)
+kzSBam        = input.bool(false, 'Silver Bullet AM (10:00–11:00)',group = grpKZ)
+kzSBpm        = input.bool(false, 'Silver Bullet PM (14:00–15:00)',group = grpKZ)
+kzSBldn       = input.bool(false, 'Silver Bullet London (03:00–04:00)', group = grpKZ)
+kzTZ          = input.string('America/New_York', 'Kill Zone Timezone', group = grpKZ,
+     options = ['America/New_York','America/Chicago','America/Los_Angeles',
+                'Europe/London','Europe/Berlin','Asia/Tokyo','Asia/Hong_Kong',
+                'Asia/Kolkata','Asia/Singapore','Australia/Sydney','UTC'],
+     tooltip = 'All kill-zone window times are defined in this timezone. Matches the smcV16 Kill Zone Timezone. Default America/New_York (ET).')
 
 //──────────────────────────────────────────────────────────────────────────────
 // Helpers — pivot source, cmp fetch, window series, ATR
@@ -905,9 +937,18 @@ string bearConfTag = checkConf(bearPivot, false)
 bool bullConfOK = str.length(bullConfTag) > 0
 bool bearConfOK = str.length(bearConfTag) > 0
 
+// v1.7: Kill Zone session filter (parity with smcV16 v13.0). inKZ mirrors
+// smcV16's inKillZone exactly. kzOK passes when the filter is off, the chart is
+// non-intraday (a daily bar spans every session), no window is enabled, or the
+// bar is inside ≥1 enabled window. Same gate for both directions (time-only).
+inKZ(string sess) => not na(time(timeframe.period, sess, kzTZ))
+bool kzAnyEnabled = kzAsian or kzLondonOpen or kzNYOpen or kzLondonClose or kzSBam or kzSBpm or kzSBldn
+bool kzActive = (kzAsian and inKZ('2000-0000')) or (kzLondonOpen and inKZ('0200-0500')) or (kzNYOpen and inKZ('0700-1000')) or (kzLondonClose and inKZ('1000-1200')) or (kzSBam and inKZ('1000-1100')) or (kzSBpm and inKZ('1400-1500')) or (kzSBldn and inKZ('0300-0400'))
+bool kzOK = not useKillZone or not timeframe.isintraday or not kzAnyEnabled or kzActive
+
 // Primary gate = SMT ★ (≥ minSmtStars) + optional confluence + chop filters.
-bool longOK  = bullSig and canLong  and inRange and bullStars >= minSmtStars and (not requireConf or bullConfOK) and bullSwingOK and cooldownOK and adxOK and bullSweepOK
-bool shortOK = bearSig and canShort and inRange and bearStars >= minSmtStars and (not requireConf or bearConfOK) and bearSwingOK and cooldownOK and adxOK and bearSweepOK
+bool longOK  = bullSig and canLong  and inRange and bullStars >= minSmtStars and (not requireConf or bullConfOK) and bullSwingOK and cooldownOK and adxOK and bullSweepOK and kzOK
+bool shortOK = bearSig and canShort and inRange and bearStars >= minSmtStars and (not requireConf or bearConfOK) and bearSwingOK and cooldownOK and adxOK and bearSweepOK and kzOK
 
 // ── Active-trade state (stop / target / trailing) ──
 var float tStop     = na
