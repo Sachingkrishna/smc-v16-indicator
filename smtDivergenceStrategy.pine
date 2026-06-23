@@ -1,4 +1,22 @@
-// SMT Divergence Strategy [v1.7]
+// SMT Divergence Strategy [v1.8]
+// v1.8 — Session-window filter (parity with smcV16 v20.3 Sessions), companion to
+//        the v1.7 kill-zone gate. New opt-in `useSession`: only take entries when
+//        the signal bar is inside an enabled market session (Sydney/Tokyo/London/
+//        NY). Mirrors smcV16's Session Anchor Mode EXACTLY via `sessAnchorMode`:
+//          • Per-Session Local (default) — each session in its own market tz/local
+//            hours: Sydney Australia/Sydney 07:00–16:00, Tokyo Asia/Tokyo
+//            09:00–18:00, London Europe/London 08:00–17:00, NY America/New_York
+//            08:00–17:00 (each tracks its own DST).
+//          • Single Timezone (ICT) — all four in one tz (`sessTZ`) on NY-clock
+//            hours: Sydney 17:00–02:00, Tokyo 19:00–04:00, London 03:00–12:00,
+//            NY 08:00–17:00.
+//        Same gate mechanics as kill zones (inSess = not na(time(tf, sess, tz))):
+//        default OFF → no change; no-op on non-intraday TFs and when no session is
+//        enabled; passes when the bar is in ≥1 enabled session. Independent of the
+//        kill-zone gate — enabling BOTH requires the bar to be in a kill zone AND a
+//        session (AND-chain). Per-session default toggles match smcV16 (all ON) but
+//        are inert until the master toggle is ON. Inputs appended at the END of the
+//        list (no input-position shift). Trade-management untouched.
 // v1.7 — Kill Zone session filter (parity with smcV16 v13.0 kill zones). New
 //        opt-in `useKillZone` gate: only take entries when the signal bar falls
 //        inside one of the enabled ICT kill-zone windows (Asian 20:00–00:00,
@@ -321,6 +339,23 @@ kzTZ          = input.string('America/New_York', 'Kill Zone Timezone', group = g
                 'Europe/London','Europe/Berlin','Asia/Tokyo','Asia/Hong_Kong',
                 'Asia/Kolkata','Asia/Singapore','Australia/Sydney','UTC'],
      tooltip = 'All kill-zone window times are defined in this timezone. Matches the smcV16 Kill Zone Timezone. Default America/New_York (ET).')
+
+// v1.8: Session-window filter (parity with smcV16 v20.3 Sessions). At the END so
+// it doesn't shift existing input positions. Default OFF = no change.
+grpSess = 'SMT — Session Filter (smcV16)'
+useSession    = input.bool(false, 'Only Trade in Sessions', group = grpSess,
+     tooltip = 'Only take an entry when the signal bar falls inside an enabled market session below. Mirrors smcV16 Sessions exactly. Independent of the kill-zone gate (enabling both requires the bar to be in a kill zone AND a session). No-op on non-intraday TFs and when no session is enabled. Default OFF.')
+sessSydney    = input.bool(true,  'Sydney',   group = grpSess, inline = 'sess1')
+sessTokyo     = input.bool(true,  'Tokyo',    group = grpSess, inline = 'sess1')
+sessLondon    = input.bool(true,  'London',   group = grpSess, inline = 'sess2')
+sessNY        = input.bool(true,  'New York', group = grpSess, inline = 'sess2')
+sessAnchorMode = input.string('Per-Session Local', 'Session Anchor Mode', options = ['Per-Session Local', 'Single Timezone (ICT)'], group = grpSess,
+     tooltip = 'Per-Session Local (default): each session in its own market timezone + local hours — Sydney Australia/Sydney 07:00-16:00, Tokyo Asia/Tokyo 09:00-18:00, London Europe/London 08:00-17:00, NY America/New_York 08:00-17:00 (each tracks its own DST). Single Timezone (ICT): all four in the timezone below on NY-clock hours — Sydney 17:00-02:00, Tokyo 19:00-04:00, London 03:00-12:00, NY 08:00-17:00. Matches smcV16.')
+sessTZ        = input.string('America/New_York', 'Session Timezone (Single mode)', group = grpSess,
+     options = ['America/New_York','America/Chicago','America/Los_Angeles',
+                'Europe/London','Europe/Berlin','Asia/Dubai','Asia/Tokyo','Asia/Hong_Kong',
+                'Asia/Kolkata','Asia/Singapore','Australia/Sydney','UTC'],
+     tooltip = 'Used only when Session Anchor Mode = Single Timezone (ICT). All four session windows are evaluated in this timezone. Matches the smcV16 Session Timezone.')
 
 //──────────────────────────────────────────────────────────────────────────────
 // Helpers — pivot source, cmp fetch, window series, ATR
@@ -946,9 +981,27 @@ bool kzAnyEnabled = kzAsian or kzLondonOpen or kzNYOpen or kzLondonClose or kzSB
 bool kzActive = (kzAsian and inKZ('2000-0000')) or (kzLondonOpen and inKZ('0200-0500')) or (kzNYOpen and inKZ('0700-1000')) or (kzLondonClose and inKZ('1000-1200')) or (kzSBam and inKZ('1000-1100')) or (kzSBpm and inKZ('1400-1500')) or (kzSBldn and inKZ('0300-0400'))
 bool kzOK = not useKillZone or not timeframe.isintraday or not kzAnyEnabled or kzActive
 
+// v1.8: Session-window filter (parity with smcV16 v20.3 Sessions). Per-Session
+// Local anchors each session in its own market tz/local hours; Single Timezone
+// (ICT) collapses all four to sessTZ on NY-clock hours. Same pass conditions as
+// kzOK. inSess mirrors smcV16's inSessionWindow exactly.
+inSess(string sess, string tz) => not na(time(timeframe.period, sess, tz))
+bool _perLocal = sessAnchorMode == 'Per-Session Local'
+string _sydH = _perLocal ? '0700-1600' : '1700-0200'
+string _sydT = _perLocal ? 'Australia/Sydney' : sessTZ
+string _tokH = _perLocal ? '0900-1800' : '1900-0400'
+string _tokT = _perLocal ? 'Asia/Tokyo'       : sessTZ
+string _lonH = _perLocal ? '0800-1700' : '0300-1200'
+string _lonT = _perLocal ? 'Europe/London'    : sessTZ
+string _nyH  = '0800-1700'
+string _nyT  = _perLocal ? 'America/New_York' : sessTZ
+bool sessAnyEnabled = sessSydney or sessTokyo or sessLondon or sessNY
+bool sessActive = (sessSydney and inSess(_sydH, _sydT)) or (sessTokyo and inSess(_tokH, _tokT)) or (sessLondon and inSess(_lonH, _lonT)) or (sessNY and inSess(_nyH, _nyT))
+bool sessOK = not useSession or not timeframe.isintraday or not sessAnyEnabled or sessActive
+
 // Primary gate = SMT ★ (≥ minSmtStars) + optional confluence + chop filters.
-bool longOK  = bullSig and canLong  and inRange and bullStars >= minSmtStars and (not requireConf or bullConfOK) and bullSwingOK and cooldownOK and adxOK and bullSweepOK and kzOK
-bool shortOK = bearSig and canShort and inRange and bearStars >= minSmtStars and (not requireConf or bearConfOK) and bearSwingOK and cooldownOK and adxOK and bearSweepOK and kzOK
+bool longOK  = bullSig and canLong  and inRange and bullStars >= minSmtStars and (not requireConf or bullConfOK) and bullSwingOK and cooldownOK and adxOK and bullSweepOK and kzOK and sessOK
+bool shortOK = bearSig and canShort and inRange and bearStars >= minSmtStars and (not requireConf or bearConfOK) and bearSwingOK and cooldownOK and adxOK and bearSweepOK and kzOK and sessOK
 
 // ── Active-trade state (stop / target / trailing) ──
 var float tStop     = na
