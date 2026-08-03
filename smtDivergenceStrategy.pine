@@ -1,4 +1,7 @@
-// SMT Divergence Strategy [v1.11]
+// SMT Divergence Strategy [v1.12]
+// v1.12 — EURUSD / 6E auto-preset. The EUR basket is USDCHF(−), GBPUSD(+),
+//         USDX(−). Auto now detects EURUSD or 6E; the new 'EUR (EUR/6E)'
+//         option can also force this basket on another chart.
 // v1.11 — One trade = one R:R zone. A same-direction signal firing while a
 //         position is already open is now ignored entirely (was: drew a 2nd zone
 //         AND silently re-anchored the live stop/target to the new pivot). Entry
@@ -387,22 +390,23 @@ sessTZ        = input.string('America/New_York', 'Session Timezone (Single mode)
                 'Asia/Kolkata','Asia/Singapore','Australia/Sydney','UTC'],
      tooltip = 'Used only when Session Anchor Mode = Single Timezone (ICT). All four session windows are evaluated in this timezone. Matches the smcV16 Session Timezone.')
 
-// v1.9: Comparison-symbol auto-preset. Input is at the END of the list (no
+// v1.12: Comparison-symbol auto-preset. Input is at the END of the list (no
 // position shift) but grouped into the Comparison Symbols UI section. Auto picks
-// the basket from the chart instrument; Gold/GBP force one; Custom keeps the
+// the basket from the chart instrument; Gold/GBP/EUR force one; Custom keeps the
 // manual Symbol 1/2/3 inputs. Override via := keeps sym* `simple` so the
 // request.security calls below are unaffected. Done before any sym* usage.
-cmpPreset = input.string('Auto', 'Comparison Preset', options = ['Auto', 'Gold (XAU/GC)', 'GBP (GBP/6B)', 'Custom'], group = grpSymbols,
-     tooltip = 'Auto (default): detect the chart and fill Symbol 1/2/3 + polarity — XAUUSD or GC -> XPTUSD(+)/USDX(-)/XAGUSD(+); GBPUSD or 6B -> EURUSD(+)/USDX(-)/USDCHF(-); any other symbol -> use the manual Symbol 1/2/3 inputs above. Gold (XAU/GC) / GBP (GBP/6B): force that basket on any chart. Custom: always use the manual inputs. Manual dropdowns are ignored while a basket is active.')
+cmpPreset = input.string('Auto', 'Comparison Preset', options = ['Auto', 'Gold (XAU/GC)', 'GBP (GBP/6B)', 'EUR (EUR/6E)', 'Custom'], group = grpSymbols,
+     tooltip = 'Auto (default): detect the chart and fill Symbol 1/2/3 + polarity — XAUUSD or GC -> XPTUSD(+)/USDX(-)/XAGUSD(+); GBPUSD or 6B -> EURUSD(+)/USDX(-)/USDCHF(-); EURUSD or 6E -> USDCHF(-)/GBPUSD(+)/USDX(-); any other symbol -> use the manual Symbol 1/2/3 inputs above. Gold (XAU/GC) / GBP (GBP/6B) / EUR (EUR/6E): force that basket on any chart. Custom: always use the manual inputs. Manual dropdowns are ignored while a basket is active.')
 bool _isGold = str.contains(syminfo.ticker, 'XAUUSD') or (not na(syminfo.root) and syminfo.root == 'GC')
 bool _isGBP  = str.contains(syminfo.ticker, 'GBPUSD') or (not na(syminfo.root) and syminfo.root == '6B')
-string _basket = cmpPreset == 'Gold (XAU/GC)' ? 'Gold' : cmpPreset == 'GBP (GBP/6B)' ? 'GBP' : cmpPreset == 'Custom' ? 'Custom' : (_isGold ? 'Gold' : _isGBP ? 'GBP' : 'Custom')
-sym1        := _basket == 'Gold' ? 'PEPPERSTONE:XPTUSD' : _basket == 'GBP' ? 'PEPPERSTONE:EURUSD' : sym1
-sym1Corr    := _basket == 'Gold' ? 'Positive' : _basket == 'GBP' ? 'Positive' : sym1Corr
-sym2        := _basket == 'Custom' ? sym2 : 'PEPPERSTONE:USDX'
-sym2Corr    := _basket == 'Custom' ? sym2Corr : 'Inverse'
-sym3        := _basket == 'Gold' ? 'PEPPERSTONE:XAGUSD' : _basket == 'GBP' ? 'PEPPERSTONE:USDCHF' : sym3
-sym3Corr    := _basket == 'Gold' ? 'Positive' : _basket == 'GBP' ? 'Inverse' : sym3Corr
+bool _isEUR  = str.contains(syminfo.ticker, 'EURUSD') or (not na(syminfo.root) and syminfo.root == '6E')
+string _basket = cmpPreset == 'Gold (XAU/GC)' ? 'Gold' : cmpPreset == 'GBP (GBP/6B)' ? 'GBP' : cmpPreset == 'EUR (EUR/6E)' ? 'EUR' : cmpPreset == 'Custom' ? 'Custom' : (_isGold ? 'Gold' : _isGBP ? 'GBP' : _isEUR ? 'EUR' : 'Custom')
+sym1        := _basket == 'Gold' ? 'PEPPERSTONE:XPTUSD' : _basket == 'GBP' ? 'PEPPERSTONE:EURUSD' : _basket == 'EUR' ? 'PEPPERSTONE:USDCHF' : sym1
+sym1Corr    := (_basket == 'Gold' or _basket == 'GBP') ? 'Positive' : _basket == 'EUR' ? 'Inverse' : sym1Corr
+sym2        := _basket == 'EUR' ? 'PEPPERSTONE:GBPUSD' : _basket == 'Custom' ? sym2 : 'PEPPERSTONE:USDX'
+sym2Corr    := _basket == 'EUR' ? 'Positive' : _basket == 'Custom' ? sym2Corr : 'Inverse'
+sym3        := _basket == 'Gold' ? 'PEPPERSTONE:XAGUSD' : _basket == 'GBP' ? 'PEPPERSTONE:USDCHF' : _basket == 'EUR' ? 'PEPPERSTONE:USDX' : sym3
+sym3Corr    := _basket == 'Gold' ? 'Positive' : (_basket == 'GBP' or _basket == 'EUR') ? 'Inverse' : sym3Corr
 sym1Enabled := _basket == 'Custom' ? sym1Enabled : true
 sym2Enabled := _basket == 'Custom' ? sym2Enabled : true
 sym3Enabled := _basket == 'Custom' ? sym3Enabled : true
